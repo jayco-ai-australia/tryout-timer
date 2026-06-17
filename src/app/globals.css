@@ -1,40 +1,179 @@
 @import "tailwindcss";
 
+/* ── Design tokens ─────────────────────────────────────────── */
 :root {
-  --background: #ffffff;
-  --foreground: #1a1a1a;
-  --jayco-blue: #0079c1;
-  --jayco-grey: #4e4b48;
+  --blue:       #0079c1;
+  --blue-dark:  #006aab;
+  --blue-light: #e8f4fb;
+  --grey:       #4e4b48;
+  --bg:         #f5f7f9;
+  --surface:    #ffffff;
+  --border:     #e4e7ec;
+  --text:       #1a1a1a;
+  --text-mid:   #4e4b48;
+  --text-muted: #8a8a8a;
+  --green:      #22a35a;
+  --green-bg:   #edfbf3;
+  --amber:      #d97706;
+  --amber-bg:   #fffbeb;
+  --red:        #dc2626;
+  --red-bg:     #fef2f2;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --color-jayco-blue: var(--jayco-blue);
-  --color-jayco-grey: var(--jayco-grey);
-}
+/* ── Base ──────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; }
 
-* {
-  box-sizing: border-box;
-}
+html { font-size: 16px; }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
+  background: var(--bg);
+  color: var(--text);
   font-family: var(--font-montserrat), -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-@keyframes pulse-ring {
-  0% { transform: scale(0.9); opacity: 1; }
-  100% { transform: scale(1.4); opacity: 0; }
+/* ── Reusable utility classes ──────────────────────────────── */
+
+/* Page wrapper */
+.page { max-width: 1200px; margin: 0 auto; padding: 24px 16px; }
+.page-narrow { max-width: 960px; margin: 0 auto; padding: 24px 16px; }
+
+/* Cards */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.06);
 }
 
-.timer-pulse::before {
-  content: '';
-  position: absolute;
-  inset: -4px;
+/* Primary button */
+.btn-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--blue);
+  color: #fff;
+  font-weight: 600;
+  font-size: 14px;
+  padding: 10px 16px;
+  border-radius: 8px;
+  border: none;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.btn-primary:hover { background: var(--blue-dark); }
+.btn-primary:disabled { opacity: 0.55; cursor: not-allowed; }
+
+/* Ghost button */
+.btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  color: var(--text-mid);
+  font-weight: 500;
+  font-size: 14px;
+  padding: 10px 16px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.btn-ghost:hover { background: var(--bg); border-color: #cdd0d6; }
+
+/* Danger button */
+.btn-danger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--red);
+  color: #fff;
+  font-weight: 600;
+  font-size: 14px;
+  padding: 10px 16px;
+  border-radius: 8px;
+  border: none;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.btn-danger:hover { background: #b91c1c; }
+
+/* Text input */
+.input {
+  width: 100%;
+  padding: 10px 14px;
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  font-size: 14px;
+  font-family: inherit;
+  color: var(--text);
+  background: var(--surface);
+  transition: border-color 0.15s, box-shadow 0.15s;
+  outline: none;
+}
+.input:focus {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px rgba(0, 121, 193, 0.12);
+}
+.input::placeholder { color: var(--text-muted); }
+
+/* Labels */
+.label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-mid);
+  margin-bottom: 6px;
+}
+
+/* Status badges */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 20px;
+  letter-spacing: 0.01em;
+}
+.badge-grey   { background: #f0f0f0; color: #6b6b6b; }
+.badge-green  { background: var(--green-bg); color: #15803d; }
+.badge-amber  { background: var(--amber-bg); color: #92400e; }
+.badge-blue   { background: var(--blue-light); color: var(--blue); }
+
+/* Live dot */
+.live-dot {
+  width: 6px; height: 6px;
   border-radius: 50%;
-  border: 2px solid #22c55e;
-  animation: pulse-ring 1.5s ease-out infinite;
+  background: var(--green);
+  animation: pulse-dot 1.5s ease-in-out infinite;
 }
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.5; transform: scale(0.75); }
+}
+
+/* Table */
+.data-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.data-table thead th {
+  text-align: left;
+  padding: 10px 20px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  background: #fafafa;
+  border-bottom: 1px solid var(--border);
+}
+.data-table thead th.right { text-align: right; }
+.data-table tbody tr { border-bottom: 1px solid #f2f2f2; }
+.data-table tbody tr:last-child { border-bottom: none; }
+.data-table tbody tr:hover { background: #fafbfc; }
+.data-table tbody td { padding: 12px 20px; color: var(--text-mid); vertical-align: middle; }
+.data-table tbody td.primary { font-weight: 600; color: var(--text); }
+.data-table tbody td.right { text-align: right; }
+.data-table tbody td.mono { font-family: ui-monospace, "Cascadia Code", monospace; font-weight: 600; }
+.data-table tbody td.blue { font-weight: 700; color: var(--blue); text-align: right; }

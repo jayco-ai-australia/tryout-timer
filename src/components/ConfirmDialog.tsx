@@ -22,22 +22,15 @@ export default function ConfirmDialog({
   onCancel,
 }: ConfirmDialogProps) {
   return (
-    <Modal title={title} onClose={onCancel} size="sm">
-      <p className="text-gray-600 mb-6">{message}</p>
-      <div className="flex gap-3 justify-end">
-        <button
-          onClick={onCancel}
-          className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors"
-        >
-          {cancelLabel}
-        </button>
+    <Modal title={title} onClose={onCancel} maxWidth={400}>
+      <p style={{ fontSize: 14, color: 'var(--text-mid)', lineHeight: 1.6, marginBottom: 20 }}>
+        {message}
+      </p>
+      <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+        <button onClick={onCancel} className="btn-ghost">{cancelLabel}</button>
         <button
           onClick={onConfirm}
-          className={`px-4 py-2 text-sm font-medium text-white rounded-lg transition-colors ${
-            danger
-              ? 'bg-red-500 hover:bg-red-600'
-              : 'bg-[#0079c1] hover:bg-[#0068a8]'
-          }`}
+          className={danger ? 'btn-danger' : 'btn-primary'}
         >
           {confirmLabel}
         </button>

@@ -39,13 +39,8 @@ export default function AdminClient({ profiles: initialProfiles, sessions: initi
   const [confirm, setConfirm] = useState<{ type: 'user' | 'session' | 'operation'; id: string } | null>(null)
 
   async function handleRoleChange(userId: string, newRole: 'user' | 'admin') {
-    const { error } = await supabase
-      .from('profiles')
-      .update({ role: newRole })
-      .eq('id', userId)
-    if (!error) {
-      setProfiles((prev) => prev.map((p) => p.id === userId ? { ...p, role: newRole } : p))
-    }
+    const { error } = await supabase.from('profiles').update({ role: newRole }).eq('id', userId)
+    if (!error) setProfiles((prev) => prev.map((p) => p.id === userId ? { ...p, role: newRole } : p))
   }
 
   async function handleDeleteUser(userId: string) {
@@ -80,28 +75,52 @@ export default function AdminClient({ profiles: initialProfiles, sessions: initi
   ]
 
   return (
-    <main className="max-w-5xl mx-auto px-4 py-6">
-      <div className="mb-6">
-        <h1 className="text-2xl font-bold text-gray-900">Admin</h1>
-        <p className="text-sm text-gray-500 mt-0.5">Manage users, sessions, and operations</p>
+    <main className="page-narrow">
+      <div style={{ marginBottom: 24 }}>
+        <h1 style={{ fontSize: 24, fontWeight: 700, color: 'var(--text)', margin: 0 }}>Admin</h1>
+        <p style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 4 }}>Manage users, sessions, and operations</p>
       </div>
 
       {/* Tabs */}
-      <div className="flex gap-1 mb-6 bg-gray-100 p-1 rounded-lg w-fit">
+      <div style={{
+        display: 'flex',
+        gap: 4,
+        marginBottom: 20,
+        background: '#eef0f3',
+        padding: 4,
+        borderRadius: 10,
+        width: 'fit-content',
+      }}>
         {tabs.map((t) => (
           <button
             key={t.key}
             onClick={() => setTab(t.key)}
-            className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
-              tab === t.key
-                ? 'bg-white text-gray-900 shadow-sm'
-                : 'text-gray-500 hover:text-gray-700'
-            }`}
+            style={{
+              padding: '7px 16px',
+              borderRadius: 7,
+              border: 'none',
+              cursor: 'pointer',
+              fontSize: 13,
+              fontWeight: 600,
+              fontFamily: 'inherit',
+              transition: 'background 0.12s, box-shadow 0.12s',
+              background: tab === t.key ? 'var(--surface)' : 'transparent',
+              color: tab === t.key ? 'var(--text)' : 'var(--text-muted)',
+              boxShadow: tab === t.key ? '0 1px 3px rgba(0,0,0,0.08)' : 'none',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
+            }}
           >
             {t.label}
-            <span className={`ml-1.5 text-xs px-1.5 py-0.5 rounded-full ${
-              tab === t.key ? 'bg-[#0079c1]/10 text-[#0079c1]' : 'bg-gray-200 text-gray-500'
-            }`}>
+            <span style={{
+              fontSize: 11,
+              fontWeight: 700,
+              padding: '1px 6px',
+              borderRadius: 20,
+              background: tab === t.key ? 'var(--blue-light)' : '#e0e2e6',
+              color: tab === t.key ? 'var(--blue)' : 'var(--text-muted)',
+            }}>
               {t.count}
             </span>
           </button>
@@ -110,37 +129,41 @@ export default function AdminClient({ profiles: initialProfiles, sessions: initi
 
       {/* Users */}
       {tab === 'users' && (
-        <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden">
-          <table className="w-full text-sm">
-            <thead className="bg-gray-50 text-xs text-gray-500 uppercase tracking-wide">
+        <div className="card" style={{ overflow: 'hidden' }}>
+          <table className="data-table">
+            <thead>
               <tr>
-                <th className="text-left px-5 py-3 font-medium">Name</th>
-                <th className="text-left px-5 py-3 font-medium">Joined</th>
-                <th className="text-left px-5 py-3 font-medium">Role</th>
-                <th className="text-right px-5 py-3 font-medium">Actions</th>
+                <th>Name</th>
+                <th>Joined</th>
+                <th>Role</th>
+                <th className="right">Actions</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-gray-50">
+            <tbody>
               {profiles.map((profile) => (
-                <tr key={profile.id} className="hover:bg-gray-50 transition-colors">
-                  <td className="px-5 py-3 font-medium text-gray-900">
-                    {profile.full_name ?? <span className="text-gray-400 italic">No name</span>}
-                  </td>
-                  <td className="px-5 py-3 text-gray-500">{formatDate(profile.created_at)}</td>
-                  <td className="px-5 py-3">
+                <tr key={profile.id}>
+                  <td className="primary">{profile.full_name ?? <em style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>No name</em>}</td>
+                  <td>{formatDate(profile.created_at)}</td>
+                  <td>
                     <select
                       value={profile.role}
                       onChange={(e) => handleRoleChange(profile.id, e.target.value as 'user' | 'admin')}
-                      className="text-xs border border-gray-200 rounded-md px-2 py-1 focus:outline-none focus:ring-2 focus:ring-[#0079c1]/30 focus:border-[#0079c1]"
+                      style={{
+                        fontSize: 12, fontWeight: 600, fontFamily: 'inherit',
+                        border: '1.5px solid var(--border)', borderRadius: 6,
+                        padding: '4px 8px', background: 'var(--surface)',
+                        color: 'var(--text-mid)', cursor: 'pointer',
+                        outline: 'none',
+                      }}
                     >
                       <option value="user">User</option>
                       <option value="admin">Admin</option>
                     </select>
                   </td>
-                  <td className="px-5 py-3 text-right">
+                  <td className="right">
                     <button
                       onClick={() => setConfirm({ type: 'user', id: profile.id })}
-                      className="text-xs text-red-500 hover:text-red-700 font-medium transition-colors"
+                      style={{ fontSize: 12, fontWeight: 600, color: 'var(--red)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'inherit' }}
                     >
                       Delete
                     </button>
@@ -149,36 +172,32 @@ export default function AdminClient({ profiles: initialProfiles, sessions: initi
               ))}
             </tbody>
           </table>
-          {profiles.length === 0 && (
-            <p className="text-center text-gray-400 py-8 text-sm">No users found</p>
-          )}
+          {profiles.length === 0 && <p style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: 13, padding: '28px 0' }}>No users found</p>}
         </div>
       )}
 
       {/* Sessions */}
       {tab === 'sessions' && (
-        <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden">
-          <table className="w-full text-sm">
-            <thead className="bg-gray-50 text-xs text-gray-500 uppercase tracking-wide">
+        <div className="card" style={{ overflow: 'hidden' }}>
+          <table className="data-table">
+            <thead>
               <tr>
-                <th className="text-left px-5 py-3 font-medium">Chassis #</th>
-                <th className="text-left px-5 py-3 font-medium">Created By</th>
-                <th className="text-left px-5 py-3 font-medium">Date</th>
-                <th className="text-right px-5 py-3 font-medium">Actions</th>
+                <th>Chassis #</th>
+                <th>Created By</th>
+                <th>Date</th>
+                <th className="right">Actions</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-gray-50">
+            <tbody>
               {sessions.map((s) => (
-                <tr key={s.id} className="hover:bg-gray-50 transition-colors">
-                  <td className="px-5 py-3 font-mono font-semibold text-gray-900">{s.chassis_number}</td>
-                  <td className="px-5 py-3 text-gray-500">
-                    {s.profiles?.full_name ?? <span className="italic">Unknown</span>}
-                  </td>
-                  <td className="px-5 py-3 text-gray-500">{formatDate(s.created_at)}</td>
-                  <td className="px-5 py-3 text-right">
+                <tr key={s.id}>
+                  <td className="mono">{s.chassis_number}</td>
+                  <td>{s.profiles?.full_name ?? <em style={{ color: 'var(--text-muted)' }}>Unknown</em>}</td>
+                  <td>{formatDate(s.created_at)}</td>
+                  <td className="right">
                     <button
                       onClick={() => setConfirm({ type: 'session', id: s.id })}
-                      className="text-xs text-red-500 hover:text-red-700 font-medium transition-colors"
+                      style={{ fontSize: 12, fontWeight: 600, color: 'var(--red)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'inherit' }}
                     >
                       Delete
                     </button>
@@ -187,38 +206,36 @@ export default function AdminClient({ profiles: initialProfiles, sessions: initi
               ))}
             </tbody>
           </table>
-          {sessions.length === 0 && (
-            <p className="text-center text-gray-400 py-8 text-sm">No sessions found</p>
-          )}
+          {sessions.length === 0 && <p style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: 13, padding: '28px 0' }}>No sessions found</p>}
         </div>
       )}
 
       {/* Operations */}
       {tab === 'operations' && (
-        <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden">
-          <table className="w-full text-sm">
-            <thead className="bg-gray-50 text-xs text-gray-500 uppercase tracking-wide">
+        <div className="card" style={{ overflow: 'hidden' }}>
+          <table className="data-table">
+            <thead>
               <tr>
-                <th className="text-left px-5 py-3 font-medium">Operation</th>
-                <th className="text-left px-5 py-3 font-medium">Operator</th>
-                <th className="text-left px-5 py-3 font-medium">Stage</th>
-                <th className="text-right px-5 py-3 font-medium">Minutes</th>
-                <th className="text-right px-5 py-3 font-medium">Actions</th>
+                <th>Operation</th>
+                <th>Operator</th>
+                <th>Stage</th>
+                <th className="right">Minutes</th>
+                <th className="right">Actions</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-gray-50">
+            <tbody>
               {operations.map((op) => (
-                <tr key={op.id} className="hover:bg-gray-50 transition-colors">
-                  <td className="px-5 py-3 font-medium text-gray-900">{op.operation_name}</td>
-                  <td className="px-5 py-3 text-gray-500">{op.operator_name}</td>
-                  <td className="px-5 py-3 text-gray-500">{op.stage}</td>
-                  <td className="px-5 py-3 text-right text-gray-700 tabular-nums">
-                    {op.total_minutes !== null ? op.total_minutes.toFixed(1) : <span className="text-gray-400">—</span>}
+                <tr key={op.id}>
+                  <td className="primary">{op.operation_name}</td>
+                  <td>{op.operator_name}</td>
+                  <td>{op.stage}</td>
+                  <td className="right" style={{ fontVariantNumeric: 'tabular-nums', fontWeight: 600, color: op.total_minutes !== null ? 'var(--blue)' : 'var(--text-muted)' }}>
+                    {op.total_minutes !== null ? op.total_minutes.toFixed(1) : '—'}
                   </td>
-                  <td className="px-5 py-3 text-right">
+                  <td className="right">
                     <button
                       onClick={() => setConfirm({ type: 'operation', id: op.id })}
-                      className="text-xs text-red-500 hover:text-red-700 font-medium transition-colors"
+                      style={{ fontSize: 12, fontWeight: 600, color: 'var(--red)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'inherit' }}
                     >
                       Delete
                     </button>
@@ -227,13 +244,10 @@ export default function AdminClient({ profiles: initialProfiles, sessions: initi
               ))}
             </tbody>
           </table>
-          {operations.length === 0 && (
-            <p className="text-center text-gray-400 py-8 text-sm">No operations found</p>
-          )}
+          {operations.length === 0 && <p style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: 13, padding: '28px 0' }}>No operations found</p>}
         </div>
       )}
 
-      {/* Confirm dialog */}
       {confirm && (
         <ConfirmDialog
           title={`Delete ${confirm.type === 'user' ? 'User' : confirm.type === 'session' ? 'Session' : 'Operation'}`}

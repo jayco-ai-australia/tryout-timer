@@ -21,51 +21,45 @@ export default function DashboardClient({ sessions: initial, userId }: Props) {
   const [creating, setCreating] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  function closeModal() {
+    setShowModal(false); setChassisNum(''); setNotes(''); setError(null)
+  }
+
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault()
     if (!chassisNum.trim()) return
-    setCreating(true)
-    setError(null)
+    setCreating(true); setError(null)
 
     const { data, error: err } = await supabase
       .from('tryout_sessions')
       .insert({ chassis_number: chassisNum.trim(), notes: notes.trim() || null, created_by: userId })
-      .select(`id, chassis_number, created_by, created_at, notes, profiles:created_by ( full_name )`)
+      .select('id, chassis_number, created_by, created_at, notes, profiles:created_by ( full_name )')
       .single()
 
-    if (err) {
-      setError(err.message)
-      setCreating(false)
-      return
-    }
+    if (err) { setError(err.message); setCreating(false); return }
 
     const profiles = Array.isArray(data.profiles) ? data.profiles[0] ?? null : data.profiles
     setSessions([{ ...data, profiles, operation_count: 0 }, ...sessions])
-    setShowModal(false)
-    setChassisNum('')
-    setNotes('')
+    closeModal()
     setCreating(false)
   }
 
   function formatDate(iso: string) {
-    return new Date(iso).toLocaleDateString('en-AU', {
-      day: 'numeric', month: 'short', year: 'numeric',
-    })
+    return new Date(iso).toLocaleDateString('en-AU', { day: 'numeric', month: 'short', year: 'numeric' })
   }
 
   return (
-    <main className="max-w-6xl mx-auto px-4 py-6">
+    <main className="page">
       {/* Header */}
-      <div className="flex items-center justify-between mb-6">
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 24, gap: 12 }}>
         <div>
-          <h1 className="text-2xl font-bold text-gray-900">Sessions</h1>
-          <p className="text-sm text-gray-500 mt-0.5">{sessions.length} tryout session{sessions.length !== 1 ? 's' : ''}</p>
+          <h1 style={{ fontSize: 24, fontWeight: 700, color: 'var(--text)', margin: 0 }}>Sessions</h1>
+          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 4 }}>
+            {sessions.length} tryout session{sessions.length !== 1 ? 's' : ''}
+          </p>
         </div>
-        <button
-          onClick={() => setShowModal(true)}
-          className="flex items-center gap-2 bg-[#0079c1] hover:bg-[#0068a8] text-white font-semibold px-4 py-2.5 rounded-lg transition-colors text-sm shadow-sm"
-        >
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+        <button className="btn-primary" onClick={() => setShowModal(true)}>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
             <path d="M12 5v14M5 12h14" />
           </svg>
           New Session
@@ -74,51 +68,93 @@ export default function DashboardClient({ sessions: initial, userId }: Props) {
 
       {/* Grid */}
       {sessions.length === 0 ? (
-        <div className="text-center py-20 text-gray-400">
-          <svg className="mx-auto mb-4 opacity-30" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+        <div style={{ textAlign: 'center', padding: '64px 0', color: 'var(--text-muted)' }}>
+          <svg style={{ display: 'block', margin: '0 auto 12px', opacity: 0.25 }} width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
             <circle cx="12" cy="13" r="8" /><polyline points="12 9 12 13 14.5 15.5" /><path d="M9 3h6" /><path d="M12 3v2" />
           </svg>
-          <p className="font-medium">No sessions yet</p>
-          <p className="text-sm mt-1">Create your first tryout session</p>
+          <p style={{ fontWeight: 600, marginBottom: 4 }}>No sessions yet</p>
+          <p style={{ fontSize: 13 }}>Create your first tryout session to get started</p>
         </div>
       ) : (
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 16 }}>
           {sessions.map((session) => (
             <button
               key={session.id}
               onClick={() => router.push(`/session/${session.id}`)}
-              className="text-left bg-white rounded-xl border border-gray-100 shadow-sm hover:shadow-md hover:border-[#0079c1]/30 transition-all p-4 group"
+              style={{
+                textAlign: 'left',
+                background: 'var(--surface)',
+                border: '1.5px solid var(--border)',
+                borderRadius: 12,
+                boxShadow: '0 1px 4px rgba(0,0,0,0.06)',
+                padding: '16px 18px',
+                cursor: 'pointer',
+                transition: 'box-shadow 0.15s, border-color 0.15s, transform 0.1s',
+                width: '100%',
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.boxShadow = '0 4px 16px rgba(0,0,0,0.10)'
+                e.currentTarget.style.borderColor = 'var(--blue)'
+                e.currentTarget.style.transform = 'translateY(-1px)'
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.boxShadow = '0 1px 4px rgba(0,0,0,0.06)'
+                e.currentTarget.style.borderColor = 'var(--border)'
+                e.currentTarget.style.transform = 'translateY(0)'
+              }}
             >
-              <div className="flex items-start justify-between mb-3">
-                <div className="bg-[#0079c1]/10 text-[#0079c1] text-xs font-bold px-2.5 py-1 rounded-md uppercase tracking-wide">
+              {/* Chassis tag + arrow */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+                <span style={{
+                  background: 'var(--blue-light)',
+                  color: 'var(--blue)',
+                  fontSize: 12,
+                  fontWeight: 700,
+                  padding: '4px 10px',
+                  borderRadius: 6,
+                  letterSpacing: '0.04em',
+                  textTransform: 'uppercase',
+                  fontFamily: 'ui-monospace, monospace',
+                }}>
                   {session.chassis_number}
-                </div>
-                <svg className="text-gray-300 group-hover:text-[#0079c1] transition-colors mt-0.5" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                </span>
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" strokeWidth="2">
                   <path d="M9 18l6-6-6-6" />
                 </svg>
               </div>
-              <div className="space-y-1.5">
-                <div className="flex items-center gap-1.5 text-sm text-gray-500">
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <rect x="3" y="4" width="18" height="18" rx="2" /><path d="M16 2v4M8 2v4M3 10h18" />
-                  </svg>
-                  {formatDate(session.created_at)}
-                </div>
-                <div className="flex items-center gap-1.5 text-sm text-gray-500">
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" />
-                  </svg>
-                  {(session.profiles as { full_name?: string })?.full_name ?? 'Unknown'}
-                </div>
-                <div className="flex items-center gap-1.5 text-sm text-gray-500">
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <circle cx="12" cy="13" r="8" /><polyline points="12 9 12 13 14.5 15.5" /><path d="M9 3h6" /><path d="M12 3v2" />
-                  </svg>
-                  {session.operation_count} operation{session.operation_count !== 1 ? 's' : ''}
-                </div>
+
+              {/* Meta rows */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <Row icon="calendar">
+                  <span style={{ fontSize: 13, color: 'var(--text-mid)' }}>{formatDate(session.created_at)}</span>
+                </Row>
+                <Row icon="user">
+                  <span style={{ fontSize: 13, color: 'var(--text-mid)' }}>
+                    {(session.profiles as { full_name?: string })?.full_name ?? 'Unknown'}
+                  </span>
+                </Row>
+                <Row icon="timer">
+                  <span style={{ fontSize: 13, color: 'var(--text-mid)' }}>
+                    {session.operation_count} operation{session.operation_count !== 1 ? 's' : ''}
+                  </span>
+                </Row>
               </div>
+
               {session.notes && (
-                <p className="mt-3 text-xs text-gray-400 line-clamp-2 border-t border-gray-50 pt-2">{session.notes}</p>
+                <p style={{
+                  marginTop: 12,
+                  paddingTop: 10,
+                  borderTop: '1px solid var(--border)',
+                  fontSize: 12,
+                  color: 'var(--text-muted)',
+                  lineHeight: 1.5,
+                  overflow: 'hidden',
+                  display: '-webkit-box',
+                  WebkitLineClamp: 2,
+                  WebkitBoxOrient: 'vertical',
+                }}>
+                  {session.notes}
+                </p>
               )}
             </button>
           ))}
@@ -127,50 +163,40 @@ export default function DashboardClient({ sessions: initial, userId }: Props) {
 
       {/* New Session Modal */}
       {showModal && (
-        <Modal title="New Tryout Session" onClose={() => { setShowModal(false); setChassisNum(''); setNotes(''); setError(null) }}>
-          <form onSubmit={handleCreate} className="flex flex-col gap-4">
+        <Modal title="New Tryout Session" onClose={closeModal}>
+          <form onSubmit={handleCreate} style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1.5">
-                Chassis Number <span className="text-red-500">*</span>
-              </label>
+              <label className="label">Chassis Number <span style={{ color: 'var(--red)' }}>*</span></label>
               <input
+                className="input"
                 type="text"
                 value={chassisNum}
                 onChange={(e) => setChassisNum(e.target.value)}
                 required
                 autoFocus
-                className="w-full px-3.5 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#0079c1]/30 focus:border-[#0079c1] transition-colors font-mono uppercase"
                 placeholder="e.g. JD24-001"
+                style={{ textTransform: 'uppercase', fontFamily: 'ui-monospace, monospace', fontWeight: 600 }}
               />
             </div>
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1.5">
-                Notes <span className="text-gray-400 font-normal">(optional)</span>
-              </label>
+              <label className="label">Notes <span style={{ color: 'var(--text-muted)', fontWeight: 400 }}>(optional)</span></label>
               <textarea
+                className="input"
                 value={notes}
                 onChange={(e) => setNotes(e.target.value)}
                 rows={3}
-                className="w-full px-3.5 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#0079c1]/30 focus:border-[#0079c1] transition-colors resize-none"
                 placeholder="Any additional notes…"
+                style={{ resize: 'none' }}
               />
             </div>
             {error && (
-              <div className="bg-red-50 border border-red-100 text-red-600 text-sm rounded-lg px-3.5 py-2.5">{error}</div>
+              <div style={{ background: 'var(--red-bg)', border: '1px solid #fecaca', color: 'var(--red)', fontSize: 13, borderRadius: 8, padding: '10px 14px' }}>
+                {error}
+              </div>
             )}
-            <div className="flex gap-3 justify-end pt-1">
-              <button
-                type="button"
-                onClick={() => { setShowModal(false); setChassisNum(''); setNotes(''); setError(null) }}
-                className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                type="submit"
-                disabled={creating}
-                className="px-4 py-2 text-sm font-medium text-white bg-[#0079c1] hover:bg-[#0068a8] disabled:opacity-60 rounded-lg transition-colors"
-              >
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 4 }}>
+              <button type="button" className="btn-ghost" onClick={closeModal}>Cancel</button>
+              <button type="submit" disabled={creating} className="btn-primary">
                 {creating ? 'Creating…' : 'Create Session'}
               </button>
             </div>
@@ -178,5 +204,21 @@ export default function DashboardClient({ sessions: initial, userId }: Props) {
         </Modal>
       )}
     </main>
+  )
+}
+
+function Row({ icon, children }: { icon: 'calendar' | 'user' | 'timer'; children: React.ReactNode }) {
+  const icons = {
+    calendar: <path d="M8 2v4M16 2v4M3 10h18M5 4h14a2 2 0 012 2v14a2 2 0 01-2 2H5a2 2 0 01-2-2V6a2 2 0 012-2z" />,
+    user: <><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2" /><circle cx="12" cy="7" r="4" /></>,
+    timer: <><circle cx="12" cy="13" r="8" /><polyline points="12 9 12 13 14.5 15.5" /><path d="M9 3h6" /><path d="M12 3v2" /></>,
+  }
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" strokeWidth="2">
+        {icons[icon]}
+      </svg>
+      {children}
+    </div>
   )
 }

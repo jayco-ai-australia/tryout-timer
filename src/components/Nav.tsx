@@ -30,38 +30,82 @@ export default function Nav() {
     router.refresh()
   }
 
-  const linkClass = (href: string) =>
-    `text-sm font-medium px-3 py-1.5 rounded-md transition-colors ${
-      pathname === href || pathname.startsWith(href + '/')
-        ? 'bg-white/20 text-white'
-        : 'text-white/80 hover:text-white hover:bg-white/10'
-    }`
+  function isActive(href: string) {
+    return pathname === href || pathname.startsWith(href + '/')
+  }
 
   return (
-    <nav className="bg-[#0079c1] shadow-md sticky top-0 z-50">
-      <div className="max-w-6xl mx-auto px-4 h-14 flex items-center justify-between">
+    <nav style={{
+      background: 'var(--surface)',
+      borderBottom: '1.5px solid var(--border)',
+      position: 'sticky',
+      top: 0,
+      zIndex: 50,
+      boxShadow: '0 1px 3px rgba(0,0,0,0.06)',
+    }}>
+      <div style={{
+        maxWidth: 1200,
+        margin: '0 auto',
+        padding: '0 16px',
+        height: 56,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+      }}>
         {/* Logo */}
-        <Link href="/dashboard" className="flex items-center gap-2 text-white font-bold text-lg">
+        <Link href="/dashboard" style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+          textDecoration: 'none',
+          color: 'var(--blue)',
+          fontWeight: 700,
+          fontSize: 17,
+          letterSpacing: '-0.01em',
+        }}>
           <StopwatchIcon />
-          <span>TryOut Timer</span>
+          TryOut Timer
         </Link>
 
         {/* Links */}
-        <div className="flex items-center gap-1">
-          <Link href="/dashboard" className={linkClass('/dashboard')}>
-            Dashboard
-          </Link>
-          <Link href="/analytics" className={linkClass('/analytics')}>
-            Analytics
-          </Link>
-          {role === 'admin' && (
-            <Link href="/admin" className={linkClass('/admin')}>
-              Admin
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+          {[
+            { href: '/dashboard', label: 'Dashboard' },
+            { href: '/analytics', label: 'Analytics' },
+            ...(role === 'admin' ? [{ href: '/admin', label: 'Admin' }] : []),
+          ].map(({ href, label }) => (
+            <Link
+              key={href}
+              href={href}
+              style={{
+                fontSize: 14,
+                fontWeight: 600,
+                padding: '6px 12px',
+                borderRadius: 7,
+                textDecoration: 'none',
+                transition: 'background 0.12s, color 0.12s',
+                background: isActive(href) ? 'var(--blue-light)' : 'transparent',
+                color: isActive(href) ? 'var(--blue)' : 'var(--text-mid)',
+              }}
+            >
+              {label}
             </Link>
-          )}
+          ))}
+
           <button
             onClick={handleLogout}
-            className="ml-2 text-sm font-medium text-white/80 hover:text-white px-3 py-1.5 rounded-md hover:bg-white/10 transition-colors"
+            style={{
+              marginLeft: 8,
+              fontSize: 14,
+              fontWeight: 600,
+              padding: '6px 12px',
+              borderRadius: 7,
+              border: '1.5px solid var(--border)',
+              background: 'transparent',
+              color: 'var(--text-mid)',
+              cursor: 'pointer',
+              transition: 'background 0.12s',
+            }}
           >
             Logout
           </button>
