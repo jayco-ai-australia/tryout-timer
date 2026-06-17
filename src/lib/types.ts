@@ -27,9 +27,17 @@ export interface Operation {
   paused_duration_seconds: number
   completed_at: string | null
   total_minutes: number | null
-  notes: string | null
   created_by: string | null
   created_at: string
+}
+
+export interface Note {
+  id: string
+  operation_id: string
+  content: string
+  created_by: string | null
+  created_at: string
+  profiles?: { full_name: string | null } | null
 }
 
 export type OperationStatus = 'idle' | 'running' | 'paused' | 'complete'

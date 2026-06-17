@@ -1,16 +1,18 @@
 'use client'
 
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import Link from 'next/link'
 import { createClient } from '@/lib/supabase/client'
 import Modal from '@/components/Modal'
 import ConfirmDialog from '@/components/ConfirmDialog'
-import type { Operation, TryoutSession } from '@/lib/types'
+import type { Operation, TryoutSession, Note } from '@/lib/types'
 
 interface Props {
   session: TryoutSession
   initialOperations: Operation[]
+  initialNotes: Record<string, Note[]>
   userId: string
+  userFullName: string | null
 }
 
 interface TimerState {
@@ -19,15 +21,22 @@ interface TimerState {
   accumulatedPause: number
 }
 
-export default function SessionClient({ session, initialOperations, userId }: Props) {
+export default function SessionClient({
+  session,
+  initialOperations,
+  initialNotes,
+  userId,
+  userFullName,
+}: Props) {
   const supabase = createClient()
   const [operations, setOperations] = useState<Operation[]>(initialOperations)
+  const [notes, setNotes] = useState<Record<string, Note[]>>(initialNotes)
+  const [newNoteText, setNewNoteText] = useState<Record<string, string>>({})
+  const [addingNote, setAddingNote] = useState<Record<string, boolean>>({})
   const [timers, setTimers] = useState<Record<string, number>>({})
   const [timerStates, setTimerStates] = useState<Record<string, TimerState>>({})
   const [showAddModal, setShowAddModal] = useState(false)
   const [confirmCompleteId, setConfirmCompleteId] = useState<string | null>(null)
-  const [editingNoteId, setEditingNoteId] = useState<string | null>(null)
-  const [noteText, setNoteText] = useState('')
   const [addForm, setAddForm] = useState({ operator_name: '', stage: '', operation_name: '' })
   const [addError, setAddError] = useState<string | null>(null)
   const [adding, setAdding] = useState(false)
@@ -77,6 +86,12 @@ export default function SessionClient({ session, initialOperations, userId }: Pr
 
   function formatDate(iso: string) {
     return new Date(iso).toLocaleDateString('en-AU', { day: 'numeric', month: 'short', year: 'numeric' })
+  }
+
+  function formatNoteTime(iso: string) {
+    return new Date(iso).toLocaleString('en-AU', {
+      day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit',
+    })
   }
 
   function getStatus(op: Operation): 'idle' | 'running' | 'paused' | 'complete' {
@@ -140,7 +155,6 @@ export default function SessionClient({ session, initialOperations, userId }: Pr
     const state = timerStates[opId]
     let finalPause = state?.accumulatedPause ?? op.paused_duration_seconds
 
-    // If currently paused, add current pause segment
     if (state?.pausedAt) {
       finalPause += Math.floor((Date.now() - state.pausedAt) / 1000)
     }
@@ -156,28 +170,39 @@ export default function SessionClient({ session, initialOperations, userId }: Pr
     if (error) return
 
     setOperations((prev) => prev.map((o) => o.id === opId ? data : o))
-    setTimerStates((prev) => {
-      const next = { ...prev }
-      delete next[opId]
-      return next
-    })
-    setTimers((prev) => {
-      const next = { ...prev }
-      delete next[opId]
-      return next
-    })
+    setTimerStates((prev) => { const n = { ...prev }; delete n[opId]; return n })
+    setTimers((prev) => { const n = { ...prev }; delete n[opId]; return n })
   }
 
-  async function handleSaveNote(opId: string) {
-    await supabase
-      .from('operations')
-      .update({ notes: noteText.trim() || null })
-      .eq('id', opId)
+  async function handleAddNote(opId: string) {
+    const content = (newNoteText[opId] ?? '').trim()
+    if (!content) return
 
-    setOperations((prev) =>
-      prev.map((o) => o.id === opId ? { ...o, notes: noteText.trim() || null } : o)
-    )
-    setEditingNoteId(null)
+    setAddingNote((prev) => ({ ...prev, [opId]: true }))
+
+    const { data, error } = await supabase
+      .from('notes')
+      .insert({ operation_id: opId, content, created_by: userId })
+      .select('id, operation_id, content, created_by, created_at')
+      .single()
+
+    if (error) {
+      setAddingNote((prev) => ({ ...prev, [opId]: false }))
+      return
+    }
+
+    // Optimistically append with current user's name
+    const newNote: Note = {
+      ...data,
+      profiles: { full_name: userFullName },
+    }
+
+    setNotes((prev) => ({
+      ...prev,
+      [opId]: [...(prev[opId] ?? []), newNote],
+    }))
+    setNewNoteText((prev) => ({ ...prev, [opId]: '' }))
+    setAddingNote((prev) => ({ ...prev, [opId]: false }))
   }
 
   async function handleAddOperation(e: React.FormEvent) {
@@ -237,9 +262,7 @@ export default function SessionClient({ session, initialOperations, userId }: Pr
         </Link>
         <div className="flex items-start justify-between flex-wrap gap-3">
           <div>
-            <div className="flex items-center gap-2">
-              <h1 className="text-2xl font-bold text-gray-900 font-mono">{session.chassis_number}</h1>
-            </div>
+            <h1 className="text-2xl font-bold text-gray-900 font-mono">{session.chassis_number}</h1>
             <p className="text-sm text-gray-500 mt-0.5">
               Started {formatDate(session.created_at)} · {operations.length} operation{operations.length !== 1 ? 's' : ''}
             </p>
@@ -271,6 +294,7 @@ export default function SessionClient({ session, initialOperations, userId }: Pr
           {operations.map((op) => {
             const status = getStatus(op)
             const elapsed = timers[op.id] ?? 0
+            const opNotes = notes[op.id] ?? []
 
             return (
               <div
@@ -347,46 +371,48 @@ export default function SessionClient({ session, initialOperations, userId }: Pr
                   </div>
                 )}
 
-                {/* Notes */}
-                <div className="mt-3 pt-3 border-t border-gray-50">
-                  {editingNoteId === op.id ? (
-                    <div className="flex gap-2">
-                      <input
-                        type="text"
-                        value={noteText}
-                        onChange={(e) => setNoteText(e.target.value)}
-                        autoFocus
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') handleSaveNote(op.id)
-                          if (e.key === 'Escape') setEditingNoteId(null)
-                        }}
-                        className="flex-1 text-sm px-3 py-1.5 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#0079c1]/30 focus:border-[#0079c1]"
-                        placeholder="Add a note…"
-                      />
-                      <button
-                        onClick={() => handleSaveNote(op.id)}
-                        className="text-xs text-white bg-[#0079c1] hover:bg-[#0068a8] px-3 py-1.5 rounded-lg font-medium"
-                      >
-                        Save
-                      </button>
-                      <button
-                        onClick={() => setEditingNoteId(null)}
-                        className="text-xs text-gray-500 bg-gray-100 hover:bg-gray-200 px-3 py-1.5 rounded-lg"
-                      >
-                        Cancel
-                      </button>
-                    </div>
-                  ) : (
-                    <button
-                      onClick={() => { setEditingNoteId(op.id); setNoteText(op.notes ?? '') }}
-                      className="text-sm text-gray-400 hover:text-gray-600 transition-colors flex items-center gap-1.5"
-                    >
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <path d="M12 20h9M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z" />
-                      </svg>
-                      {op.notes ? op.notes : 'Add note'}
-                    </button>
+                {/* Notes section */}
+                <div className="mt-4 pt-3 border-t border-gray-50">
+                  <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-2">
+                    Notes {opNotes.length > 0 && `(${opNotes.length})`}
+                  </p>
+
+                  {/* Existing notes */}
+                  {opNotes.length > 0 && (
+                    <ul className="flex flex-col gap-2 mb-3">
+                      {opNotes.map((note) => (
+                        <li key={note.id} className="bg-gray-50 rounded-lg px-3 py-2">
+                          <p className="text-sm text-gray-800 leading-snug">{note.content}</p>
+                          <p className="text-xs text-gray-400 mt-1">
+                            {note.profiles?.full_name ?? 'Unknown'} · {formatNoteTime(note.created_at)}
+                          </p>
+                        </li>
+                      ))}
+                    </ul>
                   )}
+
+                  {/* Add note input */}
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={newNoteText[op.id] ?? ''}
+                      onChange={(e) =>
+                        setNewNoteText((prev) => ({ ...prev, [op.id]: e.target.value }))
+                      }
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') handleAddNote(op.id)
+                      }}
+                      placeholder="Add a note…"
+                      className="flex-1 text-sm px-3 py-1.5 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#0079c1]/30 focus:border-[#0079c1] transition-colors"
+                    />
+                    <button
+                      onClick={() => handleAddNote(op.id)}
+                      disabled={addingNote[op.id] || !(newNoteText[op.id] ?? '').trim()}
+                      className="text-xs font-semibold text-white bg-[#0079c1] hover:bg-[#0068a8] disabled:opacity-40 px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap"
+                    >
+                      {addingNote[op.id] ? '…' : 'Add Note'}
+                    </button>
+                  </div>
                 </div>
               </div>
             )
