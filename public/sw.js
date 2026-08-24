@@ -1,10 +1,14 @@
-const CACHE_NAME = 'tryout-timer-v1'
+const CACHE_NAME = 'tryout-timer-v2'
+const OFFLINE_URL = '/offline.html'
 
 const PRECACHE = [
   '/',
   '/dashboard',
+  '/collect',
+  '/records',
   '/analytics',
   '/login',
+  OFFLINE_URL,
 ]
 
 self.addEventListener('install', (event) => {
@@ -23,15 +27,15 @@ self.addEventListener('activate', (event) => {
   self.clients.claim()
 })
 
-// Network-first for API/auth, cache-first for static assets
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url)
 
+  // Let the network handle API and Supabase calls without interference
   if (
     url.pathname.startsWith('/api/') ||
     url.hostname.includes('supabase')
   ) {
-    return // Let network handle API and Supabase calls
+    return
   }
 
   if (event.request.method !== 'GET') return
@@ -45,6 +49,17 @@ self.addEventListener('fetch', (event) => {
         }
         return response
       })
-      .catch(() => caches.match(event.request))
+      .catch(async () => {
+        const cached = await caches.match(event.request)
+        if (cached) return cached
+
+        // For page navigations with no cache, show the offline fallback
+        if (event.request.mode === 'navigate') {
+          const offline = await caches.match(OFFLINE_URL)
+          if (offline) return offline
+        }
+
+        return new Response('Offline', { status: 503, statusText: 'Service Unavailable' })
+      })
   )
 })

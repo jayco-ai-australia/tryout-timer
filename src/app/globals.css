@@ -1,4 +1,25 @@
-@import "tailwindcss";
+/* ── Minimal base reset (replaces Tailwind preflight) ──────── */
+*, *::before, *::after { box-sizing: border-box; }
+html { font-size: 16px; line-height: 1.5; -webkit-text-size-adjust: 100%; tab-size: 4; }
+body { margin: 0; line-height: inherit; }
+h1, h2, h3, h4, h5, h6 { font-size: inherit; font-weight: inherit; margin: 0; }
+p { margin: 0; }
+a { color: inherit; text-decoration: inherit; }
+button, input, optgroup, select, textarea {
+  font-family: inherit;
+  font-size: 100%;
+  font-weight: inherit;
+  line-height: inherit;
+  color: inherit;
+  margin: 0;
+  padding: 0;
+}
+button { cursor: pointer; background: transparent; border: 0; }
+[type='button'], [type='submit'], [type='reset'] { -webkit-appearance: button; }
+ol, ul, menu { list-style: none; margin: 0; padding: 0; }
+img, svg { display: block; vertical-align: middle; }
+img { max-width: 100%; height: auto; }
+table { text-indent: 0; border-color: inherit; border-collapse: collapse; }
 
 /* ── Design tokens ─────────────────────────────────────────── */
 :root {
@@ -6,7 +27,7 @@
   --blue-dark:  #006aab;
   --blue-light: #e8f4fb;
   --grey:       #4e4b48;
-  --bg:         #f5f7f9;
+  --bg:         #f8f9fa;
   --surface:    #ffffff;
   --border:     #e4e7ec;
   --text:       #1a1a1a;
@@ -21,14 +42,10 @@
 }
 
 /* ── Base ──────────────────────────────────────────────────── */
-*, *::before, *::after { box-sizing: border-box; }
-
-html { font-size: 16px; }
-
 body {
   background: var(--bg);
   color: var(--text);
-  font-family: var(--font-montserrat), -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: var(--font-inter), Inter, system-ui, -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -38,13 +55,16 @@ body {
 /* Page wrapper */
 .page { max-width: 1200px; margin: 0 auto; padding: 24px 16px; }
 .page-narrow { max-width: 960px; margin: 0 auto; padding: 24px 16px; }
+/* Four side-by-side panes need more room than the 1200px reading width the rest of the app
+   uses — /setup's Finder drill-down is the only screen wide enough to want it. */
+.page-wide { max-width: 1640px; margin: 0 auto; padding: 24px 16px; }
 
 /* Cards */
 .card {
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 12px;
-  box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+  border-radius: 10px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.08);
 }
 
 /* Primary button */
@@ -118,6 +138,22 @@ body {
 }
 .input::placeholder { color: var(--text-muted); }
 
+/* Select */
+.select {
+  font-size: 13px;
+  font-weight: 500;
+  font-family: inherit;
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 12px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  outline: none;
+  min-width: 160px;
+}
+.select:disabled { opacity: 0.5; cursor: not-allowed; }
+
 /* Labels */
 .label {
   display: block;
@@ -141,6 +177,7 @@ body {
 .badge-grey   { background: #f0f0f0; color: #6b6b6b; }
 .badge-green  { background: var(--green-bg); color: #15803d; }
 .badge-amber  { background: var(--amber-bg); color: #92400e; }
+.badge-red    { background: var(--red-bg);   color: #b91c1c; }
 .badge-blue   { background: var(--blue-light); color: var(--blue); }
 
 /* Live dot */
@@ -169,11 +206,1380 @@ body {
   border-bottom: 1px solid var(--border);
 }
 .data-table thead th.right { text-align: right; }
+.data-table thead th.center { text-align: center; }
+/* A sortable header: the whole cell is the target, and the active one keeps its arrow visible
+   so the current ordering is readable without hovering. */
+.data-table thead th.sortable {
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.data-table thead th.sortable:hover { color: var(--text); }
+.data-table thead th .sort-arrow { font-size: 9px; margin-left: 4px; opacity: 0.35; }
+.data-table thead th.sorted .sort-arrow { opacity: 1; color: var(--blue); }
 .data-table tbody tr { border-bottom: 1px solid #f2f2f2; }
 .data-table tbody tr:last-child { border-bottom: none; }
 .data-table tbody tr:hover { background: #fafbfc; }
 .data-table tbody td { padding: 12px 20px; color: var(--text-mid); vertical-align: middle; }
 .data-table tbody td.primary { font-weight: 600; color: var(--text); }
 .data-table tbody td.right { text-align: right; }
+.data-table tbody td.center { text-align: center; }
+
+/* A small icon affordance inside a table cell — sized to sit on the text baseline without
+   stretching the row, and muted until hovered so the cell still reads as its value first. */
+.row-icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s, background 0.12s;
+}
+.row-icon-button:hover {
+  color: var(--blue);
+  border-color: var(--blue);
+  background: var(--blue-light);
+}
 .data-table tbody td.mono { font-family: ui-monospace, "Cascadia Code", monospace; font-weight: 600; }
 .data-table tbody td.blue { font-weight: 700; color: var(--blue); text-align: right; }
+.data-table tfoot td { padding: 12px 20px; color: var(--text-mid); vertical-align: middle; border-top: 2px solid var(--border); background: #fafafa; }
+.data-table tfoot td.blue { font-weight: 700; color: var(--blue); text-align: right; }
+
+/* ── Nav ───────────────────────────────────────────────────── */
+.nav {
+  background: var(--surface);
+  border-bottom: 1.5px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+}
+.nav-inner {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 16px;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.nav-logo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-decoration: none;
+  color: var(--blue);
+  font-weight: 700;
+  font-size: 17px;
+  letter-spacing: -0.01em;
+}
+.nav-links { display: flex; align-items: center; gap: 4px; }
+.nav-link {
+  font-size: 14px;
+  font-weight: 600;
+  padding: 6px 12px;
+  border-radius: 7px;
+  text-decoration: none;
+  transition: background 0.12s, color 0.12s;
+  background: transparent;
+  color: var(--text-mid);
+}
+.nav-link:hover { background: var(--bg); }
+.nav-link-active { background: var(--blue-light); color: var(--blue); }
+.nav-link-active:hover { background: var(--blue-light); }
+.nav-logout {
+  margin-left: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 6px 12px;
+  border-radius: 7px;
+  border: 1.5px solid var(--border);
+  background: transparent;
+  color: var(--text-mid);
+  cursor: pointer;
+  transition: background 0.12s;
+}
+.nav-logout:hover { background: var(--bg); }
+
+/* ── Tabs ──────────────────────────────────────────────────── */
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 24px;
+  background: #eef0f3;
+  padding: 4px;
+  border-radius: 10px;
+  width: fit-content;
+  flex-wrap: wrap;
+}
+.tab {
+  padding: 7px 16px;
+  border-radius: 7px;
+  border: none;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: inherit;
+  transition: background 0.12s, box-shadow 0.12s;
+  background: transparent;
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.tab-active { background: var(--surface); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+.tab-count {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 20px;
+  background: #e0e2e6;
+  color: var(--text-muted);
+}
+.tab-active .tab-count { background: var(--blue-light); color: var(--blue); }
+
+/* ── Grid ──────────────────────────────────────────────────── */
+.grid-3 { display: grid; grid-template-columns: 1fr; gap: 16px; }
+@media (min-width: 768px) { .grid-3 { grid-template-columns: repeat(3, 1fr); } }
+
+.grid-2 { display: grid; grid-template-columns: 1fr; gap: 16px; }
+@media (min-width: 768px) { .grid-2 { grid-template-columns: repeat(2, 1fr); } }
+
+.grid-4 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+@media (min-width: 768px) { .grid-4 { grid-template-columns: repeat(4, 1fr); } }
+
+/* ── Stat cards ────────────────────────────────────────────── */
+.stat-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+  padding: 18px 20px;
+}
+.stat-card-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 8px;
+}
+.stat-card-value { font-size: 30px; font-weight: 700; color: var(--text); line-height: 1; }
+.stat-card-sub { font-size: 12px; color: var(--text-muted); margin-top: 6px; }
+
+/* ── Entry toggle (Collect) ───────────────────────────────── */
+.entry-toggle {
+  display: flex;
+  gap: 4px;
+  background: #eef0f3;
+  padding: 4px;
+  border-radius: 10px;
+  width: fit-content;
+  margin-bottom: 20px;
+}
+.entry-toggle-btn {
+  padding: 9px 18px;
+  border-radius: 7px;
+  border: none;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: inherit;
+  background: transparent;
+  color: var(--text-muted);
+  transition: background 0.12s, box-shadow 0.12s;
+}
+.entry-toggle-btn-active { background: var(--surface); color: var(--blue); box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+
+/* ── Timer display ─────────────────────────────────────────── */
+.timer-display {
+  font-family: ui-monospace, "Cascadia Code", monospace;
+  font-size: 34px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  letter-spacing: 0.01em;
+}
+.timer-display-running { color: var(--green); }
+.timer-display-paused { color: var(--amber); }
+
+/* ── Checkbox list (related models etc.) ──────────────────── */
+.checkbox-list {
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  font-size: 14px;
+}
+.checkbox-row input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--blue); cursor: pointer; }
+
+/* ── Coverage bar ──────────────────────────────────────────── */
+.coverage-bar { width: 100%; height: 6px; border-radius: 4px; background: #eef0f3; overflow: hidden; }
+.coverage-fill { height: 100%; background: var(--blue); border-radius: 4px; transition: width 0.2s; }
+
+/* ── Exceptions / next-to-time list ───────────────────────── */
+.exception-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid #f2f2f2;
+}
+.exception-item:last-child { border-bottom: none; }
+
+.exception-item-button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  border-bottom: 1px solid #f2f2f2;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.12s;
+}
+.exception-item-button:last-child { border-bottom: none; }
+.exception-item-button:hover { background: var(--bg); }
+
+/* ── Gaps drawer (dashboard) ───────────────────────────────── */
+.gaps-drawer-overlay {
+  position: fixed; inset: 0; z-index: 200;
+  background: rgba(15, 23, 36, 0.45);
+  opacity: 0;
+  transition: opacity 0.28s ease;
+}
+.gaps-drawer-overlay-visible { opacity: 1; }
+
+.gaps-drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; z-index: 201;
+  width: 25vw; min-width: min(320px, 100vw); max-width: 100vw;
+  background: var(--surface);
+  box-shadow: -8px 0 32px rgba(0,0,0,0.14);
+  overflow-y: auto; overflow-x: hidden;
+  display: flex; flex-direction: column;
+  transform: translateX(100%);
+  transition: transform 0.32s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.gaps-drawer-visible { transform: translateX(0); }
+
+.gaps-drawer-header {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 10px; padding: 20px 20px 16px; border-bottom: 1px solid var(--border);
+}
+.gaps-drawer-title { font-size: 17px; font-weight: 700; color: var(--text); word-break: break-word; }
+.gaps-drawer-jobname { font-size: 13px; color: var(--text-muted); margin-top: 3px; word-break: break-word; }
+.gaps-drawer-model { font-size: 13px; font-weight: 700; color: var(--blue); margin-top: 8px; word-break: break-word; }
+.gaps-drawer-close {
+  background: none; border: none; cursor: pointer; padding: 4px; border-radius: 6px;
+  color: var(--text-muted); line-height: 0; flex-shrink: 0;
+}
+.gaps-drawer-close:hover { background: var(--bg); }
+
+.gaps-drawer-body { padding: 8px 0; max-width: 100%; }
+.gaps-drawer-item {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 14px 20px; border-bottom: 1px solid #f2f2f2;
+}
+.gaps-drawer-item:last-child { border-bottom: none; }
+.gaps-drawer-item-name { font-size: 13px; color: var(--text); word-break: break-word; }
+.gaps-drawer-item-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.gaps-drawer-edit-group { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.gaps-drawer-item-status { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 6px; font-weight: 700; font-size: 12px; }
+.gaps-drawer-item-status-ok { color: #15803d; }
+.gaps-drawer-item-status-missing { color: var(--red); }
+.gaps-drawer-edit-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  background: rgba(0,0,0,0.06); border: none; border-radius: 5px;
+  width: 20px; height: 20px; cursor: pointer; color: inherit; padding: 0;
+  transition: background 0.12s;
+}
+.gaps-drawer-edit-btn:hover { background: rgba(0,0,0,0.12); }
+
+/* ── Validate matrix ───────────────────────────────────────── */
+.validate-job-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--blue);
+  margin-bottom: 10px;
+}
+.validate-table { width: 100%; border-collapse: collapse; font-size: 13px; white-space: nowrap; }
+.validate-table thead th {
+  text-align: left;
+  padding: 10px 16px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--grey);
+  background: #fafafa;
+  border-bottom: 1px solid var(--border);
+}
+.validate-table tbody tr { border-bottom: 1px solid #f2f2f2; }
+.validate-table tbody tr:last-child { border-bottom: none; }
+.validate-table-op-cell { padding: 10px 16px; vertical-align: middle; }
+.validate-table-op-name { font-size: 13px; font-weight: 600; color: var(--text); }
+.validate-table-op-avg { font-size: 11px; color: var(--grey); margin-top: 2px; }
+.validate-cell-wrap { padding: 0; }
+.validate-cell {
+  padding: 10px 16px;
+  text-align: center;
+  font-weight: 700;
+  font-size: 13px;
+  vertical-align: middle;
+  cursor: pointer;
+  border: none;
+  transition: filter 0.12s;
+}
+.validate-cell:hover { filter: brightness(0.96); }
+.validate-cell-all  { background: var(--green-bg); color: #15803d; }
+.validate-cell-some { background: var(--amber-bg); color: #92400e; }
+.validate-cell-none { background: var(--red-bg);   color: var(--red); }
+
+/* ── Validate drawer ───────────────────────────────────────── */
+.validate-drawer-overlay {
+  position: fixed; inset: 0; z-index: 200;
+  background: rgba(15, 23, 36, 0.45);
+}
+.validate-drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; z-index: 201;
+  width: 380px; max-width: 100vw;
+  background: var(--surface);
+  box-shadow: -8px 0 32px rgba(0,0,0,0.14);
+  overflow-y: auto;
+  display: flex; flex-direction: column;
+}
+.validate-drawer-header {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 12px; padding: 20px 22px 16px; border-bottom: 1px solid var(--border);
+}
+.validate-drawer-title { font-size: 16px; font-weight: 700; color: var(--blue); }
+.validate-drawer-subtitle { font-size: 13px; font-weight: 600; color: var(--grey); margin-top: 3px; }
+.validate-drawer-close {
+  background: none; border: none; cursor: pointer; padding: 4px; border-radius: 6px;
+  color: var(--text-muted); line-height: 0; flex-shrink: 0;
+}
+.validate-drawer-body { padding: 8px 0; }
+.validate-drawer-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 12px 22px; border-bottom: 1px solid #f2f2f2;
+  font-size: 13px; color: var(--text);
+}
+.validate-drawer-item:last-child { border-bottom: none; }
+.validate-drawer-item-status { display: inline-flex; align-items: center; gap: 6px; font-weight: 700; font-size: 12px; }
+.validate-drawer-item-status-ok { color: #15803d; }
+.validate-drawer-item-status-missing { color: var(--red); }
+.validate-drawer-edit-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  background: rgba(0,0,0,0.06); border: none; border-radius: 5px;
+  width: 20px; height: 20px; cursor: pointer; color: inherit; padding: 0;
+  transition: background 0.12s;
+}
+.validate-drawer-edit-btn:hover { background: rgba(0,0,0,0.12); }
+
+/* ── Chart card ────────────────────────────────────────────── */
+.chart-card { overflow: hidden; margin-bottom: 12px; }
+.chart-card-body { padding: 20px 20px 4px; }
+
+/* ── Search results dropdown ──────────────────────────────── */
+.search-results {
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  margin-top: 8px;
+}
+.search-result-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  text-align: left;
+  padding: 12px 16px;
+  background: var(--surface);
+  border: none;
+  border-bottom: 1px solid #f2f2f2;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.12s;
+}
+.search-result-row:last-child { border-bottom: none; }
+.search-result-row:hover { background: var(--bg); }
+
+/* ── Three-pane workbench (Collect) ──────────────────────────
+   Wider breakpoint than .grid-3 on purpose: a tablet in portrait (~768-820px) still has too
+   little room for setup + models + timers side by side, so it should stay stacked. */
+.collect-panes {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 20px;
+  align-items: start;
+}
+@media (min-width: 1024px) {
+  .collect-panes { grid-template-columns: repeat(3, 1fr); }
+}
+
+/* ── Timer cards grid (Collect) ───────────────────────────── */
+.ops-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+  align-items: stretch;
+}
+@media (max-width: 767px) {
+  .ops-grid { grid-template-columns: 1fr; }
+}
+/* Equal-height cards */
+.op-card {
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+  overflow: hidden;
+}
+/* Card body fills remaining space */
+.op-card-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  padding: 14px 18px;
+}
+/* Notes section always at the bottom */
+.op-notes-section {
+  margin-top: auto;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+/* ── Finder panes (/setup) ───────────────────────────────────────────────────────────────
+   Four columns that drill left → right: Stages → Jobs → Operations → Models. Each pane is its
+   own scroll container so a long list never pushes the others off screen, and the row/footer
+   styling deliberately mirrors .exception-item so a pane row looks like every other list row
+   in the app. */
+.finder-panes {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+  align-items: stretch;
+}
+
+.finder-pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  height: 64vh;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+/* The pane holding the current selection's downstream focus — a quiet cue about where you are
+   in the drill, not a second selected state. */
+.finder-pane-active { border-color: #cdd0d6; box-shadow: 0 1px 4px rgba(0,0,0,0.05); }
+
+.finder-pane-header {
+  flex-shrink: 0;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+.finder-pane-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+.finder-pane-sub {
+  font-size: 12px;
+  color: var(--text-mid);
+  margin-top: 2px;
+  word-break: break-word;
+}
+
+.finder-pane-body { flex: 1; min-height: 0; overflow-y: auto; }
+
+.finder-pane-footer {
+  flex-shrink: 0;
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.finder-pane-empty {
+  padding: 28px 16px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.finder-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 9px 12px;
+  border-bottom: 1px solid #f2f2f2;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+.finder-row:last-child { border-bottom: none; }
+.finder-row:hover { background: var(--bg); }
+.finder-row-selected,
+.finder-row-selected:hover { background: var(--blue-light); }
+.finder-row-selected .finder-row-name { color: var(--blue); }
+
+.finder-row-main { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1; }
+.finder-row-name { font-size: 13px; font-weight: 600; color: var(--text); word-break: break-word; }
+.finder-row-meta { font-size: 11px; color: var(--text-muted); margin-top: 1px; word-break: break-word; }
+.finder-row-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+
+/* Row-level text buttons (rename, move, delete) — deliberately unstyled boxes so a dense pane
+   row doesn't turn into a strip of competing buttons. */
+.finder-row-action {
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.finder-row-action:hover { color: var(--text-mid); }
+.finder-row-action-danger { color: var(--red); }
+.finder-row-action:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.finder-chevron { flex-shrink: 0; color: var(--text-muted); font-size: 12px; line-height: 1; }
+
+/* /tryouts' three-column variant: no Models pane, and the Operations column is doing the work
+   (allocation flag, on-van times, a stopwatch), so it gets the extra width instead. */
+.finder-panes-3 {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 2fr);
+}
+
+/* ── /tryouts' operation row ──────────────────────────────────────────────────────────────
+   A THREE-ROW GRID WITH EXPLICIT ROW HEIGHTS, and that is the whole point: the row must be
+   exactly as tall whether the operation has never been timed, has a stopwatch running on it, or
+   was just completed. Starting or finishing a timer swaps what is inside the third row and
+   nothing else — the operations list does not reflow, the pane does not scroll under the
+   pointer, and a Complete button never moves out from under a finger.
+
+   Every cell clips and ellipsises rather than wrapping, so a long operation name or a run list
+   with four entries can't quietly turn a 3-line row into a 4-line one. */
+.finder-row-op {
+  display: grid;
+  grid-template-rows: 24px 18px 34px;
+  row-gap: 6px;
+  align-content: start;
+  height: 110px;
+  box-sizing: border-box;
+  padding: 11px 12px;
+  align-items: center;
+}
+.finder-row-op-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+}
+.finder-row-op-head .finder-row-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  word-break: normal;
+}
+/* Always reserved, timer or no timer, so the name beside it doesn't re-truncate the instant a
+   stopwatch starts. */
+.finder-row-op-dot {
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  width: 13px;
+  flex-shrink: 0;
+}
+.finder-row-op-dot .finder-running-dot { margin-left: 0; }
+/* The record of what's on THIS van — one line, always present, so the row's height is the same
+   before and after a run is saved. Only its text changes. */
+.finder-row-op-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.finder-row-op-status > * { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+/* The reserved capture slot: 34px of row that exists whatever state the operation is in. Holds
+   the Start button, or the read-only "timing" readout once a stopwatch is on this operation —
+   live timers are paused and completed in the right-hand rail, not here, precisely so this slot
+   never has to grow a second row of controls. */
+.finder-row-op-slot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+/* Tabular figures and a floor on the width, so a tick from 9:59 to 10:00 doesn't nudge
+   everything beside it. */
+.finder-row-op-clock {
+  font-size: 15px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  min-width: 54px;
+}
+
+/* The green "already timed on this van" chip — a button into the times drawer, sized to sit in
+   the 18px status row without changing it. */
+.finder-row-op-timed {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  padding: 1px 8px;
+  border: 1px solid #bbf7d0;
+  border-radius: 20px;
+  background: var(--green-bg);
+  color: #15803d;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.5;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+/* /collect's capture bar: what the next run will be banked against, and how to start it.
+   Sits under the panes rather than inside one — the choice it acts on (an operation in pane 3,
+   a set of models in pane 4) spans two columns, so it belongs to neither. */
+.collect-capture {
+  margin-top: 16px;
+  padding: 14px 20px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+/* Two fields side by side in a capture form (operator + notes), folding to one column when the
+   dialog or drawer is too narrow to give each a usable width. */
+.capture-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 14px;
+  align-items: start;
+}
+
+/* The marker on a stage/job/operation row with a stopwatch under it. Sized and coloured to read
+   at a glance without competing with the row's own text. */
+.finder-running-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: var(--green);
+  vertical-align: middle;
+  flex-shrink: 0;
+  animation: finder-running-pulse 1.6s ease-in-out infinite;
+}
+@keyframes finder-running-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .finder-running-dot { animation: none; }
+}
+
+/* ── The running-timers rail (/tryouts) ──────────────────────────────────────────────────
+   A fixed column down the right-hand quarter of the screen holding every running or paused
+   stopwatch, so one started in any job can be paused or completed from anywhere in the van.
+   It runs from under the sticky nav (56px) to the bottom of the viewport and scrolls
+   internally, so it stays put while the panes to its left scroll and drill.
+
+   Sits at z-index 40: under the nav (50) and under the slide-over drawers/modals (200/201),
+   which are meant to cover it, but above ordinary page content.
+
+   The page reserves the matching width via .rail-page rather than the rail overlapping —
+   both read the same custom properties, so the two can't fall out of step. */
+:root {
+  --timer-rail-w: clamp(280px, 25vw, 460px);
+}
+
+.timer-rail {
+  position: fixed;
+  top: 56px;
+  right: 0;
+  bottom: 0;
+  z-index: 40;
+  width: var(--timer-rail-w);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  box-shadow: -2px 0 12px rgba(0, 0, 0, 0.05);
+}
+/* Idle: the same footprint, quietly styled and holding a one-line empty state. The width is
+   deliberately NOT collapsed — the rail changing width when the first timer starts reflowed the
+   panes and shifted the whole screen sideways, which is exactly what must not happen. It stays
+   unobtrusive by being quiet, not by being narrow. */
+.timer-rail-empty {
+  background: var(--bg);
+  box-shadow: none;
+}
+
+.timer-rail-header {
+  flex-shrink: 0;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+.timer-rail-none {
+  padding: 14px;
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+/* Cards render in the timers array's own order — insertion order, newest appended last — so a
+   new timer arrives at the bottom and nothing above it moves. */
+.timer-rail-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.timer-rail-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+}
+.timer-rail-card-main { min-width: 0; }
+.timer-rail-card-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* Notes gathered on a run so far — held on the timer, not yet written anywhere, so the list is
+   editable right up until Complete. */
+.timer-rail-notes {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.timer-rail-notes li {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-mid);
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+.timer-rail-notes li span { flex: 1; min-width: 0; word-break: break-word; }
+.timer-rail-note-form { display: flex; flex-direction: column; gap: 6px; }
+
+.timer-rail-op { font-size: 13px; font-weight: 700; color: var(--text); word-break: break-word; }
+.timer-rail-meta { font-size: 11px; color: var(--text-muted); word-break: break-word; margin-top: 1px; }
+.timer-rail-clock {
+  font-size: 22px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  line-height: 1.1;
+}
+
+/* The space the rail takes out of the page — one constant value, reserved from the moment the
+   van view mounts and never recalculated, so starting, ticking, completing or discarding a
+   timer cannot move the panes by a pixel.
+
+   Taken as a right MARGIN, and .page-wide's max-width + auto-centering are dropped for this
+   page. That combination is the whole fix for the dead gutter: .page-wide caps the content at
+   1640px and centres it, so on a wide screen the content box ended well short of the rail and
+   a right padding merely pushed the panes further left, leaving daylight between them and the
+   rail. With no cap and margin-right = the rail's exact width, the content box runs from the
+   left edge to precisely where the rail begins — the panes get every pixel that isn't the rail,
+   and there is nothing left over to be a gutter. */
+.rail-page {
+  max-width: none;
+  margin: 0 var(--timer-rail-w) 0 0;
+  /* Its own 16px of breathing room, the same as .page-wide gives the left edge — the content
+     stops one gutter-width short of the rail's border, not one gutter plus a gap. */
+  padding-right: 16px;
+}
+
+/* Tablet portrait and narrower: a quarter-width column would leave the panes nothing to live
+   in, so the same markup lays out as the bottom bar it used to be — full width, capped height,
+   cards on one line. Nothing about the component or its behaviour changes. */
+@media (max-width: 1100px) {
+  .timer-rail {
+    top: auto;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: auto;
+    z-index: 60;
+    max-height: 180px;
+    border-left: none;
+    border-top: 1px solid var(--border);
+    box-shadow: 0 -2px 12px rgba(0, 0, 0, 0.07);
+  }
+  .timer-rail-card {
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 7px 10px;
+  }
+  .timer-rail-card-main { margin-right: auto; }
+  .timer-rail-clock { font-size: 18px; min-width: 68px; text-align: right; }
+  /* The row wraps, so these take a line of their own instead of competing with the buttons. */
+  .timer-rail-notes, .timer-rail-note-form { flex-basis: 100%; }
+
+  /* Same constant-reservation rule as the side rail: matched to the bar's own max-height, so
+     content is never left underneath it AND the reservation never changes. Past that cap the
+     bar scrolls internally rather than growing, so 180px is the worst case, not a guess. */
+  /* The rail is a bottom bar at this width, so it takes height rather than width back. */
+  .rail-page { margin-right: 0; padding-right: 16px; padding-bottom: 192px; }
+}
+
+@media (max-width: 720px) {
+  .timer-rail-body { padding: 8px; }
+  .timer-rail-clock { min-width: 0; text-align: left; }
+}
+
+/* Below the desktop width four thirds stop being readable, so the panes become fixed-width
+   columns in a horizontal scroller rather than being squeezed. */
+@media (max-width: 1400px) {
+  .finder-panes,
+  .finder-panes-3 {
+    grid-template-columns: none;
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(280px, 1fr);
+    overflow-x: auto;
+    padding-bottom: 6px;
+  }
+}
+
+/* Phones: one pane per row, each capped so all four stay reachable by scrolling the page. */
+@media (max-width: 720px) {
+  .finder-panes,
+  .finder-panes-3 {
+    display: flex;
+    flex-direction: column;
+    overflow-x: visible;
+  }
+  .finder-pane { height: auto; max-height: 52vh; }
+}
+
+/* ── Print: the Model Total collection sheet ─────────────────────────────────────────────
+   The sheet lives in the page as a direct child of .page but is never shown on screen. When
+   printing, every OTHER direct child of .page is hidden outright (display:none, not
+   visibility:hidden — hidden-but-laid-out content prints as blank leading pages), leaving the
+   sheet alone on a clean white page. */
+.print-sheet { display: none; }
+
+@media print {
+  @page { margin: 14mm; }
+
+  html, body {
+    background: #fff !important;
+    color: #000 !important;
+  }
+
+  /* App chrome: nav, and any slide-over that happened to be open. */
+  .nav,
+  .gaps-drawer,
+  .gaps-drawer-overlay { display: none !important; }
+
+  .page { max-width: none; margin: 0; padding: 0; }
+  .page > *:not(.print-sheet) { display: none !important; }
+
+  .print-sheet {
+    display: block !important;
+    color: #000;
+    font-size: 10.5pt;
+    line-height: 1.35;
+  }
+  .print-sheet * { color: #000 !important; }
+
+  .print-sheet-header {
+    border-bottom: 2px solid #000;
+    padding-bottom: 8px;
+    margin-bottom: 14px;
+  }
+  .print-sheet-title { font-size: 15pt; font-weight: 700; margin: 0 0 4px; }
+  .print-sheet-meta { font-size: 10pt; margin: 2px 0; }
+  .print-sheet-coverage { font-size: 11pt; font-weight: 700; margin: 8px 0 0; }
+
+  /* A job and its operations stay on one page wherever the page has room for them. */
+  .print-job {
+    break-inside: avoid;
+    page-break-inside: avoid;
+    margin-bottom: 16px;
+  }
+  .print-job-name {
+    font-size: 11.5pt;
+    font-weight: 700;
+    margin: 0 0 6px;
+    border-bottom: 1px solid #000;
+    padding-bottom: 3px;
+  }
+
+  /* Enough vertical room to hand-write on each line. */
+  .print-op {
+    break-inside: avoid;
+    page-break-inside: avoid;
+    padding: 7px 0 9px;
+    border-bottom: 1px dotted #999;
+  }
+  .print-op-name { font-size: 10.5pt; font-weight: 600; }
+  .print-checkbox {
+    display: inline-block;
+    width: 11px; height: 11px;
+    border: 1.2px solid #000;
+    margin-right: 7px;
+    vertical-align: middle;
+  }
+  .print-fields { margin: 9px 0 0 18px; font-size: 9.5pt; }
+  /* The write-in blanks — a ruled line rather than typed underscores, so the widths hold. */
+  .print-blank {
+    display: inline-block;
+    border-bottom: 1px solid #000;
+    margin: 0 14px 0 4px;
+    height: 13px;
+  }
+  .print-blank-operator { width: 150px; }
+  .print-blank-minutes { width: 70px; }
+  .print-blank-notes { width: 260px; }
+
+  .print-sheet-signoff {
+    margin-top: 6px;
+    font-size: 10pt;
+  }
+  .print-sheet-footer {
+    margin-top: 18px;
+    padding-top: 6px;
+    border-top: 1px solid #000;
+    font-size: 9pt;
+  }
+}
+
+/* ── Roadmap (/roadmap) ────────────────────────────────────── */
+/* Four phases across the full page width, halving to two and then one as the viewport
+   narrows — a phase card is a column of stacked tasks, not a table, so it stays readable
+   at a quarter of the screen. */
+.roadmap-grid {
+  display: grid;
+  gap: 20px;
+  grid-template-columns: 1fr;
+  align-items: stretch;
+}
+@media (min-width: 720px)  { .roadmap-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (min-width: 1280px) { .roadmap-grid { grid-template-columns: repeat(4, 1fr); } }
+
+.roadmap-card { display: flex; flex-direction: column; overflow: hidden; }
+.roadmap-card-header { padding: 16px 18px; border-bottom: 1px solid var(--border); }
+.roadmap-card-pill-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.roadmap-phase-pill {
+  display: inline-flex; align-items: center; flex-shrink: 0;
+  color: #fff; font-size: 11px; font-weight: 700;
+  letter-spacing: 0.04em; text-transform: uppercase;
+  padding: 5px 12px; border-radius: 20px;
+}
+.roadmap-card-title { font-size: 15px; font-weight: 700; color: var(--text); line-height: 1.35; margin-top: 12px; }
+.roadmap-card-subtitle { font-size: 12.5px; color: var(--text-muted); line-height: 1.5; margin-top: 6px; }
+.roadmap-card-dates { font-size: 12px; color: var(--text-mid); line-height: 1.5; margin-top: 8px; }
+.roadmap-card-lead { font-size: 12.5px; color: var(--text-mid); margin-top: 8px; }
+
+/* Tasks fill the card so every card in a row ends at the same height, with the add button
+   pinned to the bottom by margin-top: auto. */
+.roadmap-tasks { display: flex; flex-direction: column; flex: 1; }
+.roadmap-task { padding: 12px 18px; border-bottom: 1px solid #f2f2f2; }
+.roadmap-task:last-child { border-bottom: none; }
+.roadmap-task-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.roadmap-task-name { font-size: 13px; font-weight: 600; color: var(--text); line-height: 1.4; }
+.roadmap-task-desc { font-size: 12px; color: var(--text-muted); line-height: 1.5; margin-top: 4px; }
+.roadmap-task-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.roadmap-task-meta-text { font-size: 11.5px; color: var(--text-muted); }
+/* The status chip in a task card. .badge-green / .badge-blue already carry the right hues, so
+   this only fixes the one that fell short: --blue on --blue-light is 4.2:1, under AA for an
+   11px chip. Scoped to the roadmap so the badge palette other pages use is left alone. */
+.roadmap-task-meta .badge-blue { color: #00629c; }
+.roadmap-card-footer { padding: 12px 18px; border-top: 1px solid var(--border); margin-top: auto; }
+
+/* ── Roadmap timeline (Gantt) ──────────────────────────────── */
+.roadmap-timeline { padding: 18px 20px 16px; margin-bottom: 20px; }
+/* Seventeen months of axis needs room: below ~700px the chart scrolls sideways rather than
+   crushing the month labels into each other. */
+.roadmap-timeline-scroll { overflow-x: auto; }
+.roadmap-timeline-inner { position: relative; min-width: 640px; padding-top: 18px; }
+
+.roadmap-timeline-row { display: flex; align-items: center; }
+.roadmap-timeline-row + .roadmap-timeline-row { margin-top: 8px; }
+.roadmap-timeline-label {
+  width: 80px; flex-shrink: 0; padding-right: 12px;
+  font-size: 12px; font-weight: 600; color: var(--text-mid);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.roadmap-timeline-track { position: relative; flex: 1; }
+
+/* Month header */
+.roadmap-timeline-months { height: 18px; }
+/* Week row sits directly under the month row, so the 8px stagger between chart rows is
+   cancelled for this one. */
+.roadmap-timeline-row + .roadmap-timeline-weeks { margin-top: 2px; }
+.roadmap-timeline-weeks { height: 13px; margin-bottom: 8px; }
+.roadmap-timeline-week-label {
+  position: absolute; top: 0;
+  font-family: var(--font-montserrat), Montserrat, var(--font-inter), Inter, system-ui, sans-serif;
+  font-size: 9px; font-weight: 500;
+  color: var(--text-muted); white-space: nowrap; padding-left: 3px;
+}
+.roadmap-timeline-month {
+  position: absolute; top: 0;
+  font-family: var(--font-montserrat), Montserrat, var(--font-inter), Inter, system-ui, sans-serif;
+  font-size: 12px; font-weight: 700; letter-spacing: 0.02em;
+  color: var(--text); white-space: nowrap; padding-left: 3px;
+}
+
+/* Phase bars */
+.roadmap-timeline-bars { height: 36px; }
+.roadmap-timeline-bar {
+  position: absolute; top: 7px; height: 22px;
+  border-radius: 11px;
+  min-width: 6px;
+  /* Keeps the fill layer and the label's ellipsis inside the rounded ends. */
+  overflow: hidden;
+}
+.roadmap-timeline-empty { font-size: 11px; color: var(--text-muted); line-height: 36px; }
+
+/* Gridlines — week boundaries hairline, month boundaries a touch stronger. Both sit behind
+   the bars by being earlier siblings in the DOM. */
+.roadmap-timeline-week {
+  position: absolute; top: 18px; bottom: 0;
+  border-left: 0.5px solid #e5e7eb;
+  pointer-events: none;
+}
+.roadmap-timeline-month-line {
+  position: absolute; top: 18px; bottom: 0;
+  border-left: 1px solid #d1d5db;
+  pointer-events: none;
+}
+
+/* RDO / leave bands — one day wide unless consecutive days merged into a longer run. The
+   min-width keeps a single day from collapsing to a hairline on a 17-month axis. Drawn first
+   in the DOM so the phase bars paint over them. */
+.roadmap-timeline-rdo {
+  position: absolute; top: 18px; bottom: 0;
+  min-width: 3px;
+  background: #f3f4f6;
+  pointer-events: none;
+}
+
+/* Today marker */
+.roadmap-timeline-today {
+  position: absolute; top: 18px; bottom: 0;
+  border-left: 1.5px dashed #ef4444;
+  pointer-events: none;
+}
+.roadmap-timeline-today-label {
+  position: absolute; top: -16px; left: 0; transform: translateX(-50%);
+  font-family: var(--font-montserrat), Montserrat, var(--font-inter), Inter, system-ui, sans-serif;
+  font-size: 10px; font-weight: 700; color: #ef4444; white-space: nowrap;
+}
+
+/* Status segments — done / in progress / not started, tiling the bar left to right. The bar's
+   own overflow: hidden gives them the rounded ends, so no segment carries its own radius. */
+.roadmap-timeline-bar-segments {
+  position: absolute;
+  inset: 0;
+  display: flex;
+}
+.roadmap-timeline-bar-segment { height: 100%; }
+
+/* Bar label — vertically centred by matching the bar's 22px height, and clipped with an
+   ellipsis when the phase title outruns the bar. Sits above the fill layer. */
+.roadmap-timeline-bar-label {
+  position: relative;
+  z-index: 1;
+  display: block;
+  line-height: 22px;
+  padding: 0 11px;
+  font-family: var(--font-montserrat), Montserrat, var(--font-inter), Inter, system-ui, sans-serif;
+  font-size: 12px;
+  font-weight: 600;
+  color: #fff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Due-today strip — a plain row above the chart, not a card. Hidden entirely when nothing
+   is due, so it never occupies space as an empty state. */
+.roadmap-due-today {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.roadmap-due-today-label {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  margin-right: 2px;
+}
+.roadmap-due-today-pill {
+  background: #f3f4f6;
+  color: #4e4b48;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 4px 10px;
+  border-radius: 20px;
+  white-space: nowrap;
+}
+
+/* ── Print: the Roadmap document ─────────────────────────────────────────────────────────
+   Same scaffolding as the Model Total collection sheet above — a print-only block living in
+   the page, with every other direct child of the container hidden when printing. The hide rule
+   is keyed to .roadmap-page rather than .page-wide so it can't blank out the other wide pages,
+   which have no print block of their own to leave behind.
+
+   A3 landscape, so the printed copy can carry the real Gantt at full width with the phase
+   columns beneath it — close to what the screen shows, rather than a reflow.
+
+   The page size is set through a NAMED page rather than a bare `@page { size: ... }`. A bare
+   rule is document-wide and would drag the A4 collection sheet onto A3 landscape with it;
+   naming it scopes the size to the one element that opts in. */
+.roadmap-print { display: none; }
+
+@media print {
+  @page roadmap-sheet {
+    size: A3 landscape;
+    margin: 10mm 12mm;
+  }
+  .roadmap-page { page: roadmap-sheet; }
+
+  .roadmap-page { max-width: none; margin: 0; padding: 0; }
+  .roadmap-page > *:not(.roadmap-print) { display: none !important; }
+
+  .roadmap-print {
+    display: block !important;
+    color: #000;
+    font-size: 10pt;
+    line-height: 1.4;
+    /* The chart IS the document here — bars, RDO bands and the Today marker all have to
+       survive the printer's default "drop the decoration" pass. */
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  /* Forced black is scoped to the prose, not the whole block: the timeline needs its red
+     Today label and its phase-coloured bars to come through. The status chips are excluded
+     too — they are colour-coded green/blue and a blanket black would flatten them back out. */
+  .roadmap-print-header *,
+  .roadmap-print-phases *:not(.roadmap-print-status) { color: #000 !important; }
+
+  .roadmap-print-header {
+    border-bottom: 2px solid #000;
+    padding-bottom: 7px;
+    margin-bottom: 12px;
+  }
+  .roadmap-print-title { font-size: 18pt; font-weight: 700; margin: 0 0 4px; }
+  .roadmap-print-meta { font-size: 9.5pt; margin: 2px 0; }
+  .roadmap-print-empty { font-size: 9pt; font-style: italic; margin: 4px 0 0; }
+
+  /* ── Gantt ──────────────────────────────────────────────────────────────────────────
+     The on-screen chart in its print variant. The card chrome comes off, the horizontal
+     scroller is unlocked (an overflow:auto box clips to one screenful when paginated), and
+     the hairline gridlines are darkened — #e5e7eb survives a monitor but not a printer. */
+  .roadmap-timeline-print {
+    padding: 0;
+    margin: 0 0 10px;
+    background: #fff;
+    border: 0;
+    box-shadow: none;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+  .roadmap-timeline-print .roadmap-timeline-scroll { overflow: visible; }
+  .roadmap-timeline-print .roadmap-timeline-inner { min-width: 0; }
+
+  .roadmap-timeline-print .roadmap-timeline-label {
+    font-size: 10pt;
+    font-weight: 600;
+    color: #000;
+  }
+  .roadmap-timeline-print .roadmap-timeline-month { font-size: 10pt; color: #000; }
+  .roadmap-timeline-print .roadmap-timeline-week-label { font-size: 7.5pt; color: #444; }
+
+  .roadmap-timeline-print .roadmap-timeline-week { border-left-color: #cfcfcf; }
+  .roadmap-timeline-print .roadmap-timeline-month-line { border-left-color: #8a8a8a; }
+  .roadmap-timeline-print .roadmap-timeline-rdo { background: #e8e8e8; }
+
+  /* Today: the one thing a reader looks for on a printed plan, so it gets a heavier rule than
+     on screen — a 1.5px dashed line reproduces as a broken grey smudge at print resolution. */
+  .roadmap-timeline-print .roadmap-timeline-today { border-left: 2px dashed #d92020; }
+  .roadmap-timeline-print .roadmap-timeline-today-label { font-size: 8.5pt; color: #d92020; }
+
+  /* The bars carry inline rgba() backgrounds from withAlpha(), which the root's
+     print-color-adjust already protects; this just keeps the rounded ends crisp. */
+  .roadmap-timeline-print .roadmap-timeline-bar { border: 0.5px solid rgba(0, 0, 0, 0.28); }
+
+  /* ── Legend ─────────────────────────────────────────────────────────────────────────
+     Neutral greys rather than any one phase's colour: the swatches explain the light-to-dark
+     shading every bar uses, not a particular phase. */
+  .roadmap-print-legend {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 4px 16px;
+    font-size: 8.5pt;
+    padding: 5px 0 7px;
+    border-bottom: 1px solid #000;
+    margin-bottom: 12px;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+  .roadmap-print-legend-item { display: inline-flex; align-items: center; gap: 5px; }
+  .roadmap-print-legend-note { font-style: italic; color: #444; }
+  .roadmap-print-swatch {
+    display: inline-block;
+    width: 15px; height: 9px;
+    border: 0.5px solid rgba(0, 0, 0, 0.35);
+  }
+  .roadmap-print-swatch-done { background: #4b5563; }
+  .roadmap-print-swatch-progress { background: #9ca3af; }
+  .roadmap-print-swatch-todo { background: #e2e4e8; }
+  .roadmap-print-swatch-rdo { background: #e8e8e8; }
+  .roadmap-print-swatch-today {
+    width: 0; height: 11px;
+    border: 0; border-left: 2px dashed #d92020;
+  }
+
+  /* ── Phase detail ───────────────────────────────────────────────────────────────────
+     Columns across the landscape width. auto-fill at an 80mm floor gives four across the
+     ~396mm content box — the screen layout — and wraps to a second row if phases are ever
+     added, rather than squeezing them all onto one line. */
+  .roadmap-print-phases {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(80mm, 1fr));
+    gap: 6mm 8mm;
+    align-items: start;
+  }
+
+  .roadmap-print-phase {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+  .roadmap-print-phase-head {
+    /* The one piece of phase colour down here — a thin rule tying each column back to its bar
+       on the chart above. */
+    border-left: 3px solid #000;
+    padding: 0 0 5px 8px;
+    margin-bottom: 6px;
+    border-bottom: 1px solid #000;
+    break-after: avoid;
+    page-break-after: avoid;
+  }
+  .roadmap-print-phase-title { font-size: 11pt; font-weight: 700; margin: 0; }
+  .roadmap-print-phase-sub { font-size: 8.5pt; margin: 3px 0 0; }
+  .roadmap-print-phase-facts { font-size: 8.5pt; margin: 3px 0 0; }
+
+  .roadmap-print-task {
+    break-inside: avoid;
+    page-break-inside: avoid;
+    padding: 4px 0 5px 8px;
+    border-bottom: 1px dotted #999;
+  }
+  .roadmap-print-task-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .roadmap-print-task-name { font-size: 9.5pt; font-weight: 600; }
+  /* The base chip is the neutral outline — "Not started", and anything unrecognised, stays a
+     word in a box rather than a block of ink on every task. Done and In progress are tinted
+     to agree with their on-screen badges; the tints are a step stronger than the screen's
+     --green-bg / --blue-light, which are pale enough to print as plain white. */
+  .roadmap-print-status {
+    flex-shrink: 0;
+    font-size: 7pt;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    border: 0.5px solid #000;
+    border-radius: 3px;
+    padding: 1px 5px;
+    white-space: nowrap;
+    /* Repeated on the chip itself: the inherited value from .roadmap-print is enough in
+       Chrome, but a backgrounded inline child is exactly what the "economy" pass in some
+       drivers drops first. */
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  .roadmap-print-status-done {
+    background: #cdeedd;
+    border-color: #15803d;
+    color: #14532d;
+  }
+  .roadmap-print-status-progress {
+    background: #cbe6f7;
+    border-color: #0079c1;
+    color: #08496f;
+  }
+  .roadmap-print-task-desc { font-size: 8.5pt; margin: 2px 0 0; }
+  .roadmap-print-task-meta { font-size: 8.5pt; margin: 2px 0 0; }
+}

@@ -1,7 +1,7 @@
 module.exports = {
   apps: [
     {
-      name: "tryout-timer",
+      name: "j-motion",
       script: "node_modules/.bin/next",
       args: "start",
       cwd: "/Users/jaycoai/Projects/tryout-timer",

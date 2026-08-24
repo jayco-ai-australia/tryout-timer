@@ -34,79 +34,38 @@ export default function Nav() {
     return pathname === href || pathname.startsWith(href + '/')
   }
 
+  const links = [
+    { href: '/dashboard', label: 'Dashboard' },
+    { href: '/setup', label: 'Setup' },
+    { href: '/collect', label: 'Collect' },
+    { href: '/tryouts', label: 'Try Outs' },
+    { href: '/model-total', label: 'Model Total' },
+    { href: '/roadmap', label: 'Roadmap' },
+    ...(role === 'admin' ? [{ href: '/config', label: 'Config' }] : []),
+    ...(role === 'admin' ? [{ href: '/admin', label: 'Admin' }] : []),
+    { href: '/profile', label: 'Profile' },
+  ]
+
   return (
-    <nav style={{
-      background: 'var(--surface)',
-      borderBottom: '1.5px solid var(--border)',
-      position: 'sticky',
-      top: 0,
-      zIndex: 50,
-      boxShadow: '0 1px 3px rgba(0,0,0,0.06)',
-    }}>
-      <div style={{
-        maxWidth: 1200,
-        margin: '0 auto',
-        padding: '0 16px',
-        height: 56,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'space-between',
-      }}>
-        {/* Logo */}
-        <Link href="/dashboard" style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 8,
-          textDecoration: 'none',
-          color: 'var(--blue)',
-          fontWeight: 700,
-          fontSize: 17,
-          letterSpacing: '-0.01em',
-        }}>
+    <nav className="nav">
+      <div className="nav-inner">
+        <Link href="/dashboard" className="nav-logo">
           <StopwatchIcon />
-          TryOut Timer
+          J-Motion
         </Link>
 
-        {/* Links */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-          {[
-            { href: '/dashboard', label: 'Dashboard' },
-            { href: '/analytics', label: 'Analytics' },
-            ...(role === 'admin' ? [{ href: '/admin', label: 'Admin' }] : []),
-          ].map(({ href, label }) => (
+        <div className="nav-links">
+          {links.map(({ href, label }) => (
             <Link
               key={href}
               href={href}
-              style={{
-                fontSize: 14,
-                fontWeight: 600,
-                padding: '6px 12px',
-                borderRadius: 7,
-                textDecoration: 'none',
-                transition: 'background 0.12s, color 0.12s',
-                background: isActive(href) ? 'var(--blue-light)' : 'transparent',
-                color: isActive(href) ? 'var(--blue)' : 'var(--text-mid)',
-              }}
+              className={isActive(href) ? 'nav-link nav-link-active' : 'nav-link'}
             >
               {label}
             </Link>
           ))}
 
-          <button
-            onClick={handleLogout}
-            style={{
-              marginLeft: 8,
-              fontSize: 14,
-              fontWeight: 600,
-              padding: '6px 12px',
-              borderRadius: 7,
-              border: '1.5px solid var(--border)',
-              background: 'transparent',
-              color: 'var(--text-mid)',
-              cursor: 'pointer',
-              transition: 'background 0.12s',
-            }}
-          >
+          <button onClick={handleLogout} className="nav-logout">
             Logout
           </button>
         </div>

@@ -49,7 +49,7 @@ export default function LoginPage() {
             </svg>
           </div>
           <div>
-            <div style={{ fontSize: 20, fontWeight: 700, color: 'var(--text)', letterSpacing: '-0.01em' }}>TryOut Timer</div>
+            <div style={{ fontSize: 20, fontWeight: 700, color: 'var(--text)', letterSpacing: '-0.01em' }}>J-Motion</div>
             <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 1 }}>Jayco Manufacturing</div>
           </div>
         </div>

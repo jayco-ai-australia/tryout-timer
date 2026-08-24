@@ -2,48 +2,39 @@ import { createClient } from '@/lib/supabase/server'
 import { redirect } from 'next/navigation'
 import Nav from '@/components/Nav'
 import AdminClient from './AdminClient'
+import type { Profile, OperationTimeWithRelations, OperatorChangeRequest } from '@/lib/types'
 
 export default async function AdminPage() {
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
   if (!user) redirect('/login')
 
-  const { data: profile } = await supabase
-    .from('profiles')
-    .select('role')
-    .eq('id', user.id)
-    .single()
-
+  const { data: profile } = await supabase.from('profiles').select('role').eq('id', user.id).single()
   if (profile?.role !== 'admin') redirect('/dashboard')
 
-  const [{ data: profiles }, { data: sessions }, { data: operations }] = await Promise.all([
-    supabase
-      .from('profiles')
-      .select('id, full_name, role, created_at')
-      .order('created_at', { ascending: false }),
-    supabase
-      .from('tryout_sessions')
-      .select('id, chassis_number, created_at, profiles:created_by ( full_name )')
-      .order('created_at', { ascending: false }),
-    supabase
-      .from('operations')
-      .select('id, operator_name, stage, operation_name, total_minutes, completed_at, session_id')
+  const [{ data: profiles }, { data: records }, { data: requests }] = await Promise.all([
+    supabase.from('profiles').select('id, full_name, role, created_at').order('created_at', { ascending: false }),
+    // No is_active filter — and no screen filters on it, see lib/operationTimes.ts. This list
+    // is every recorded time, newest first.
+    supabase.from('operation_times').select(`
+      *,
+      operations ( id, name, job_id, jobs ( id, name ) ),
+      operators ( id, full_name ),
+      chassis ( id, chassisnumber, product_id, products ( id, product_code, model ) ),
+      collector:profiles!collected_by ( full_name )
+    `).order('created_at', { ascending: false }).limit(200),
+    supabase.from('operator_change_requests')
+      .select('*, operators ( id, full_name ), from_team:from_team_id ( id, name ), to_team:to_team_id ( id, name ), requester:requested_by ( full_name )')
       .order('created_at', { ascending: false }),
   ])
 
-  // Supabase returns joined relations as arrays; normalise to single object
-  const normalisedSessions = (sessions ?? []).map((s) => ({
-    ...s,
-    profiles: Array.isArray(s.profiles) ? s.profiles[0] ?? null : s.profiles,
-  }))
-
   return (
-    <div className="min-h-screen bg-gray-50">
+    <div style={{ minHeight: '100vh', background: 'var(--bg)' }}>
       <Nav />
       <AdminClient
-        profiles={(profiles ?? []) as import('@/lib/types').Profile[]}
-        sessions={normalisedSessions}
-        operations={operations ?? []}
+        profiles={(profiles ?? []) as Profile[]}
+        records={(records ?? []) as unknown as OperationTimeWithRelations[]}
+        requests={(requests ?? []) as unknown as OperatorChangeRequest[]}
       />
     </div>
   )

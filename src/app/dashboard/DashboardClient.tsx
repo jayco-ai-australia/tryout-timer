@@ -1,224 +1,859 @@
 'use client'
 
-import { useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { createClient } from '@/lib/supabase/client'
-import Modal from '@/components/Modal'
-import type { TryoutSession } from '@/lib/types'
+import {
+  chunked, fetchLinksForOperations, READ_CHUNK,
+} from '@/lib/modelOperations'
+import { modelTotalMinutes, operationProductKey } from '@/lib/operationTimes'
+import {
+  aggregateCoverage, computeCoverageCombos, modelCoverageFromCombos, type ModelCoverage,
+} from '@/lib/coverage'
+import { fetchFutureBuilds, fmtScheduleDate, todayIsoDate } from '@/lib/schedule'
+import { fmtHours, fmtMinutes } from '@/lib/format'
+import { usePersistedFilter } from '@/lib/useLocalStorage'
+import type { ProductionLine, UserRole } from '@/lib/types'
+
+/**
+ * Dashboard — the collection scorecard.
+ *
+ * One question, answered in three parts: how much of the line is covered, which models to
+ * collect next, and whether anyone is collecting. Everything is scoped by a single production
+ * line filter and computed live; nothing here is cached or stored.
+ *
+ * ── Two coverage grains, one of them the headline ────────────────────────────────────────
+ * The headline is JOB × model, straight out of lib/coverage.ts — the same definition
+ * /model-total uses. A job counts as covered for a model when any of its
+ * operations has a recorded time for that model. That is the planning unit, and making it the
+ * headline is what lets this screen's percentage be compared with Model Total's without a
+ * footnote explaining why they differ.
+ *
+ * Operation × model — one unit per model_operations row — is kept, but demoted to a single
+ * muted detail line. It is the finer measure of collection effort (a job whose four operations
+ * are one-quarter timed reads as one-quarter, not as covered), and it is worth showing; it just
+ * isn't the number anyone should quote.
+ *
+ * The two are computed from the SAME fetched rows, so they can't disagree about the underlying
+ * data — only about what they count. The job-level numbers all come from coverage.ts; nothing
+ * here re-implements that definition.
+ *
+ * ── The schedule ──────────────────────────────────────────────────────────────────────────
+ * Future builds come from `chassis`, joined to products through chassis.product_id and filtered
+ * in the DATABASE by `dateonline >= today` — see lib/schedule. dateonline is a real Postgres
+ * date column; nothing here parses, coerces or string-compares it.
+ *
+ * ── Everything else is reused ─────────────────────────────────────────────────────────────
+ * Labour totals come from modelTotalMinutes (lib/operationTimes) — the "average per operation,
+ * then sum" rule, not a fresh SUM() — fed once from data fetched for the whole line rather than
+ * per model. The applies-list read is fetchLinksForOperations, the chunking is
+ * lib/modelOperations', and the schedule read is lib/schedule.
+ */
 
 interface Props {
-  sessions: TryoutSession[]
   userId: string
+  role: UserRole
+  lines: ProductionLine[]
+  initialLineId: string
 }
 
-export default function DashboardClient({ sessions: initial, userId }: Props) {
+const SEL: React.CSSProperties = {
+  fontSize: 13, fontWeight: 500, fontFamily: 'inherit',
+  border: '1.5px solid var(--border)', borderRadius: 8, padding: '7px 10px',
+  background: 'var(--surface)', color: 'var(--text)', cursor: 'pointer', outline: 'none', minWidth: 220,
+}
+const ERR_BOX: React.CSSProperties = {
+  padding: '9px 14px', borderRadius: 8, background: 'var(--red-bg)',
+  border: '1px solid #fecaca', color: 'var(--red)', fontSize: 13,
+}
+/** Same slide-in width as /setup's and /tryouts' drawers (.gaps-drawer is hard-coded to 25vw
+ * for the dashboard gap drawer — overridden here to match the rest). */
+const DRAWER_WIDTH: React.CSSProperties = { width: '33.333vw', minWidth: 340 }
+const EMPTY: React.CSSProperties = {
+  textAlign: 'center', color: 'var(--text-muted)', fontSize: 13, padding: '28px 0',
+}
+
+/** Red below a third, amber below four fifths, green above — the same three-band reading the
+ * coverage badges use elsewhere, so a colour means the same thing on every screen. */
+function coveragePctClass(pct: number | null): string {
+  if (pct == null) return 'badge-grey'
+  if (pct >= 80) return 'badge-green'
+  if (pct >= 33) return 'badge-amber'
+  return 'badge-red'
+}
+
+function pctLabel(pct: number | null): string {
+  return pct == null ? '—' : `${pct.toFixed(1)}%`
+}
+
+/**
+ * Local midnight today, and the Monday-start week boundaries around it. Local, not UTC:
+ * "collected today" means the collector's today, at the tablet in the shed, and
+ * operation_times.created_at is a timestamptz so the comparison is exact either way.
+ *
+ * "This week" runs from Monday to now (a partial week, by design — it's a progress figure);
+ * "last week" is the full Monday–Sunday before it. They therefore aren't like-for-like, which
+ * is why each card prints the window it counted rather than just a name.
+ */
+function periodBounds() {
+  const now = new Date()
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  // getDay(): 0 = Sunday. Shift so Monday is the first day of the week.
+  const daysSinceMonday = (todayStart.getDay() + 6) % 7
+  const thisWeekStart = new Date(todayStart)
+  thisWeekStart.setDate(todayStart.getDate() - daysSinceMonday)
+  const lastWeekStart = new Date(thisWeekStart)
+  lastWeekStart.setDate(thisWeekStart.getDate() - 7)
+  return { todayStart, thisWeekStart, lastWeekStart }
+}
+
+interface CoverageSummary {
+  // ── Headline: job × model, from coverage.ts ──────────────────────────────────────────
+  /** Required (job, model) combos in scope. */
+  requiredCombos: number
+  coveredCombos: number
+  /** Uncovered COMBOS — job-level, not operations. */
+  gaps: number
+  pct: number | null
+  /** Distinct models any job requires. */
+  models: number
+  /** Of those, the ones where every required job is covered. */
+  modelsAtFull: number
+  /** Per-model job×model coverage, keyed by product id — feeds the priority table's column, so
+   * it is the same number as the headline, just scoped to one model. */
+  byProductId: Map<string, ModelCoverage>
+
+  // ── Secondary detail: operation × model ──────────────────────────────────────────────
+  allocatedOperations: number
+  timedOperations: number
+  operationPct: number | null
+}
+
+interface PriorityRow {
+  productId: string
+  model: string
+  /** Carried so the Model Total link can land already scoped — that screen restores its
+   * line/series/model selects from localStorage, and a series that doesn't match its product's
+   * own would be cleared as stale the moment it mounts. */
+  lineId: string | null
+  series: string
+  /** 0 for a model with nothing booked — such a model is still listed. */
+  futureBuilds: number
+  /** This model's share of the line's future builds. null when the line has none at all. */
+  sharePct: number | null
+  /** `YYYY-MM-DD`, straight off the date column — formatted only at render. null when there is
+   * no build ahead, which is what sorts those rows to the bottom. */
+  nextOnLine: string | null
+  /** Job × model, same definition as the headline — see coverage.ts. null means no job requires
+   * this model at all, which is a different thing from 0%. */
+  coveragePct: number | null
+  requiredCombos: number
+  coveredCombos: number
+  totalMinutes: number | null
+}
+
+type SortKey = 'model' | 'future' | 'next' | 'coverage' | 'labour'
+type SortDir = 'asc' | 'desc'
+
+/** What each column sorts on. A null always sinks to the bottom, whichever direction is
+ * active — "no date" and "no coverage" are absences, not extreme values, and floating them to
+ * the top on a descending sort would bury the rows somebody actually asked to see. */
+const SORT_VALUES: Record<SortKey, (row: PriorityRow) => string | number | null> = {
+  model: (r) => r.model,
+  future: (r) => r.futureBuilds,
+  next: (r) => r.nextOnLine,
+  coverage: (r) => r.coveragePct,
+  labour: (r) => r.totalMinutes,
+}
+
+function sortRows(rows: PriorityRow[], key: SortKey, dir: SortDir): PriorityRow[] {
+  const pick = SORT_VALUES[key]
+  return [...rows].sort((a, b) => {
+    const av = pick(a)
+    const bv = pick(b)
+    if (av == null && bv == null) return a.model.localeCompare(b.model)
+    if (av == null) return 1
+    if (bv == null) return -1
+    let diff: number
+    if (typeof av === 'number' && typeof bv === 'number') diff = av - bv
+    // Dates are YYYY-MM-DD, so a string compare is a date compare.
+    else diff = String(av).localeCompare(String(bv))
+    if (diff === 0) return a.model.localeCompare(b.model)
+    return dir === 'asc' ? diff : -diff
+  })
+}
+
+/** One scheduled van in the focus panel — the chassis rows behind a model's "future builds". */
+interface UpcomingChassis { id: string; chassisnumber: string; dateonline: string }
+
+interface CollectedCounts {
+  today: number
+  thisWeek: number
+  lastWeek: number
+  /** The exact windows the counts came from, rendered under each card so the boundaries are
+   * verifiable at a glance rather than taken on trust. */
+  todayLabel: string
+  thisWeekLabel: string
+  lastWeekLabel: string
+}
+
+export default function DashboardClient({ role, lines, initialLineId }: Props) {
+  const supabase = useMemo(() => createClient(), [])
   const router = useRouter()
-  const supabase = createClient()
-  const [sessions, setSessions] = useState(initial)
-  const [showModal, setShowModal] = useState(false)
-  const [chassisNum, setChassisNum] = useState('')
-  const [notes, setNotes] = useState('')
-  const [creating, setCreating] = useState(false)
+
+  // Persisted, but seeded from the profile's line the first time — an admin starts unfiltered.
+  const [lineId, setLineId] = usePersistedFilter('jmotion_dashboard_line', initialLineId)
+
+  const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
-  function closeModal() {
-    setShowModal(false); setChassisNum(''); setNotes(''); setError(null)
+  const [coverage, setCoverage] = useState<CoverageSummary | null>(null)
+  const [priority, setPriority] = useState<PriorityRow[]>([])
+  /** Default: soonest on the line first — the ordering the section exists for. */
+  const [sortKey, setSortKey] = useState<SortKey>('next')
+  const [sortDir, setSortDir] = useState<SortDir>('asc')
+
+  // ── Focus panel: one model's upcoming vans, as a way into their Try Outs ─────────────
+  const [focusRow, setFocusRow] = useState<PriorityRow | null>(null)
+  const [focusVisible, setFocusVisible] = useState(false)
+  const [focusChassis, setFocusChassis] = useState<UpcomingChassis[] | null>(null)
+  const [focusError, setFocusError] = useState<string | null>(null)
+  const [unlinkedBuilds, setUnlinkedBuilds] = useState(0)
+  const [collected, setCollected] = useState<CollectedCounts>({
+    today: 0, thisWeek: 0, lastWeek: 0, todayLabel: '', thisWeekLabel: '', lastWeekLabel: '',
+  })
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      // ── 1. The line's models ────────────────────────────────────────────────────────
+      let productQuery = supabase.from('products').select('id, model, product_series, production_line_id')
+      if (lineId) productQuery = productQuery.eq('production_line_id', lineId)
+      const { data: productRows, error: productsError } = await productQuery
+      if (productsError) throw new Error(productsError.message)
+      const products = (productRows ?? []) as {
+        id: string; model: string; product_series: string | null; production_line_id: string | null
+      }[]
+      const productIds = products.map((p) => p.id)
+
+      // ── 2. The applies-list, scoped to those models ─────────────────────────────────
+      // Scoped by PRODUCT, not by the operation's line: an operation doesn't have to sit on the
+      // same line as the model it applies to, and often doesn't for imported data. The unit
+      // being counted is "this operation is allocated to this model", so the model decides.
+      const modelOperations: { operation_id: string; product_id: string }[] = []
+      for (const chunk of chunked(productIds, READ_CHUNK)) {
+        const { data, error: err } = await supabase
+          .from('model_operations').select('operation_id, product_id').in('product_id', chunk)
+        if (err) throw new Error(err.message)
+        modelOperations.push(...((data ?? []) as { operation_id: string; product_id: string }[]))
+      }
+
+      // ── 3. Recorded times for those models, product-first ───────────────────────────
+      // The same chain fetchModelTotal holds itself to: junction → times → operations, filtered
+      // by product_id alone at the top and never re-narrowed by line.
+      const operationTimeModels: { operation_time_id: string; product_id: string }[] = []
+      for (const chunk of chunked(productIds, READ_CHUNK)) {
+        const { data, error: err } = await supabase
+          .from('operation_time_models').select('operation_time_id, product_id').in('product_id', chunk)
+        if (err) throw new Error(err.message)
+        operationTimeModels.push(...((data ?? []) as { operation_time_id: string; product_id: string }[]))
+      }
+
+      const timeIds = [...new Set(operationTimeModels.map((tm) => tm.operation_time_id))]
+      const operationTimes: { id: string; operation_id: string; total_minutes: number | null }[] = []
+      for (const chunk of chunked(timeIds, READ_CHUNK)) {
+        const { data, error: err } = await supabase
+          .from('operation_times').select('id, operation_id, total_minutes').in('id', chunk)
+        if (err) throw new Error(err.message)
+        operationTimes.push(...((data ?? []) as { id: string; operation_id: string; total_minutes: number | null }[]))
+      }
+
+      // ── 4. Operations + jobs, purely to label the labour rows ───────────────────────
+      const opIds = [...new Set([
+        ...modelOperations.map((mo) => mo.operation_id),
+        ...operationTimes.map((t) => t.operation_id),
+      ])]
+      const operations: {
+        id: string; name: string; job_id: string
+        primary_operator_id: string | null; secondary_operator_id: string | null
+      }[] = []
+      for (const chunk of chunked(opIds, READ_CHUNK)) {
+        const { data, error: err } = await supabase
+          .from('operations')
+          .select('id, name, job_id, primary_operator_id, secondary_operator_id')
+          .in('id', chunk).eq('is_active', true)
+        if (err) throw new Error(err.message)
+        operations.push(...(data ?? []) as typeof operations)
+      }
+
+      const jobIds = [...new Set(operations.map((o) => o.job_id).filter(Boolean))]
+      const jobs: { id: string; name: string }[] = []
+      for (const chunk of chunked(jobIds, READ_CHUNK)) {
+        const { data, error: err } = await supabase.from('jobs').select('id, name').in('id', chunk)
+        if (err) throw new Error(err.message)
+        jobs.push(...(data ?? []) as { id: string; name: string }[])
+      }
+
+      // ── 5. Coverage, both grains, from one set of rows ──────────────────────────────
+      // Job × model is the headline and comes entirely from coverage.ts — the same
+      // computeCoverageCombos /model-total calls, fed the same product_id-first
+      // join, so the three screens cannot report different percentages for the same models.
+      const combos = computeCoverageCombos({
+        operations,
+        modelOperations,
+        operationTimes,
+        operationTimeModels,
+      })
+      const aggregate = aggregateCoverage(combos)
+      const perModel = modelCoverageFromCombos(combos)
+
+      // ── TEMPORARY coverage diagnostics — remove once confirmed ──────────────────────
+      // Prints the two sets computeCoverageCombos matches against, in the same
+      // `jobId:productId` shape it keys them by, so an empty timed set (join/filter bug) is
+      // instantly distinguishable from a populated one that doesn't intersect (key bug).
+      {
+        const jobIdByOperationId = new Map(operations.map((o) => [o.id, o.job_id]))
+        const jobIdByTimeId = new Map<string, string>()
+        for (const t of operationTimes) {
+          const j = jobIdByOperationId.get(t.operation_id)
+          if (j) jobIdByTimeId.set(t.id, j)
+        }
+        const requiredKeys = new Set<string>()
+        for (const mo of modelOperations) {
+          const j = jobIdByOperationId.get(mo.operation_id)
+          if (j) requiredKeys.add(`${j}:${mo.product_id}`)
+        }
+        const timedKeys = new Set<string>()
+        for (const tm of operationTimeModels) {
+          const j = jobIdByTimeId.get(tm.operation_time_id)
+          if (j) timedKeys.add(`${j}:${tm.product_id}`)
+        }
+        const intersect = [...timedKeys].filter((k) => requiredKeys.has(k))
+        console.log('[coverage] line:', lineId || '(all)', {
+          products: productIds.length,
+          modelOperationRows: modelOperations.length,
+          operationTimeModelRows: operationTimeModels.length,
+          operationTimesFetched: operationTimes.length,
+          operationsFetched: operations.length,
+          requiredSet: requiredKeys.size,
+          timedSet: timedKeys.size,
+          matched: intersect.length,
+          pct: aggregate.coveragePct === null ? null : Number(aggregate.coveragePct.toFixed(1)),
+        })
+        console.log('[coverage] sample required keys:', [...requiredKeys].slice(0, 3))
+        console.log('[coverage] sample timed keys   :', [...timedKeys].slice(0, 3))
+        console.log('[coverage] sample matched keys :', intersect.slice(0, 3))
+        if (timedKeys.size === 0 && operationTimeModels.length > 0) {
+          console.warn('[coverage] timed set is EMPTY despite', operationTimeModels.length,
+            'model links — the times→operation→job join dropped every row (filter or fetch bug).')
+        } else if (intersect.length === 0 && timedKeys.size > 0 && requiredKeys.size > 0) {
+          console.warn('[coverage] timed set is populated but intersects nothing — key mismatch.')
+        }
+      }
+      // ── end TEMPORARY diagnostics ───────────────────────────────────────────────────
+
+      // Operation × model, the demoted detail line. Counted here rather than in coverage.ts
+      // because it is a different unit — one per model_operations row — and coverage.ts owns
+      // exactly one definition of coverage on purpose.
+      const operationByTimeId = new Map(operationTimes.map((t) => [t.id, t.operation_id]))
+      const timedPairs = new Set<string>()
+      for (const tm of operationTimeModels) {
+        const opId = operationByTimeId.get(tm.operation_time_id)
+        if (opId) timedPairs.add(operationProductKey(opId, tm.product_id))
+      }
+      const allocatedOperations = modelOperations.length
+      const timedOperations = modelOperations.filter(
+        (mo) => timedPairs.has(operationProductKey(mo.operation_id, mo.product_id))
+      ).length
+
+      const byProductId = new Map(perModel.map((m) => [m.productId, m]))
+      setCoverage({
+        requiredCombos: aggregate.totalRequired,
+        coveredCombos: aggregate.totalCovered,
+        gaps: aggregate.gapsRemaining,
+        pct: aggregate.coveragePct,
+        models: perModel.length,
+        modelsAtFull: perModel.filter((m) => m.requiredCount > 0 && m.coveredCount === m.requiredCount).length,
+        byProductId,
+        allocatedOperations,
+        timedOperations,
+        operationPct: allocatedOperations > 0 ? (timedOperations / allocatedOperations) * 100 : null,
+      })
+
+      // ── 6. The schedule, and the priority table ─────────────────────────────────────
+      // Scoped by the line's product ids and filtered by date IN THE DATABASE, so what comes
+      // back is only the builds still ahead — no client-side date parsing, and no 1,000-row
+      // page of the oldest rows standing in for the whole table.
+      const future = await fetchFutureBuilds(supabase, lineId ? productIds : null)
+      setUnlinkedBuilds(future.unlinkedBuilds)
+
+      // Every model on the line gets a row, including the ones with nothing booked. A model
+      // that is fully covered and has no upcoming builds is a real answer — "nothing to do
+      // here" — and dropping it made the table look like the model had disappeared.
+      const totalFuture = future.totalFutureBuilds
+      const rows: PriorityRow[] = products.map((product) => {
+        const entry = future.byProductId.get(product.id)
+        const cov = byProductId.get(product.id)
+        // The shared "average per operation, then sum" helper — never a raw SUM(total_minutes),
+        // which would multiply an operation's contribution by how many times it was timed.
+        const total = modelTotalMinutes({
+          productId: product.id,
+          operations,
+          jobs,
+          operationTimes,
+          operationTimeModels,
+        })
+        const futureBuilds = entry?.futureBuilds ?? 0
+        return {
+          productId: product.id,
+          model: product.model,
+          lineId: product.production_line_id,
+          series: product.product_series?.trim() || 'Other',
+          futureBuilds,
+          sharePct: totalFuture > 0 ? (futureBuilds / totalFuture) * 100 : null,
+          nextOnLine: entry?.nextOnLine ?? null,
+          coveragePct: cov?.coveragePct ?? null,
+          requiredCombos: cov?.requiredCount ?? 0,
+          coveredCombos: cov?.coveredCount ?? 0,
+          totalMinutes: total.operations.length > 0 ? total.totalMinutes : null,
+        }
+      })
+      setPriority(rows)
+
+      // ── 7. Times collected: today / this week / last week ───────────────────────────
+      const { todayStart, thisWeekStart, lastWeekStart } = periodBounds()
+      async function countTimes(fromDate: Date, toDate?: Date): Promise<number> {
+        let q = supabase.from('operation_times').select('id', { count: 'exact', head: true })
+          .gte('created_at', fromDate.toISOString())
+        if (toDate) q = q.lt('created_at', toDate.toISOString())
+        if (lineId) q = q.eq('production_line_id', lineId)
+        const { count, error: err } = await q
+        if (err) throw new Error(err.message)
+        return count ?? 0
+      }
+      const [todayCount, weekCount, lastWeekCount] = await Promise.all([
+        countTimes(todayStart),
+        countTimes(thisWeekStart),
+        countTimes(lastWeekStart, thisWeekStart),
+      ])
+      const dayLabel = (d: Date) => d.toLocaleDateString('en-AU', { day: 'numeric', month: 'short' })
+      const lastWeekEnd = new Date(thisWeekStart)
+      lastWeekEnd.setDate(thisWeekStart.getDate() - 1)
+      setCollected({
+        today: todayCount,
+        thisWeek: weekCount,
+        lastWeek: lastWeekCount,
+        todayLabel: `since midnight, ${dayLabel(todayStart)}`,
+        thisWeekLabel: `${dayLabel(thisWeekStart)} — today`,
+        lastWeekLabel: `${dayLabel(lastWeekStart)} — ${dayLabel(lastWeekEnd)}`,
+      })
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not load the dashboard')
+      setCoverage(null); setPriority([]); setUnlinkedBuilds(0)
+    } finally {
+      setLoading(false)
+    }
+  }, [supabase, lineId])
+
+  useEffect(() => { load() }, [load])
+
+  const sortedPriority = useMemo(() => sortRows(priority, sortKey, sortDir), [priority, sortKey, sortDir])
+
+  /** First click on a column sorts it ascending; clicking the active column flips it. */
+  function toggleSort(key: SortKey) {
+    if (key === sortKey) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))
+    else { setSortKey(key); setSortDir('asc') }
   }
 
-  async function handleCreate(e: React.FormEvent) {
-    e.preventDefault()
-    if (!chassisNum.trim()) return
-    setCreating(true); setError(null)
+  /**
+   * Opens the focus panel and loads that model's upcoming vans — the chassis rows the "future
+   * builds" count is made of, so the number can be drilled into rather than just read.
+   */
+  function openFocus(row: PriorityRow) {
+    setFocusRow(row)
+    setFocusChassis(null)
+    setFocusError(null)
+    requestAnimationFrame(() => requestAnimationFrame(() => setFocusVisible(true)))
 
-    const { data, error: err } = await supabase
-      .from('tryout_sessions')
-      .insert({ chassis_number: chassisNum.trim(), notes: notes.trim() || null, created_by: userId })
-      .select('id, chassis_number, created_by, created_at, notes, profiles:created_by ( full_name )')
-      .single()
-
-    if (err) { setError(err.message); setCreating(false); return }
-
-    const profiles = Array.isArray(data.profiles) ? data.profiles[0] ?? null : data.profiles
-    setSessions([{ ...data, profiles, operation_count: 0 }, ...sessions])
-    closeModal()
-    setCreating(false)
+    supabase
+      .from('chassis')
+      .select('id, chassisnumber, dateonline')
+      .eq('product_id', row.productId)
+      // The same date-column comparison the table's counts use — filtered by the database,
+      // never parsed client-side.
+      .gte('dateonline', todayIsoDate())
+      .order('dateonline')
+      .then(({ data, error }) => {
+        if (error) { setFocusError(error.message); setFocusChassis([]); return }
+        setFocusChassis((data ?? []) as UpcomingChassis[])
+      })
   }
 
-  function formatDate(iso: string) {
-    return new Date(iso).toLocaleDateString('en-AU', { day: 'numeric', month: 'short', year: 'numeric' })
+  function closeFocus() {
+    setFocusVisible(false)
+    window.setTimeout(() => setFocusRow(null), 320)
   }
+
+  /** Straight into that van's Try Out. /tryouts creates or re-opens the tryouts row itself from
+   * this parameter, so there is no second "start tryout" path to keep in step. */
+  function openTryoutFor(chassisId: string) {
+    router.push(`/tryouts?chassisId=${encodeURIComponent(chassisId)}`)
+  }
+
+  /**
+   * Model Total, already scoped to this model. That screen restores its three selects from
+   * localStorage via usePersistedFilter, so seeding those keys is what makes it open on the
+   * model instead of blank. All three must agree — it clears a series or product that doesn't
+   * belong to the line it mounts with.
+   */
+  function openModelTotal(row: PriorityRow) {
+    try {
+      window.localStorage.setItem('modelTotal.lineId', row.lineId ?? '')
+      window.localStorage.setItem('modelTotal.series', row.series)
+      window.localStorage.setItem('modelTotal.productId', row.productId)
+    } catch {
+      // Storage unavailable (private mode) — Model Total simply opens unscoped.
+    }
+    router.push('/model-total')
+  }
+
+  // Escape closes the focus panel, matching every other slide-over in the app.
+  useEffect(() => {
+    if (!focusRow) return
+    function onKey(e: KeyboardEvent) { if (e.key === 'Escape') closeFocus() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusRow])
+
+  const lineName = lines.find((l) => l.id === lineId)?.name ?? null
 
   return (
-    <main className="page">
-      {/* Header */}
-      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 24, gap: 12 }}>
-        <div>
-          <h1 style={{ fontSize: 24, fontWeight: 700, color: 'var(--text)', margin: 0 }}>Sessions</h1>
-          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 4 }}>
-            {sessions.length} tryout session{sessions.length !== 1 ? 's' : ''}
-          </p>
-        </div>
-        <button className="btn-primary" onClick={() => setShowModal(true)}>
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-            <path d="M12 5v14M5 12h14" />
-          </svg>
-          New Session
-        </button>
+    <main className="page-wide">
+      <div style={{ marginBottom: 16 }}>
+        <h1 style={{ fontSize: 24, fontWeight: 700, color: 'var(--text)', margin: 0 }}>Collection scorecard</h1>
+        <p style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 4 }}>
+          How much of {lineName ?? 'the business'} is covered, which models to collect next, and
+          whether anyone is collecting.
+        </p>
       </div>
 
-      {/* Grid */}
-      {sessions.length === 0 ? (
-        <div style={{ textAlign: 'center', padding: '64px 0', color: 'var(--text-muted)' }}>
-          <svg style={{ display: 'block', margin: '0 auto 12px', opacity: 0.25 }} width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-            <circle cx="12" cy="13" r="8" /><polyline points="12 9 12 13 14.5 15.5" /><path d="M9 3h6" /><path d="M12 3v2" />
-          </svg>
-          <p style={{ fontWeight: 600, marginBottom: 4 }}>No sessions yet</p>
-          <p style={{ fontSize: 13 }}>Create your first tryout session to get started</p>
-        </div>
+      {/* ── 1. Line filter — scopes everything below ─────────────────────────────────── */}
+      <div className="card" style={{ padding: '14px 20px', marginBottom: 16, display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'center' }}>
+        <select style={SEL} value={lineId} onChange={(e) => setLineId(e.target.value)}>
+          <option value="">All production lines</option>
+          {lines.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
+        </select>
+        {role === 'admin' && (
+          <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+            Admins start unfiltered; your choice is remembered on this device.
+          </span>
+        )}
+      </div>
+
+      {error && <p style={{ ...ERR_BOX, marginBottom: 16 }}>{error}</p>}
+
+      {loading ? (
+        <p style={EMPTY}>Loading…</p>
       ) : (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 16 }}>
-          {sessions.map((session) => (
-            <button
-              key={session.id}
-              onClick={() => router.push(`/session/${session.id}`)}
-              style={{
-                textAlign: 'left',
-                background: 'var(--surface)',
-                border: '1.5px solid var(--border)',
-                borderRadius: 12,
-                boxShadow: '0 1px 4px rgba(0,0,0,0.06)',
-                padding: '16px 18px',
-                cursor: 'pointer',
-                transition: 'box-shadow 0.15s, border-color 0.15s, transform 0.1s',
-                width: '100%',
-              }}
-              onMouseEnter={(e) => {
-                e.currentTarget.style.boxShadow = '0 4px 16px rgba(0,0,0,0.10)'
-                e.currentTarget.style.borderColor = 'var(--blue)'
-                e.currentTarget.style.transform = 'translateY(-1px)'
-              }}
-              onMouseLeave={(e) => {
-                e.currentTarget.style.boxShadow = '0 1px 4px rgba(0,0,0,0.06)'
-                e.currentTarget.style.borderColor = 'var(--border)'
-                e.currentTarget.style.transform = 'translateY(0)'
-              }}
-            >
-              {/* Chassis tag + arrow */}
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
-                <span style={{
-                  background: 'var(--blue-light)',
-                  color: 'var(--blue)',
-                  fontSize: 12,
-                  fontWeight: 700,
-                  padding: '4px 10px',
-                  borderRadius: 6,
-                  letterSpacing: '0.04em',
-                  textTransform: 'uppercase',
-                  fontFamily: 'ui-monospace, monospace',
-                }}>
-                  {session.chassis_number}
-                </span>
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" strokeWidth="2">
-                  <path d="M9 18l6-6-6-6" />
-                </svg>
-              </div>
-
-              {/* Meta rows */}
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                <Row icon="calendar">
-                  <span style={{ fontSize: 13, color: 'var(--text-mid)' }}>{formatDate(session.created_at)}</span>
-                </Row>
-                <Row icon="user">
-                  <span style={{ fontSize: 13, color: 'var(--text-mid)' }}>
-                    {(session.profiles as { full_name?: string })?.full_name ?? 'Unknown'}
-                  </span>
-                </Row>
-                <Row icon="timer">
-                  <span style={{ fontSize: 13, color: 'var(--text-mid)' }}>
-                    {session.operation_count} operation{session.operation_count !== 1 ? 's' : ''}
-                  </span>
-                </Row>
-              </div>
-
-              {session.notes && (
-                <p style={{
-                  marginTop: 12,
-                  paddingTop: 10,
-                  borderTop: '1px solid var(--border)',
-                  fontSize: 12,
-                  color: 'var(--text-muted)',
-                  lineHeight: 1.5,
-                  overflow: 'hidden',
-                  display: '-webkit-box',
-                  WebkitLineClamp: 2,
-                  WebkitBoxOrient: 'vertical',
-                }}>
-                  {session.notes}
+        <>
+          {/* ── 2. Coverage + gaps ───────────────────────────────────────────────────── */}
+          <section className="card" style={{ padding: '22px 24px', marginBottom: 20 }}>
+            {!coverage || coverage.requiredCombos === 0 ? (
+              <div>
+                <div className="stat-card-label">Coverage</div>
+                <p style={{ ...EMPTY, textAlign: 'left', padding: '8px 0 0' }}>
+                  No jobs require any model on {lineName ?? 'any line'} yet, so there is nothing to
+                  have coverage of. Allocate operations to models in Setup or Try Outs and this
+                  fills in.
                 </p>
-              )}
-            </button>
-          ))}
-        </div>
-      )}
+              </div>
+            ) : (
+              <div style={{ display: 'flex', gap: 32, flexWrap: 'wrap', alignItems: 'flex-start' }}>
+                <div style={{ minWidth: 180 }}>
+                  <div className="stat-card-label">Coverage</div>
+                  <div style={{ fontSize: 52, fontWeight: 700, lineHeight: 1, color: coverage.pct != null && coverage.pct >= 80 ? 'var(--green)' : coverage.pct != null && coverage.pct >= 33 ? 'var(--amber)' : 'var(--red)' }}>
+                    {pctLabel(coverage.pct)}
+                  </div>
+                  <div className="stat-card-sub">
+                    {coverage.gaps.toLocaleString()} job&times;model gap{coverage.gaps === 1 ? '' : 's'} remaining
+                  </div>
+                </div>
 
-      {/* New Session Modal */}
-      {showModal && (
-        <Modal title="New Tryout Session" onClose={closeModal}>
-          <form onSubmit={handleCreate} style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-            <div>
-              <label className="label">Chassis Number <span style={{ color: 'var(--red)' }}>*</span></label>
-              <input
-                className="input"
-                type="text"
-                value={chassisNum}
-                onChange={(e) => setChassisNum(e.target.value)}
-                required
-                autoFocus
-                placeholder="e.g. JD24-001"
-                style={{ textTransform: 'uppercase', fontFamily: 'ui-monospace, monospace', fontWeight: 600 }}
-              />
-            </div>
-            <div>
-              <label className="label">Notes <span style={{ color: 'var(--text-muted)', fontWeight: 400 }}>(optional)</span></label>
-              <textarea
-                className="input"
-                value={notes}
-                onChange={(e) => setNotes(e.target.value)}
-                rows={3}
-                placeholder="Any additional notes…"
-                style={{ resize: 'none' }}
-              />
-            </div>
-            {error && (
-              <div style={{ background: 'var(--red-bg)', border: '1px solid #fecaca', color: 'var(--red)', fontSize: 13, borderRadius: 8, padding: '10px 14px' }}>
-                {error}
+                <div style={{ flex: 1, minWidth: 320 }}>
+                  {/* Headline descriptor — job × model, the same unit Model Total uses. */}
+                  <div style={{ fontSize: 14, color: 'var(--text-mid)', lineHeight: 1.7 }}>
+                    <strong style={{ color: 'var(--text)' }}>{coverage.requiredCombos.toLocaleString()}</strong>{' '}
+                    job&times;model combination{coverage.requiredCombos === 1 ? '' : 's'} required across{' '}
+                    <strong style={{ color: 'var(--text)' }}>{coverage.models}</strong>{' '}
+                    model{coverage.models === 1 ? '' : 's'}.{' '}
+                    <strong style={{ color: 'var(--text)' }}>{coverage.coveredCombos.toLocaleString()}</strong>{' '}
+                    covered &rarr; <strong style={{ color: 'var(--text)' }}>{pctLabel(coverage.pct)}</strong>.{' '}
+                    <strong style={{ color: 'var(--text)' }}>{coverage.modelsAtFull}</strong> of{' '}
+                    {coverage.models} model{coverage.models === 1 ? '' : 's'} fully covered.
+                  </div>
+
+                  {/* Secondary, deliberately subordinate: the finer measure of collection
+                    * effort. Same underlying rows, different unit — never the quoted number. */}
+                  <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 10, lineHeight: 1.6 }}>
+                    <strong style={{ fontWeight: 700 }}>Operation detail:</strong>{' '}
+                    {coverage.timedOperations.toLocaleString()} of{' '}
+                    {coverage.allocatedOperations.toLocaleString()} allocated operations timed
+                    ({pctLabel(coverage.operationPct)}).
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 6, lineHeight: 1.5 }}>
+                    A job counts as covered once any one of its operations has a time for that
+                    model — so the headline runs ahead of the operation detail, which counts every
+                    allocation separately.
+                  </div>
+                </div>
               </div>
             )}
-            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 4 }}>
-              <button type="button" className="btn-ghost" onClick={closeModal}>Cancel</button>
-              <button type="submit" disabled={creating} className="btn-primary">
-                {creating ? 'Creating…' : 'Create Session'}
+          </section>
+
+          {/* ── 3. Times collected ───────────────────────────────────────────────────── */}
+          <section>
+            <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--text)', marginBottom: 10 }}>Times collected</div>
+            <div className="grid-3">
+              <div className="stat-card">
+                <div className="stat-card-label">Today</div>
+                <div className="stat-card-value">{collected.today.toLocaleString()}</div>
+                <div className="stat-card-sub">{collected.todayLabel}</div>
+              </div>
+              <div className="stat-card">
+                <div className="stat-card-label">This week</div>
+                <div className="stat-card-value">{collected.thisWeek.toLocaleString()}</div>
+                <div className="stat-card-sub">
+                  {collected.thisWeekLabel}
+                  {collected.lastWeek > 0 && ` · ${collected.lastWeek.toLocaleString()} across all of last week`}
+                </div>
+              </div>
+              <div className="stat-card">
+                <div className="stat-card-label">Last week</div>
+                <div className="stat-card-value">{collected.lastWeek.toLocaleString()}</div>
+                <div className="stat-card-sub">{collected.lastWeekLabel}</div>
+              </div>
+            </div>
+          </section>
+
+          {/* ── 4. Schedule priority ─────────────────────────────────────────────────── */}
+          <section className="card" style={{ marginBottom: 20, overflow: 'hidden' }}>
+            <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border)' }}>
+              <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--text)' }}>Collect these next</div>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 3 }}>
+                Every model on the line, soonest build first — models with nothing booked sink to
+                the bottom. A low coverage figure at the top of this list is the most expensive
+                gap you have. Click any column to re-sort.
+              </div>
+            </div>
+
+            {priority.length === 0 ? (
+              <p style={EMPTY}>
+                No models are set up for {lineName ?? 'any line'} yet.
+              </p>
+            ) : (
+              <div style={{ overflowX: 'auto' }}>
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <SortHeader label="Model" col="model" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                      <SortHeader label="Future builds" col="future" align="center" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                      <SortHeader label="Next online" col="next" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                      <SortHeader label="Coverage" col="coverage" align="right" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                      <SortHeader label="Total labour" col="labour" align="right" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                      {/* Not sortable — it holds a link, not a value. */}
+                      <th className="right" style={{ width: 1, whiteSpace: 'nowrap' }} />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sortedPriority.map((row) => (
+                      <tr key={row.productId} style={row.futureBuilds === 0 ? { opacity: 0.7 } : undefined}>
+                        <td className="primary">
+                          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                            <button
+                              type="button"
+                              className="row-icon-button"
+                              title={`Show ${row.model}'s upcoming vans`}
+                              aria-label={`Show ${row.model}'s upcoming vans`}
+                              onClick={() => openFocus(row)}
+                            >
+                              <StopwatchIcon />
+                            </button>
+                            {row.model}
+                          </span>
+                        </td>
+                        <td className="center">
+                          {row.futureBuilds}
+                          {row.futureBuilds > 0 && row.sharePct != null && (
+                            <span style={{ color: 'var(--text-muted)', fontWeight: 500 }}>
+                              {' '}({row.sharePct.toFixed(0)}%)
+                            </span>
+                          )}
+                        </td>
+                        <td>
+                          {row.nextOnLine
+                            ? fmtScheduleDate(row.nextOnLine)
+                            : <span style={{ color: 'var(--text-muted)' }}>none scheduled</span>}
+                        </td>
+                        <td className="right">
+                          {row.coveragePct == null ? (
+                            <span className="badge badge-grey" title="No job requires this model — nothing has been allocated to it yet, so there is no coverage to report">
+                              —
+                            </span>
+                          ) : (
+                            <span className={'badge ' + coveragePctClass(row.coveragePct)} title={`${row.coveredCombos} of ${row.requiredCombos} required job×model combinations covered`}>
+                              {pctLabel(row.coveragePct)}
+                            </span>
+                          )}
+                        </td>
+                        <td className="right mono" title={row.totalMinutes != null ? `${fmtHours(row.totalMinutes)} h` : 'Nothing has been timed for this model yet'}>
+                          {row.totalMinutes != null ? `${fmtMinutes(row.totalMinutes)}m` : '—'}
+                        </td>
+                        <td className="right">
+                          <button
+                            type="button"
+                            className="finder-row-action"
+                            style={{ whiteSpace: 'nowrap' }}
+                            title={`Open ${row.model} in Model Total`}
+                            onClick={() => openModelTotal(row)}
+                          >
+                            Model Total →
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {/* Small print: scheduled builds that couldn't be attributed to a model. Only shown
+              * unfiltered — under a line filter a build with no model belongs to no line. */}
+            {!lineId && unlinkedBuilds > 0 && (
+              <div style={{ padding: '10px 20px', borderTop: '1px solid var(--border)', fontSize: 11, color: 'var(--text-muted)' }}>
+                {unlinkedBuilds} scheduled build{unlinkedBuilds === 1 ? '' : 's'} {unlinkedBuilds === 1 ? 'is' : 'are'} not
+                linked to a model (chassis.product_id is empty), so {unlinkedBuilds === 1 ? 'it is' : 'they are'} not
+                counted above.
+              </div>
+            )}
+          </section>
+        </>
+      )}
+
+      {/* ── Focus panel: one model's upcoming vans, each a way into its Try Out ─────── */}
+      {focusRow && (
+        <>
+          <div
+            className={'gaps-drawer-overlay' + (focusVisible ? ' gaps-drawer-overlay-visible' : '')}
+            onClick={closeFocus}
+          />
+          <div className={'gaps-drawer' + (focusVisible ? ' gaps-drawer-visible' : '')} style={DRAWER_WIDTH}>
+            <div className="gaps-drawer-header">
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div className="gaps-drawer-title">{focusRow.model}</div>
+                <div className="gaps-drawer-jobname" style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  <span className={'badge ' + coveragePctClass(focusRow.coveragePct)}>
+                    {focusRow.coveragePct == null ? 'no coverage' : `${pctLabel(focusRow.coveragePct)} covered`}
+                  </span>
+                  <span>
+                    {focusRow.futureBuilds} future build{focusRow.futureBuilds === 1 ? '' : 's'}
+                  </span>
+                </div>
+              </div>
+              <button className="gaps-drawer-close" onClick={closeFocus} aria-label="Close">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                  <path d="M18 6L6 18M6 6l12 12" />
+                </svg>
               </button>
             </div>
-          </form>
-        </Modal>
+
+            <div className="gaps-drawer-body" style={{ padding: '16px 20px' }}>
+              {focusError && <p style={{ ...ERR_BOX, marginBottom: 12 }}>{focusError}</p>}
+
+              {focusChassis == null ? (
+                <p style={EMPTY}>Loading…</p>
+              ) : focusChassis.length === 0 ? (
+                <p style={EMPTY}>
+                  No vans of this model are scheduled from today onwards, so there is nothing
+                  coming up to time.
+                </p>
+              ) : (
+                <>
+                  <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '0 0 10px', lineHeight: 1.5 }}>
+                    Soonest first. Picking one opens its Try Out — starting the tryout if it
+                    hasn&apos;t been started yet.
+                  </p>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    {focusChassis.map((c) => (
+                      <button
+                        key={c.id}
+                        type="button"
+                        className="exception-item-button"
+                        style={{
+                          width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                          gap: 12, textAlign: 'left', fontFamily: 'inherit', cursor: 'pointer',
+                        }}
+                        onClick={() => openTryoutFor(c.id)}
+                        title={`Open the Try Out for ${c.chassisnumber}`}
+                      >
+                        <span style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}>
+                          <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>{c.chassisnumber}</span>
+                          <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                            online {fmtScheduleDate(c.dateonline)}
+                          </span>
+                        </span>
+                        <span className="finder-chevron">›</span>
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </>
       )}
     </main>
   )
 }
 
-function Row({ icon, children }: { icon: 'calendar' | 'user' | 'timer'; children: React.ReactNode }) {
-  const icons = {
-    calendar: <path d="M8 2v4M16 2v4M3 10h18M5 4h14a2 2 0 012 2v14a2 2 0 01-2 2H5a2 2 0 01-2-2V6a2 2 0 012-2z" />,
-    user: <><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2" /><circle cx="12" cy="7" r="4" /></>,
-    timer: <><circle cx="12" cy="13" r="8" /><polyline points="12 9 12 13 14.5 15.5" /><path d="M9 3h6" /><path d="M12 3v2" /></>,
-  }
+/** The stopwatch that opens a model's focus panel — same glyph as the app's own mark, so the
+ * affordance reads as "go and time this". */
+function StopwatchIcon() {
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" strokeWidth="2">
-        {icons[icon]}
-      </svg>
-      {children}
-    </div>
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="13" r="8" />
+      <polyline points="12 9 12 13 14.5 15.5" />
+      <path d="M9 3h6" />
+      <path d="M12 3v2" />
+    </svg>
+  )
+}
+
+/** A clickable column header. The arrow is always rendered — faint on inactive columns, so the
+ * whole row reads as sortable — and solid on the one actually in force. */
+function SortHeader({
+  label, col, align, sortKey, sortDir, onSort,
+}: {
+  label: string
+  col: SortKey
+  align?: 'center' | 'right'
+  sortKey: SortKey
+  sortDir: SortDir
+  onSort: (key: SortKey) => void
+}) {
+  const active = sortKey === col
+  return (
+    <th
+      className={'sortable' + (align ? ' ' + align : '') + (active ? ' sorted' : '')}
+      onClick={() => onSort(col)}
+      role="button"
+      tabIndex={0}
+      aria-sort={active ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}
+      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSort(col) } }}
+    >
+      {label}
+      <span className="sort-arrow">{active ? (sortDir === 'asc' ? '▲' : '▼') : '▲'}</span>
+    </th>
   )
 }

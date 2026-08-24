@@ -1,7 +1,7 @@
 {
-  "name": "TryOut Timer",
-  "short_name": "TryOut",
-  "description": "Chassis tryout session timer and tracking",
+  "name": "J-Motion",
+  "short_name": "J-Motion",
+  "description": "Production line operations time study",
   "start_url": "/dashboard",
   "display": "standalone",
   "background_color": "#ffffff",

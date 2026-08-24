@@ -32,7 +32,6 @@ export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl
   const isPublic =
     pathname === '/login' ||
-    pathname === '/analytics' ||
     pathname.startsWith('/auth/')
 
   if (!user && !isPublic) {
@@ -47,8 +46,8 @@ export async function middleware(request: NextRequest) {
     return NextResponse.redirect(url)
   }
 
-  // Admin route: check role
-  if (user && pathname.startsWith('/admin')) {
+  // Admin-only routes: check role
+  if (user && (pathname.startsWith('/admin') || pathname.startsWith('/config'))) {
     const { data: profile } = await supabase
       .from('profiles')
       .select('role')
