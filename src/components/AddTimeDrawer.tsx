@@ -68,10 +68,20 @@ export interface ModelApplicabilityOutcome {
   model: string
   /** The job already applied to this model before the submit. */
   alreadyApplied: boolean
-  /** model_operations rows actually written for it. */
+  /** model_operations rows the database confirmed for it — the read-back count from
+   * linkOperationsToModels, not the size of the plan. */
   linked: number
   /** Operations linked ONLY because a time was entered against them (the case-b exception). */
   timedAdditions: string[]
+  /**
+   * Its applies-list write failed, so NO times were recorded against it and it is unchanged
+   * beyond whatever links happened to land (which are correct — the upsert is idempotent). The
+   * same guard as the copy panel's: writing the times anyway is what produces a recorded time for
+   * a pair the model is not recorded as doing.
+   */
+  skippedForLinkFailure: boolean
+  /** Why, when skipped. */
+  linkError: string | null
 }
 
 export interface AddTimeResult {
@@ -86,6 +96,9 @@ export interface AddTimeResult {
   applicability: ModelApplicabilityOutcome[]
   /** Per-operation failures, reported rather than swallowed — the batch is not transactional. */
   failures: string[]
+  /** Every selected model's link failed, so nothing at all was written. Distinct from a save that
+   * ran with some failures: this one did not run. */
+  nothingSaved: boolean
 }
 
 type Step = 1 | 2 | 3 | 4
@@ -708,6 +721,7 @@ export default function AddTimeDrawer({
     const out: AddTimeResult = {
       jobId: job, jobName, lineId, created: 0, totalMinutes: 0,
       modelCount: models.length, notesWritten: 0, applicability: [], failures: [],
+      nothingSaved: false,
     }
     try {
       // ── 1. Applicability FIRST ──────────────────────────────────────────────────────
@@ -715,22 +729,57 @@ export default function AddTimeDrawer({
       // recorded as doing. linkOperationsToModels is the single writer and upserts, so a pair
       // that already exists is a no-op rather than a duplicate-key error — nothing here can
       // delete a model_operations row.
-      const pairs = applicabilityPlan.flatMap((planned) =>
-        planned.toLink.map((operation_id) => ({ operation_id, product_id: planned.productId }))
-      )
-      if (pairs.length > 0) {
-        const linkResult = await linkOperationsToModels(supabase, pairs)
-        if (linkResult.error) out.failures.push(`Linking operations to models: ${linkResult.error}`)
+      //
+      // ONE WRITE PER MODEL, so a failure can be pinned to the model it belongs to. A model
+      // whose links did not all land gets NO times — it is dropped from the models the times
+      // are recorded against, and the rest still save. Banking four of five and naming the
+      // fifth beats losing all five to one rejected write and inviting a duplicate re-entry.
+      const savedModels: string[] = []
+      for (const planned of applicabilityPlan) {
+        const outcome: ModelApplicabilityOutcome = {
+          productId: planned.productId,
+          model: planned.model,
+          alreadyApplied: planned.alreadyApplies,
+          linked: 0,
+          timedAdditions: planned.timedAdditions,
+          skippedForLinkFailure: false,
+          linkError: null,
+        }
+        out.applicability.push(outcome)
+        if (planned.toLink.length > 0) {
+          // A throw is the same failure as a returned error — see the copy panel's guard.
+          let linkError: string | null
+          try {
+            const linkResult = await linkOperationsToModels(
+              supabase, planned.toLink.map((operation_id) => ({ operation_id, product_id: planned.productId }))
+            )
+            outcome.linked = linkResult.linked
+            linkError = linkResult.error
+          } catch (err) {
+            linkError = err instanceof Error ? err.message : 'the write was rejected'
+          }
+          if (linkError) {
+            outcome.skippedForLinkFailure = true
+            outcome.linkError = linkError
+            out.failures.push(
+              `${planned.model}: its applies-list could not be written (${linkError}), so NO times `
+              + 'were saved against it. Fix that and enter the times again for this model only.'
+            )
+            continue
+          }
+        }
+        savedModels.push(planned.productId)
       }
-      out.applicability = applicabilityPlan.map((planned) => ({
-        productId: planned.productId,
-        model: planned.model,
-        alreadyApplied: planned.alreadyApplies,
-        linked: planned.toLink.length,
-        timedAdditions: planned.timedAdditions,
-      }))
 
-      // ── 2. Then the times ───────────────────────────────────────────────────────────
+      // Every model's link failed: write nothing. A time recorded against no model is not a
+      // smaller save, it is a record nothing can find.
+      if (savedModels.length === 0) {
+        out.nothingSaved = true
+        setResult(out)
+        return
+      }
+
+      // ── 2. Then the times — against the models whose applicability landed, only ────────
       for (const { operation, minutes } of entered.ok) {
         try {
           // THE single insert path. Never a direct .insert() into operation_times: this is what
@@ -738,7 +787,7 @@ export default function AddTimeDrawer({
           // was the current record for each (operation, model) pair.
           const created = await recordOperationTime(supabase, {
             operationId: operation.id,
-            productIds: models,
+            productIds: savedModels,
             operatorId: operatorId || null,
             collectedBy: userId as string,
             totalMinutes: minutes,
@@ -779,7 +828,7 @@ export default function AddTimeDrawer({
   if (result) {
     return (
       <Modal
-        title="Time added"
+        title={result.nothingSaved ? 'Nothing saved' : 'Time added'}
         onClose={close}
         maxWidth={560}
         // The applicability report is one line per model — 89 of them on Caravan — so Done goes
@@ -801,21 +850,37 @@ export default function AddTimeDrawer({
       >
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
           <div style={result.failures.length > 0 ? { ...ERR_BOX, fontSize: 13 } : OK_BOX}>
-            <div>
-              Added {plural(result.created, 'time')} to <strong>{result.jobName || 'this job'}</strong> —{' '}
-              {fmtTotal(result.totalMinutes)} minutes.
-              {result.notesWritten > 0 && <> Note saved on {plural(result.notesWritten, 'record')}.</>}
-            </div>
+            {result.nothingSaved ? (
+              <div>
+                <strong>Nothing was saved.</strong> None of the selected models’ applies-lists could
+                be written, so no times were recorded against any of them. Every model below is
+                unchanged — fix the cause and enter the form again.
+              </div>
+            ) : (
+              <div>
+                Added {plural(result.created, 'time')} to <strong>{result.jobName || 'this job'}</strong> —{' '}
+                {fmtTotal(result.totalMinutes)} minutes
+                {result.applicability.some((a) => a.skippedForLinkFailure) && (
+                  <>, against {plural(result.applicability.filter((a) => !a.skippedForLinkFailure).length, 'model')} of {result.modelCount} selected</>
+                )}.
+                {result.notesWritten > 0 && <> Note saved on {plural(result.notesWritten, 'record')}.</>}
+              </div>
+            )}
             {/* Reported separately from the times because it is a separate table with separate
                 meaning — this is the half that decides whether untimed work shows as a gap. */}
             {result.applicability.length > 0 && (
               <div style={{ marginTop: 6 }}>
                 {result.applicability.map((a) => (
                   <div key={a.productId}>
-                    {a.linked > 0
-                      ? <>Linked {plural(a.linked, 'operation')} to <strong>{a.model}</strong>.</>
-                      : <><strong>{a.model}</strong> unchanged.</>}
-                    {a.alreadyApplied && a.timedAdditions.map((name) => (
+                    {/* A skipped model is named as SKIPPED, not as "unchanged" alone — "no
+                        times were saved here, deliberately" is the thing the reader must not
+                        miss when the rest of the box says times were added. */}
+                    {a.skippedForLinkFailure
+                      ? <><strong>{a.model}</strong> — <strong>skipped, no times saved</strong>: its applies-list could not be written{a.linkError ? <> ({a.linkError})</> : null}.</>
+                      : a.linked > 0
+                        ? <>Linked {plural(a.linked, 'operation')} to <strong>{a.model}</strong>.</>
+                        : <><strong>{a.model}</strong> unchanged.</>}
+                    {!a.skippedForLinkFailure && a.alreadyApplied && a.timedAdditions.map((name) => (
                       <div key={name} style={{ paddingLeft: 12 }}>
                         + {name} linked (you recorded a time for it).
                       </div>

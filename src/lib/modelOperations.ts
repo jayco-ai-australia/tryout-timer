@@ -193,10 +193,11 @@ export function jobsApplying(
 // ── Writes ─────────────────────────────────────────────────────────────────────────────────
 
 export interface BulkLinkResult {
-  /** Pairs written (upserted). */
+  /** Pairs the database confirmed it holds — the rows the upsert returned, not the rows sent. */
   linked: number
   attempted: number
-  /** The first failure, if any — the rest of the batch is still attempted. */
+  /** The first failure, if any — the rest of the batch is still attempted. A SHORT write is a
+   * failure: `linked < attempted` always comes with an error, never with null. */
   error: string | null
 }
 
@@ -204,6 +205,13 @@ export interface BulkLinkResult {
  * The only function anywhere that inserts into model_operations. Upsert rather than insert so a
  * pair that already exists is a no-op instead of a duplicate-key error that fails the whole
  * batch — every caller's "link these" means "make sure these exist", not "these are new".
+ *
+ * The written rows are read back and counted rather than assumed, the same shape as
+ * setSupersededBy and deleteJobPermanently: a write filtered by RLS comes back successful having
+ * done nothing, and counting `chunk.length` on that path reported applicability that was never
+ * recorded — which is how a caller goes on to write times for a pair its model isn't recorded as
+ * doing. The upsert resolves conflicts by merging, so a pair that already existed is returned
+ * too and counts as linked; only a pair the database did not end up holding goes missing.
  */
 export async function linkOperationsToModels(
   supabase: SupabaseClient,
@@ -212,10 +220,16 @@ export async function linkOperationsToModels(
   let linked = 0
   let error: string | null = null
   for (const chunk of chunked(pairs, WRITE_CHUNK)) {
-    const { error: err } = await supabase
+    const { data, error: err } = await supabase
       .from('model_operations').upsert(chunk, { onConflict: 'operation_id,product_id' })
-    if (err) error ??= err.message
-    else linked += chunk.length
+      .select('operation_id')
+    if (err) { error ??= err.message; continue }
+    linked += (data ?? []).length
+  }
+  if (!error && linked < pairs.length) {
+    error = `only ${linked} of ${pairs.length} model link${pairs.length === 1 ? '' : 's'} were ` +
+      'written — the rest were rejected by the database, which usually means linking operations ' +
+      'to models is restricted to admins in this environment.'
   }
   return { linked, attempted: pairs.length, error }
 }
