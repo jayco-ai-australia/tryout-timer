@@ -1,3 +1,10 @@
+/** "1 job" / "2 jobs" — the app's one pluraliser. Lives here rather than in
+ * components/FinderPanes (where it used to) so components outside the panes can use it
+ * without importing the pane module back. FinderPanes re-exports it for its own callers. */
+export function plural(n: number, word: string) {
+  return `${n} ${word}${n === 1 ? '' : 's'}`
+}
+
 export function fmtClock(seconds: number): string {
   const m = Math.floor(seconds / 60).toString().padStart(2, '0')
   const s = Math.floor(seconds % 60).toString().padStart(2, '0')

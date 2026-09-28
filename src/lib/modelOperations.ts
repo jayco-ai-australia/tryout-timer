@@ -1,5 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { operationProductKey } from './operationTimes'
+import { fetchAllChunked, fetchAllRows } from './supabaseRead'
 
 /**
  * The single model_operations module — every screen that links or unlinks an operation to a
@@ -7,8 +8,8 @@ import { operationProductKey } from './operationTimes'
  *
  * model_operations is the applies-list: one row per (operation, product) pair meaning "this
  * operation applies to this model". It is the ONLY place applicability is recorded — there is
- * no job→model or stage→model link anywhere. A job "applies to a model" iff at least one of its
- * operations does (see jobsApplying below), and stages are line-level structure that is never
+ * no job→model or section→model link anywhere. A job "applies to a model" iff at least one of its
+ * operations does (see jobsApplying below), and sections are line-level structure that is never
  * model-scoped at all.
  *
  * Three screens write it and they must not drift:
@@ -29,19 +30,23 @@ import { operationProductKey } from './operationTimes'
  * lib/operationTimes.ts. In this database that flag marks a superseded import batch, not an
  * admin-hidden row, and filtering on it here would wave through unlinks of pairs that carry the
  * bulk of their model's recorded history.
+ *
+ * They do not filter superseded_by either, for the same shape of reason. The question these
+ * guards ask is "has this pair ever been timed?" — which is what authorises an unlink — not
+ * "what is its labour figure?". A pair whose records have all been superseded has been timed,
+ * and filtering to the current record would wave through unlinks that orphan real history.
  */
 
 /** PostgREST caps how much a single `.in(...)` filter or insert payload can carry comfortably,
  * so every bulk read/write below is chunked. Reads use the smaller size because their ids go
- * into the URL. */
-export const READ_CHUNK = 150
-export const WRITE_CHUNK = 500
+ * into the URL — that size and the chunker itself now live in lib/supabaseRead alongside the
+ * OTHER limit a bulk read has to respect (the row cap on what one response can return), and are
+ * re-exported here so the many callers that import them from this module still can. */
+export { chunked, READ_CHUNK } from './supabaseRead'
+import { chunked, READ_CHUNK } from './supabaseRead'
 
-export function chunked<T>(items: T[], size: number): T[][] {
-  const out: T[][] = []
-  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size))
-  return out
-}
+/** Insert/upsert payload size. Not a URL concern, so it stays larger and stays here. */
+export const WRITE_CHUNK = 500
 
 /** One (operation, product) applies-list row. */
 export interface ModelOperationPair { operation_id: string; product_id: string }
@@ -54,14 +59,13 @@ export async function fetchLinksForOperations(
   operationIds: string[]
 ): Promise<ModelOperationPair[]> {
   if (operationIds.length === 0) return []
-  const rows: ModelOperationPair[] = []
-  for (const chunk of chunked(operationIds, READ_CHUNK)) {
-    const { data, error } = await supabase
+  return fetchAllChunked<ModelOperationPair>(
+    operationIds, READ_CHUNK,
+    (chunk) => supabase
       .from('model_operations').select('operation_id, product_id').in('operation_id', chunk)
-    if (error) throw new Error(error.message)
-    rows.push(...((data ?? []) as ModelOperationPair[]))
-  }
-  return rows
+      .order('operation_id').order('product_id'),
+    { table: 'model_operations' }
+  )
 }
 
 /**
@@ -73,16 +77,27 @@ export async function fetchOperationIdsForModel(
   supabase: SupabaseClient,
   productId: string
 ): Promise<Set<string>> {
-  const { data, error } = await supabase
-    .from('model_operations').select('operation_id').eq('product_id', productId)
-  if (error) throw new Error(error.message)
-  return new Set((data ?? []).map((r) => r.operation_id as string))
+  const rows = await fetchAllRows<{ operation_id: string }>(
+    () => supabase
+      .from('model_operations').select('operation_id').eq('product_id', productId)
+      .order('operation_id').order('product_id'),
+    { table: 'model_operations' }
+  )
+  return new Set(rows.map((r) => r.operation_id))
 }
 
 /**
  * The (operation, product) pairs that already have a recorded time — the unlink guard, keyed
  * with the shared operationProductKey so it lines up with every other pair-keyed map in the
  * app. Joined through operation_time_models because operation_times has no product_id column.
+ *
+ * BOTH reads are paged (lib/supabaseRead), and that is a correctness requirement rather than a
+ * completeness nicety. This set is consulted as "a pair NOT in here has no recorded times, so
+ * it is safe to delete" — the absence of a pair is what authorises the delete. A read truncated
+ * at the row cap therefore FAILS OPEN: the missing pairs look untimed and get unlinked, orphaning
+ * their operation_times behind a link that no longer exists. There is no error to catch on that
+ * path; a capped response is a normal 200. Every query below carries a total order over its
+ * primary key, without which paging could skip a row and reproduce the same hole.
  */
 export async function fetchTimedPairs(
   supabase: SupabaseClient,
@@ -91,23 +106,25 @@ export async function fetchTimedPairs(
   const pairs = new Set<string>()
   if (operationIds.length === 0) return pairs
 
-  const timeRows: { id: string; operation_id: string }[] = []
-  for (const chunk of chunked(operationIds, READ_CHUNK)) {
-    const { data, error } = await supabase
+  const timeRows = await fetchAllChunked<{ id: string; operation_id: string }>(
+    operationIds, READ_CHUNK,
+    (chunk) => supabase
       .from('operation_times').select('id, operation_id').in('operation_id', chunk)
-    if (error) throw new Error(error.message)
-    timeRows.push(...((data ?? []) as { id: string; operation_id: string }[]))
-  }
+      .order('id'),
+    { table: 'operation_times' }
+  )
 
   const opByTimeId = new Map(timeRows.map((t) => [t.id, t.operation_id]))
-  for (const chunk of chunked([...opByTimeId.keys()], READ_CHUNK)) {
-    const { data, error } = await supabase
+  const linkRows = await fetchAllChunked<{ operation_time_id: string; product_id: string }>(
+    [...opByTimeId.keys()], READ_CHUNK,
+    (chunk) => supabase
       .from('operation_time_models').select('operation_time_id, product_id').in('operation_time_id', chunk)
-    if (error) throw new Error(error.message)
-    for (const r of (data ?? []) as { operation_time_id: string; product_id: string }[]) {
-      const opId = opByTimeId.get(r.operation_time_id)
-      if (opId) pairs.add(operationProductKey(opId, r.product_id))
-    }
+      .order('operation_time_id').order('product_id'),
+    { table: 'operation_time_models' }
+  )
+  for (const r of linkRows) {
+    const opId = opByTimeId.get(r.operation_time_id)
+    if (opId) pairs.add(operationProductKey(opId, r.product_id))
   }
   return pairs
 }
@@ -120,24 +137,39 @@ export async function fetchTimedPairs(
  * Returns null when the lookup fails rather than an empty set: "we don't know" and "nothing is
  * timed" must never be confused, because the caller uses this to decide whether unlinking is
  * allowed, and an empty set would wave every unlink through.
+ *
+ * The same fail-open hazard fetchTimedPairs carries applies here, and null only covers the half
+ * of it that raises an error. A SHORT read raises nothing — it just answers "fewer operations
+ * are timed than really are", which permits an unlink that should have been refused. That is why
+ * both reads are paged rather than merely chunked.
  */
 export async function fetchTimedOperationIdsForModel(
   supabase: SupabaseClient,
   productId: string
 ): Promise<Set<string> | null> {
-  const { data: linkRows, error: linkError } = await supabase
-    .from('operation_time_models').select('operation_time_id').eq('product_id', productId)
-  if (linkError) return null
-
-  const timeIds = [...new Set((linkRows ?? []).map((r) => r.operation_time_id as string))]
-  const opIds = new Set<string>()
-  for (const chunk of chunked(timeIds, READ_CHUNK)) {
-    const { data, error } = await supabase
-      .from('operation_times').select('operation_id').in('id', chunk)
-    if (error) return null
-    for (const r of data ?? []) opIds.add(r.operation_id as string)
+  // The paged helpers throw where the old inline reads returned an error object, so the whole
+  // chain is wrapped to keep this function's contract exactly as it was: any failure — including
+  // a page failing halfway through — is null, never a partial set. A partial set here reads as
+  // "these operations are timed and no others", which is the answer that lets a timed pair be
+  // unlinked.
+  try {
+    const linkRows = await fetchAllRows<{ operation_time_id: string }>(
+      () => supabase
+        .from('operation_time_models').select('operation_time_id').eq('product_id', productId)
+        .order('operation_time_id').order('product_id'),
+      { table: 'operation_time_models' }
+    )
+    const timeIds = [...new Set(linkRows.map((r) => r.operation_time_id))]
+    const timeRows = await fetchAllChunked<{ operation_id: string }>(
+      timeIds, READ_CHUNK,
+      (chunk) => supabase
+        .from('operation_times').select('operation_id').in('id', chunk).order('id'),
+      { table: 'operation_times' }
+    )
+    return new Set(timeRows.map((r) => r.operation_id))
+  } catch {
+    return null
   }
-  return opIds
 }
 
 // ── Derivation ─────────────────────────────────────────────────────────────────────────────
