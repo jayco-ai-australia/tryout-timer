@@ -2,9 +2,15 @@ import { createClient } from '@/lib/supabase/server'
 import { redirect } from 'next/navigation'
 import Nav from '@/components/Nav'
 import SetupClient from './SetupClient'
+import { setupFocusFromParams } from '@/lib/setupLinks'
 import type { UserRole } from '@/lib/types'
 
-export default async function SetupPage() {
+/** Focus is read from the query string HERE, on the server, and handed down — the same shape
+ * /reports uses. It arrives before first paint, so a deep-linked merge opens on the right job
+ * rather than flashing the remembered position and jumping. */
+export default async function SetupPage({ searchParams }: {
+  searchParams: Record<string, string | string[] | undefined>
+}) {
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
   if (!user) redirect('/login')
@@ -19,7 +25,12 @@ export default async function SetupPage() {
   return (
     <div style={{ minHeight: '100vh', background: 'var(--bg)' }}>
       <Nav />
-      <SetupClient lines={lines ?? []} role={role} userId={user.id} />
+      <SetupClient
+        lines={lines ?? []}
+        role={role}
+        userId={user.id}
+        initialFocus={setupFocusFromParams(searchParams)}
+      />
     </div>
   )
 }

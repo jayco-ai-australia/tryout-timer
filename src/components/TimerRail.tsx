@@ -2,6 +2,7 @@
 
 import { useState } from 'react'
 import ConfirmDialog from './ConfirmDialog'
+import OperatorSelect from './OperatorSelect'
 import { elapsedSecondsNow, genId, type ActiveTimer } from '@/lib/stopwatch'
 import { fmtClock, fmtMinutes } from '@/lib/format'
 
@@ -14,8 +15,9 @@ import { fmtClock, fmtMinutes } from '@/lib/format'
  * The two screens differ only in what a run is banked against — a chassis on /tryouts, a set of
  * models on /collect — and that difference is a single `contextLabel` string here. Everything
  * else (concurrency, the one-timer-per-operation rule enforced by the caller, pause
- * accumulation, notes gathered mid-run, the operator asked at Start and confirmed at Complete)
- * is identical, and lives in one place so the two can't drift apart.
+ * accumulation, notes gathered mid-run, the searchable line-scoped operator picker asked at
+ * Start and confirmed at Complete, the Restart that puts a card back to 0:00) is identical, and
+ * lives in one place so the two can't drift apart.
  *
  * All timer state belongs to lib/stopwatch and is owned by the host screen's useStopwatches;
  * nothing here holds a timer. The only state these components own is what a user is part-way
@@ -26,11 +28,6 @@ import { fmtClock, fmtMinutes } from '@/lib/format'
  * selects from `operators`. */
 export interface TimerOperatorOption { id: string; full_name: string }
 
-const SEL: React.CSSProperties = {
-  fontSize: 13, fontWeight: 500, fontFamily: 'inherit',
-  border: '1.5px solid var(--border)', borderRadius: 8, padding: '7px 10px',
-  background: 'var(--surface)', color: 'var(--text)', cursor: 'pointer', outline: 'none', width: '100%',
-}
 const ERR_BOX: React.CSSProperties = {
   padding: '9px 14px', borderRadius: 8, background: 'var(--red-bg)',
   border: '1px solid #fecaca', color: 'var(--red)', fontSize: 13,
@@ -48,7 +45,7 @@ function plural(n: number, word: string) {
 /**
  * Every running or paused stopwatch, always on screen — this is what replaces a "Running now"
  * pane. A pane could only ever show the timers under whatever the drill-down columns happen to
- * be pointing at, and timers deliberately run concurrently across different jobs and stages;
+ * be pointing at, and timers deliberately run concurrently across different jobs and sections;
  * the rail is the one place that shows all of them, so any can be paused or completed without
  * navigating back to the operation it belongs to.
  *
@@ -72,7 +69,7 @@ function plural(n: number, word: string) {
  * invisible, and therefore un-completable, because the screen moved on.
  */
 export function TimerRail({
-  timers, nowMs, currentContextKey, onTogglePause, onComplete, onDiscard, onAddNote, onRemoveNote,
+  timers, nowMs, currentContextKey, onTogglePause, onRestart, onComplete, onDiscard, onAddNote, onRemoveNote,
 }: {
   timers: ActiveTimer[]
   nowMs: number
@@ -83,6 +80,8 @@ export function TimerRail({
    */
   currentContextKey: string | null
   onTogglePause: (timerId: string) => void
+  /** Reset one timer to 0:00 and leave it paused — this component confirms before calling. */
+  onRestart: (timerId: string) => void
   onComplete: (timer: ActiveTimer) => void
   onDiscard: (timerId: string) => void
   onAddNote: (timerId: string, note: string) => void
@@ -112,6 +111,7 @@ export function TimerRail({
             nowMs={nowMs}
             showContext={currentContextKey !== null && timer.chassisId !== currentContextKey}
             onTogglePause={() => onTogglePause(timer.timerId)}
+            onRestart={() => onRestart(timer.timerId)}
             onComplete={() => onComplete(timer)}
             onDiscard={() => onDiscard(timer.timerId)}
             onAddNote={(note) => onAddNote(timer.timerId, note)}
@@ -135,12 +135,13 @@ export function TimerRail({
  * it is still going.
  */
 function TimerRailCard({
-  timer, nowMs, showContext, onTogglePause, onComplete, onDiscard, onAddNote, onRemoveNote,
+  timer, nowMs, showContext, onTogglePause, onRestart, onComplete, onDiscard, onAddNote, onRemoveNote,
 }: {
   timer: ActiveTimer
   nowMs: number
   showContext: boolean
   onTogglePause: () => void
+  onRestart: () => void
   onComplete: () => void
   onDiscard: () => void
   onAddNote: (note: string) => void
@@ -148,7 +149,12 @@ function TimerRailCard({
 }) {
   const [noteOpen, setNoteOpen] = useState(false)
   const [draft, setDraft] = useState('')
+  const [confirmRestart, setConfirmRestart] = useState(false)
   const notes = timer.notes ?? []
+  const elapsed = elapsedSecondsNow(timer, nowMs)
+  /** A timer sitting paused on 0:00 has never actually run — most often because it was just
+   * restarted — so the resume control says what it will really do. */
+  const atZero = timer.isPaused && elapsed === 0
 
   function commit() {
     if (!draft.trim()) return
@@ -170,12 +176,12 @@ function TimerRailCard({
       </div>
 
       <span className={'timer-rail-clock ' + (timer.isPaused ? 'timer-display-paused' : 'timer-display-running')}>
-        {fmtClock(elapsedSecondsNow(timer, nowMs))}
+        {fmtClock(elapsed)}
       </span>
 
       <div className="timer-rail-card-actions">
         <button type="button" className="btn-ghost" style={{ padding: '5px 10px', fontSize: 12 }} onClick={onTogglePause}>
-          {timer.isPaused ? 'Resume' : 'Pause'}
+          {timer.isPaused ? (atZero ? 'Start' : 'Resume') : 'Pause'}
         </button>
         <button
           type="button"
@@ -189,12 +195,38 @@ function TimerRailCard({
         <button
           type="button"
           className="finder-row-action"
+          title="Reset this timer to 0:00 — it stays paused until you press Start"
+          onClick={() => setConfirmRestart(true)}
+        >
+          Restart
+        </button>
+        <button
+          type="button"
+          className="finder-row-action"
           title="Discard this timer — no time will be recorded"
           onClick={onDiscard}
         >
           Discard
         </button>
       </div>
+
+      {/* Restarting throws the elapsed time away, so it asks first — the same small
+        * confirmation Discard gets, since from a walker's point of view both lose the run. */}
+      {confirmRestart && (
+        <ConfirmDialog
+          title="Restart timer"
+          message={
+            `Reset this timer to 0:00? The ${fmtClock(elapsed)} already on “${timer.operationName}” ` +
+            'is discarded and nothing is recorded. It stays paused until you press Start, and ' +
+            (notes.length > 0 ? `the ${plural(notes.length, 'note')} on this run ` : 'the operator and everything else on this run ') +
+            'is kept.'
+          }
+          confirmLabel="Reset to 0:00"
+          danger
+          onConfirm={() => { setConfirmRestart(false); onRestart() }}
+          onCancel={() => setConfirmRestart(false)}
+        />
+      )}
 
       {/* Notes gathered so far on THIS run — each removable while it's still only in the
           timer, since nothing has been written and a typo would otherwise be permanent. */}
@@ -280,6 +312,7 @@ export function StartTimerDialog({
   jobName: string
   /** What the run will be banked against — "EF1147", "4 models", etc. */
   contextLabel: string
+  /** Already scoped to the production line in play — see lib/operators' operatorsForLine. */
   operators: TimerOperatorOption[]
   onStart: (choice: StartTimerChoice) => void
   onCancel: () => void
@@ -307,12 +340,15 @@ export function StartTimerDialog({
       <div className="capture-fields">
         <div>
           <label className="label">Operator — who&apos;s being timed?</label>
-          <select style={SEL} value={operatorId} onChange={(e) => setOperatorId(e.target.value)}>
-            <option value="">— None —</option>
-            {operators.map((o) => <option key={o.id} value={o.id}>{o.full_name}</option>)}
-          </select>
+          <OperatorSelect
+            operators={operators}
+            value={operatorId}
+            ariaLabel="Operator being timed"
+            onChange={setOperatorId}
+          />
           <p style={{ fontSize: 11, color: 'var(--text-muted)', margin: '6px 0 0' }}>
-            Optional. The operation&apos;s own primary operator isn&apos;t changed either way.
+            Optional, and only this production line&apos;s operators. The operation&apos;s own primary
+            operator isn&apos;t changed either way.
           </p>
         </div>
         <div>
@@ -362,6 +398,7 @@ export function CompleteTimerDialog({
   timer: ActiveTimer
   /** What the run is being banked against — shown for confirmation before saving. */
   contextLabel: string
+  /** Already scoped to the production line in play — see lib/operators' operatorsForLine. */
   operators: TimerOperatorOption[]
   saving: boolean
   error: string | null
@@ -395,7 +432,10 @@ export function CompleteTimerDialog({
       }
       confirmLabel={saving ? 'Saving…' : 'Save'}
       cancelLabel="Cancel"
-      maxWidth={560}
+      // 720 rather than 560 so /collect's expanded model grid gets three columns out of the
+      // 180px track instead of two — 89 models is 30 rows, not 45. The two side-by-side fields
+      // below it are unaffected.
+      maxWidth={720}
       onConfirm={() => {
         if (saving || blockedReason) return
         onSave({ operatorId: operatorId || null, notes: notes.map((n) => n.text), note, atMs })
@@ -411,17 +451,16 @@ export function CompleteTimerDialog({
         <div className="capture-fields">
           <div>
             <label className="label">Operator — who was timed?</label>
-            <select
-              style={SEL}
+            <OperatorSelect
+              operators={operators}
               value={operatorId}
               disabled={saving}
-              onChange={(e) => setOperatorId(e.target.value)}
-            >
-              <option value="">— None —</option>
-              {operators.map((o) => <option key={o.id} value={o.id}>{o.full_name}</option>)}
-            </select>
+              ariaLabel="Operator who was timed"
+              onChange={setOperatorId}
+            />
             <p style={{ fontSize: 11, color: 'var(--text-muted)', margin: '6px 0 0' }}>
-              Pre-filled from Start. The operation&apos;s own primary operator isn&apos;t changed either way.
+              Pre-filled from Start, and only this production line&apos;s operators. The operation&apos;s
+              own primary operator isn&apos;t changed either way.
             </p>
           </div>
           <div>

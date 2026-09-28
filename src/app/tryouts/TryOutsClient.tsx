@@ -2,22 +2,31 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
+import { selectIn } from '@/lib/chunkedIn'
 import Modal from '@/components/Modal'
 import ConfirmDialog from '@/components/ConfirmDialog'
 import NewOperationModal from '@/components/NewOperationModal'
 import { NoteThread } from '@/components/ModelLinker'
 import {
-  JobsPane, Pane, RenameButton, ROW_INPUT, RunningDot, StagesPane, UNSTAGED_KEY, plural,
-  type StageEntry,
+  JobsPane, Pane, RenameButton, RunningDot, SectionsPane, UNSECTIONED_KEY, plural,
+  type SectionEntry,
 } from '@/components/FinderPanes'
 import {
-  fetchOperationIdsForModel, fetchTimedOperationIdsForModel, jobsApplying,
+  MergeConfirm, MergeFooter, MergeNotices, MergeRowItem, useMergeMode,
+  type MergeModeState, type MergeRow,
+} from '@/components/MergeMode'
+import { useSlideOverDrawer } from '@/components/BulkModelLinkDrawer'
+import JobEditDrawer from '@/components/JobEditDrawer'
+import OperationEditDrawer from '@/components/OperationEditDrawer'
+import {
+  chunked, fetchOperationIdsForModel, fetchTimedOperationIdsForModel, jobsApplying,
   linkOperationToModel, linkOperationsToModels, unlinkOperationFromModel,
-  unlinkOperationsFromModels,
+  unlinkOperationsFromModels, READ_CHUNK,
 } from '@/lib/modelOperations'
 import {
-  addOperationTimeNote, averageByOperation, deleteOperationTime, fetchOperationTimeNotes,
-  recordOperationTime, updateOperationTimeMinutes, type OperationTimeStat,
+  addOperationTimeNote, currentByOperation, currentForOperation, deleteOperationTime, historyLabel,
+  fetchOperationTimeNotes, recordOperationTime, updateOperationTimeMinutes,
+  type OperationTimeStat,
 } from '@/lib/operationTimes'
 import {
   elapsedSecondsNow, saveTimerRun, useStopwatches, type ActiveTimer,
@@ -25,12 +34,18 @@ import {
 import {
   CompleteTimerDialog, StartTimerDialog, TimerRail, type CompleteTimerResult, type StartTimerChoice,
 } from '@/components/TimerRail'
-import { fmtClock, fmtDate, fmtMinutes } from '@/lib/format'
+import { fmtClock, fmtDate, fmtDateTime, fmtMinutes } from '@/lib/format'
 import { operationProductKey } from '@/lib/operationTimes'
-import { sortStages } from '@/lib/stages'
-import { mergeOperations, strandedMergeMessage } from '@/lib/mergeOperations'
+import {
+  canDeleteTime, canEditTime, timeEditBlockedReason, type PermissionActor,
+} from '@/lib/permissions'
+import { findSectionTray, sortSections, teamForJob } from '@/lib/sections'
 import { usePersistedFilter } from '@/lib/useLocalStorage'
-import type { Job, Operation, OperationTimeNote, Stage, Team } from '@/lib/types'
+import {
+  fetchOperators, operatorsForLine, type OperatorOption,
+} from '@/lib/operators'
+import OperatorSelect from '@/components/OperatorSelect'
+import type { Job, Operation, OperationTimeNote, Section, Team, UserRole } from '@/lib/types'
 
 /**
  * Try Outs — the "follow one van down the line" capture flow.
@@ -38,23 +53,27 @@ import type { Job, Operation, OperationTimeNote, Stage, Team } from '@/lib/types
  * Everything past the landing list is scoped to a single chassis: a tryout *is* the set of
  * operation_times carrying that chassis_id. The van's chassis fixes the production line (via
  * chassis → product → production_line_id), and inside that line the screen is the same
- * Finder-style drill-down /setup uses — Team filter, then Stages → Jobs → Operations, the
+ * Finder-style drill-down /setup uses — Team filter, then Sections → Jobs → Operations, the
  * literal same pane components from components/FinderPanes for the first two columns (mounted
- * read-only for stages, and with the job applies-toggle turned on), Unstaged bucket and all.
+ * read-only for sections, and with the job applies-toggle turned on), Unsectioned bucket and all.
  *
  * ── Model applicability ──────────────────────────────────────────────────────────────────
  * Stored in exactly one place, model_operations (operation ↔ product), and nowhere else:
  *   - an OPERATION applies to this van's model iff a model_operations row exists for the pair;
  *   - a JOB applies iff at least one of its operations does — derived, never stored, so the two
  *     can't fall out of step (there is no job→model link and there must not be one);
- *   - a STAGE is line-level structure and is never model-scoped at all. Every stage on the line
- *     always shows, whatever the model. The Stages pane here is navigation plus create: a new
- *     stage is appended to the line (never to the model), while rename, reorder and delete —
+ *   - a SECTION is line-level structure and is never model-scoped at all. Every section on the line
+ *     always shows, whatever the model. The Sections pane here is navigation plus create: a new
+ *     section is appended to the line (never to the model), while rename, reorder and delete —
  *     the operations that can disturb a walk other vans are mid-way through — stay on /setup.
  *
  * It is operated at the JOB grain, because that's the unit a van actually differs by: the job
  * toggle in pane 2 writes every operation under it in one bulk call. The per-operation toggle
  * in pane 3 is the fine-grained override for "everything in this job applies except that one".
+ * A job with NO operations is the one case there is nothing to write: ticking it opens the
+ * add-operation modal for that job instead, pre-linked to this van's model, so the first
+ * operation created both fills the job and applies it. Still no job→model flag — the job's
+ * "Applies" state simply derives itself on once that operation exists.
  * Both go through lib/modelOperations, the same helpers /setup's bulk drawer and ModelLinker
  * use, so the guard — an operation with recorded times for this model can never be un-applied,
  * it demonstrably applies — is enforced identically everywhere.
@@ -72,11 +91,11 @@ import type { Job, Operation, OperationTimeNote, Stage, Team } from '@/lib/types
  *      stopwatch is on it. Nothing in the row changes height between those states.
  *
  * There is no fourth "Running now" pane. Timers can run concurrently across different jobs and
- * stages, and a pane would only ever show the ones under the current selection — so every
+ * sections, and a pane would only ever show the ones under the current selection — so every
  * running or paused timer ALSO lives in the fixed rail down the right-hand quarter of the
  * screen, where any of them can be paused or completed without navigating back to its
  * operation. The rail and the row are two views of one timer: their Complete buttons call the
- * same handler and open the same operator + notes confirmation. The drill-down panes carry a running dot on the stage/job/operation a timer
+ * same handler and open the same operator + notes confirmation. The drill-down panes carry a running dot on the section/job/operation a timer
  * belongs to so the rail and the columns agree about where the work is.
  *
  * The stopwatches themselves are lib/stopwatch — the same module /collect's Active Timers run
@@ -90,7 +109,12 @@ import type { Job, Operation, OperationTimeNote, Stage, Team } from '@/lib/types
  * recorded against the shared placeholder operator — see recordOperationTime.
  */
 
-interface Props { userId: string }
+interface Props {
+  userId: string
+  /** The viewer's profiles.role, read server-side. Used only by the time-detail panel, which
+   * gates its edit and delete controls through lib/permissions. */
+  role: UserRole | null
+}
 
 type SupabaseClient = ReturnType<typeof createClient>
 
@@ -129,7 +153,7 @@ interface RawChassisRow {
 interface RawTeamRef { id: string; name: string }
 interface RawJob {
   id: string; name: string; primary_operator_id: string | null
-  team_id: string | null; production_line_id: string | null; stage_id: string | null; created_at: string
+  team_id: string | null; production_line_id: string | null; section_id: string | null; created_at: string
   teams: RawTeamRef | RawTeamRef[] | null
 }
 interface RawOperatorRef { id: string; full_name: string }
@@ -177,9 +201,13 @@ interface VanTime {
   totalMinutes: number | null
   createdAt: string
   operatorName: string | null
+  /** Who collected the record — the ownership half of the edit permission (lib/permissions).
+   * null is an ownerless imported row, editable by anyone. */
+  collectedBy: string | null
+  /** null = the current record for its model; set = archived behind that one. Carried so the
+   * van log can pick the figure through the shared helper and label the rest as history. */
+  supersededBy: string | null
 }
-
-interface OperatorOption { id: string; full_name: string }
 
 /** Which operation a drawer is pointing at. Carries its labels rather than looking them up
  * from the panes, so an operation created inline can be worked on immediately without waiting
@@ -278,7 +306,7 @@ async function buildVanContext(
   }
 }
 
-export default function TryOutsClient({ userId }: Props) {
+export default function TryOutsClient({ userId, role }: Props) {
   const supabase = useMemo(() => createClient(), [])
 
   const [van, setVan] = useState<VanContext | null>(null)
@@ -294,7 +322,7 @@ export default function TryOutsClient({ userId }: Props) {
   const [tryoutBusy, setTryoutBusy] = useState(false)
 
   // ── Van view: the line's structure, and this van's times over it ──────────────────────
-  const [stages, setStages] = useState<Stage[]>([])
+  const [sections, setSections] = useState<Section[]>([])
   const [jobs, setJobs] = useState<Job[]>([])
   const [operationsByJob, setOperationsByJob] = useState<Record<string, Operation[]>>({})
   const [lineTeams, setLineTeams] = useState<Team[]>([])
@@ -302,14 +330,43 @@ export default function TryOutsClient({ userId }: Props) {
   const [loadingVan, setLoadingVan] = useState(false)
   const [vanError, setVanError] = useState<string | null>(null)
   const [operators, setOperators] = useState<OperatorOption[]>([])
-  const [newOperationJob, setNewOperationJob] = useState<{ jobId: string; jobName: string } | null>(null)
+  /** The add-operation modal's target, plus why it opened: 'time' is the Operations pane's
+   * "+ Add operation" (create, then straight into Start), 'apply' is pane 2's applies-toggle on
+   * a job with no operations yet — see toggleJobApplies. */
+  const [newOperationJob, setNewOperationJob] =
+    useState<{ jobId: string; jobName: string; intent: 'time' | 'apply' } | null>(null)
 
   // ── Drill position — persisted, exactly like /setup's, so a refresh comes back to the
   // same operation. The production line is NOT a filter here: the van's chassis fixes it. ──
   const [teamId, setTeamId] = usePersistedFilter('jmotion_tryout_team')
-  const [stageKey, setStageKey] = usePersistedFilter('jmotion_tryout_stage')
+  const [sectionKey, setSectionKey] = usePersistedFilter('jmotion_tryout_section')
   const [jobId, setJobId] = usePersistedFilter('jmotion_tryout_job')
   const [operationId, setOperationId] = usePersistedFilter('jmotion_tryout_operation')
+
+  /**
+   * Pane 3's merge mode — the same hook the Sections and Jobs panes mount, at the operation
+   * level. Declared up here, above the effects that reset it when the van or the job changes,
+   * so those effects can call `cancel()` without reaching forward to a binding that hasn't been
+   * initialised yet.
+   *
+   * Rows come straight off `operationsByJob` rather than the van-scoped `visibleOperations`
+   * below: merging is structure work on the JOB, and hiding a duplicate because it doesn't
+   * happen to apply to the van currently being walked would leave it unmergeable from here.
+   * The group key is job_id, which is the rule lib/mergeOperations enforces.
+   */
+  const opMergeRows = useMemo<MergeRow<Operation>[]>(
+    () => (operationsByJob[jobId] ?? []).map((op) => ({
+      id: op.id, name: op.name, groupKey: `job:${op.job_id}`, subject: op,
+    })),
+    [operationsByJob, jobId]
+  )
+  const opMerge = useMergeMode({
+    level: 'operation',
+    supabase,
+    userId,
+    rows: opMergeRows,
+    onMerged: async () => { if (van) await loadVan(van) },
+  })
 
   // ── Model applicability (model_operations) ───────────────────────────────────────────
   /** Operation ids that apply to this van's model. Empty = nothing applies yet, and every
@@ -331,16 +388,10 @@ export default function TryOutsClient({ userId }: Props) {
   const [unapplyJobTarget, setUnapplyJob] = useState<{ job: Job; unlinkCount: number; keptCount: number } | null>(null)
   const [jobApplyNotice, setJobApplyNotice] = useState<string | null>(null)
 
-  // ── Merge mode (pane 3, one job at a time — same routine /setup runs) ─────────────────
-  const [opMode, setOpMode] = useState<'normal' | 'merge'>('normal')
-  const [mergeSelected, setMergeSelected] = useState<Set<string>>(new Set())
-  const [mergeKeeperId, setMergeKeeperId] = useState<string | null>(null)
-  const [mergeConfirm, setMergeConfirm] = useState<{ keeper: Operation; dups: Operation[] } | null>(null)
-  const [merging, setMerging] = useState(false)
 
   // ── Stopwatches: the shared module, one persisted list across every van ───────────────
   const {
-    timers, nowMs, start: startStopwatch, togglePause, discard: discardTimer,
+    timers, nowMs, start: startStopwatch, togglePause, restart: restartTimer, discard: discardTimer,
     addNote: addTimerNote, removeNote: removeTimerNote,
   } = useStopwatches(TIMERS_KEY)
   /** The Start confirmation — operator and an opening note, both optional, asked BEFORE the
@@ -351,6 +402,37 @@ export default function TryOutsClient({ userId }: Props) {
   const [completing, setCompleting] = useState(false)
   const [completeError, setCompleteError] = useState<string | null>(null)
   const [cancelingTimerId, setCancelingTimerId] = useState<string | null>(null)
+
+  // ── "Who have I timed?": the left-hand log, opposite the timer rail ──────────────────
+  const {
+    open: timedLogOpen, visible: timedLogVisible,
+    openDrawer: openTimedLog, closeDrawer: closeTimedLog,
+  } = useSlideOverDrawer()
+
+  /**
+   * ── Renaming, on the SHARED editors ────────────────────────────────────────────────
+   * The ✎ on a job row and the ✎ on an operation row open components/JobEditDrawer and
+   * components/OperationEditDrawer — the same two drawers /setup, /collect and /line-config
+   * open from the same icon. This screen used to rename operations with its own inline text
+   * field and had no way to rename a job at all; both are gone.
+   *
+   * The job drawer is opened `nameOnly`: see the note on JobEditDrawer. A re-section can move a
+   * job to another team and out of the pane, which is not something a van walk should be able
+   * to do by accident.
+   */
+  const [jobDrawer, setJobDrawer] = useState<Job | null>(null)
+  const [operationDrawer, setOperationDrawer] = useState<{ operation: Operation; jobName: string } | null>(null)
+  /** What the rename did, shown above the panes — the drawer slides away, so the confirmation
+   * has to land somewhere the user is still looking. */
+  const [renameNotice, setRenameNotice] = useState<string | null>(null)
+  const {
+    open: jobDrawerOpen, visible: jobDrawerVisible,
+    openDrawer: showJobDrawer, closeDrawer: hideJobDrawer,
+  } = useSlideOverDrawer()
+  const {
+    open: opDrawerOpen, visible: opDrawerVisible,
+    openDrawer: showOperationDrawer, closeDrawer: hideOperationDrawer,
+  } = useSlideOverDrawer()
 
   // ── Manual entry / time detail drawers ───────────────────────────────────────────────
   const [capture, setCapture] = useState<CaptureTarget | null>(null)
@@ -387,27 +469,36 @@ export default function TryOutsClient({ userId }: Props) {
 
     const chassisIds = [...new Set(tryouts.map((t) => t.chassis_id))]
 
-    const [chassisResult, timesResult] = await Promise.all([
-      supabase
-        .from('chassis')
-        .select('id, chassisnumber, product_id, products ( id, product_code, model, production_line_id )')
-        .in('id', chassisIds),
-      // Scoped to the listed chassis rather than every time in the table — the count is a
-      // per-card detail now, not the thing that builds the list.
-      supabase.from('operation_times').select('chassis_id, created_at').in('chassis_id', chassisIds),
-    ])
-    if (chassisResult.error) { setListError(chassisResult.error.message); setLoadingCards(false); return }
-    if (timesResult.error) { setListError(timesResult.error.message); setLoadingCards(false); return }
+    // Both chunked (lib/chunkedIn): chassisIds is one id per listed try-out, which is unbounded
+    // — a full season's list overflows the ~16KB URL cap on its own. Neither read is ordered and
+    // neither is consumed positionally: the first builds a Map by id, the second aggregates.
+    let chassisRows: RawChassisRow[]
+    let timeRows: { chassis_id: string; created_at: string }[]
+    try {
+      ;[chassisRows, timeRows] = await Promise.all([
+        selectIn<RawChassisRow>(chassisIds, (chunk) => supabase
+          .from('chassis')
+          .select('id, chassisnumber, product_id, products ( id, product_code, model, production_line_id )')
+          .in('id', chunk) as unknown as PromiseLike<{ data: RawChassisRow[] | null; error: { message: string } | null }>),
+        // Scoped to the listed chassis rather than every time in the table — the count is a
+        // per-card detail now, not the thing that builds the list.
+        // Unfiltered: "has this van been worked on, and when" is activity, not labour content.
+        selectIn<{ chassis_id: string; created_at: string }>(chassisIds, (chunk) => supabase
+          .from('operation_times').select('chassis_id, created_at').in('chassis_id', chunk)),
+      ])
+    } catch (err) {
+      setListError(err instanceof Error ? err.message : 'Could not load try-outs'); setLoadingCards(false); return
+    }
 
     const agg = new Map<string, { count: number; last: string }>()
-    for (const t of (timesResult.data ?? []) as { chassis_id: string; created_at: string }[]) {
+    for (const t of timeRows) {
       const cur = agg.get(t.chassis_id)
       if (!cur) agg.set(t.chassis_id, { count: 1, last: t.created_at })
       else { cur.count += 1; if (t.created_at > cur.last) cur.last = t.created_at }
     }
 
     const chassisById = new Map<string, RawChassisRow>()
-    for (const row of (chassisResult.data ?? []) as unknown as RawChassisRow[]) chassisById.set(row.id, row)
+    for (const row of chassisRows) chassisById.set(row.id, row)
 
     // One lookup for every line the listed vans resolve to, rather than one per card.
     const lineIds = [...new Set([...chassisById.values()].map((r) => one(r.products)?.production_line_id).filter((id): id is string => !!id))]
@@ -496,21 +587,33 @@ export default function TryOutsClient({ userId }: Props) {
     return () => { cancelled = true }
   }, [supabase, userId])
 
-  // Every active operator, not scoped to the van's team/line — a tryout regularly catches
-  // whoever is actually on the van that day. Matches /setup's convention.
+  // Every active operator, fetched once with the line each belongs to; the pickers below are
+  // handed `lineOperators`, not this.
   useEffect(() => {
-    supabase.from('operators').select('id, full_name').eq('is_active', true).order('full_name')
-      .then(({ data }) => setOperators((data ?? []) as OperatorOption[]))
+    fetchOperators(supabase)
+      .then(setOperators)
+      .catch(() => setOperators([]))
   }, [supabase])
+
+  /**
+   * The only operator list this screen offers anywhere — the van's own production line's.
+   * A van is walked by the people on its line, and a run banked against another line's operator
+   * is invisible in every per-line rollup that reads it back. A van whose model has no line
+   * falls back to everyone, since there is then nothing to scope by.
+   */
+  const lineOperators = useMemo(
+    () => operatorsForLine(operators, van?.productionLineId),
+    [operators, van?.productionLineId]
+  )
 
   // ── Van view loader ──────────────────────────────────────────────────────────────────
   /**
    * Everything the columns and the on-van figures are built from, in one pass: this van's own
    * times, its model's applies-list (plus which of those operations are already timed, the
-   * guard on un-applying one), and the line's Stage → Job → Operation structure.
+   * guard on un-applying one), and the line's Section → Job → Operation structure.
    *
-   * The structure query is /setup's, narrowed to the van's line: stages for the line, jobs on
-   * the line OR attached to one of its stages (the stage link is the stronger signal for a
+   * The structure query is /setup's, narrowed to the van's line: sections for the line, jobs on
+   * the line OR attached to one of its sections (the section link is the stronger signal for a
    * walk), then that job set's active operations. The Team filter is applied client-side over
    * the loaded jobs, so switching teams doesn't cost a round trip.
    */
@@ -520,19 +623,24 @@ export default function TryOutsClient({ userId }: Props) {
 
     // The van's own times come first — they're keyed by chassis alone, so they load (and the
     // count stays truthful) even when the line structure below turns up empty.
+    // Every record this van has, archived ones included: this is the van's log, and the drawer
+    // it feeds shows history. superseded_by is selected so currentByOperation can pick the figure.
     const { data: timeRows, error: timesError } = await supabase
       .from('operation_times')
-      .select('id, operation_id, operator_id, total_minutes, created_at')
+      .select('id, operation_id, operator_id, total_minutes, created_at, superseded_by, collected_by')
       .eq('chassis_id', context.chassisId)
       .order('created_at', { ascending: false })
     if (timesError) { setVanError(timesError.message); setLoadingVan(false); return }
-    const times = (timeRows ?? []) as { id: string; operation_id: string; operator_id: string | null; total_minutes: number | null; created_at: string }[]
+    const times = (timeRows ?? []) as { id: string; operation_id: string; operator_id: string | null; total_minutes: number | null; created_at: string; superseded_by: string | null; collected_by: string | null }[]
 
     const operatorIds = [...new Set(times.map((t) => t.operator_id).filter((id): id is string => !!id))]
     const operatorNameById = new Map<string, string>()
     if (operatorIds.length > 0) {
-      const { data: opRows } = await supabase.from('operators').select('id, full_name').in('id', operatorIds)
-      for (const o of opRows ?? []) operatorNameById.set(o.id, o.full_name)
+      // Chunked (lib/chunkedIn): one id per distinct operator across every time on the van.
+      // Feeds a Map, so chunk-order concatenation is irrelevant.
+      const opRows = await selectIn<{ id: string; full_name: string }>(operatorIds, (chunk) =>
+        supabase.from('operators').select('id, full_name').in('id', chunk))
+      for (const o of opRows) operatorNameById.set(o.id, o.full_name)
     }
 
     setVanTimes(times.map((t) => ({
@@ -540,6 +648,8 @@ export default function TryOutsClient({ userId }: Props) {
       operationId: t.operation_id,
       totalMinutes: t.total_minutes,
       createdAt: t.created_at,
+      supersededBy: t.superseded_by,
+      collectedBy: t.collected_by,
       operatorName: t.operator_id ? operatorNameById.get(t.operator_id) ?? null : null,
     })))
 
@@ -564,7 +674,7 @@ export default function TryOutsClient({ userId }: Props) {
     setTimedForModelOpIds(timedOpIds)
 
     if (!context.productionLineId) {
-      setStages([]); setJobs([]); setOperationsByJob({}); setLineTeams([])
+      setSections([]); setJobs([]); setOperationsByJob({}); setLineTeams([])
       setLoadingVan(false)
       return
     }
@@ -573,28 +683,33 @@ export default function TryOutsClient({ userId }: Props) {
       .from('teams').select('*').eq('production_line_id', context.productionLineId).order('name')
     setLineTeams((teamRows ?? []) as Team[])
 
-    const { data: stageRows, error: stagesError } = await supabase
-      .from('stages')
+    const { data: sectionRows, error: sectionsError } = await supabase
+      .from('sections')
       .select('*')
       .eq('production_line_id', context.productionLineId)
+      // Retired sections (merged away — see lib/sections' mergeSections) never appear in a list,
+      // a pane or a picker.
+      .eq('is_active', true)
       .order('sort_order')
-    if (stagesError) { setVanError(stagesError.message); setLoadingVan(false); return }
-    const loadedStages = sortStages((stageRows ?? []) as Stage[])
-    setStages(loadedStages)
+    if (sectionsError) { setVanError(sectionsError.message); setLoadingVan(false); return }
+    const loadedSections = sortSections((sectionRows ?? []) as Section[])
+    setSections(loadedSections)
 
-    // Jobs on this line, plus any job attached to one of this line's stages even if its own
-    // production_line_id was never filled in — the stage link is the stronger signal for a walk.
-    const stageIds = loadedStages.map((s) => s.id)
-    let jobQuery = supabase.from('jobs').select('*, teams ( id, name )').order('name')
-    jobQuery = stageIds.length > 0
-      ? jobQuery.or(`production_line_id.eq.${context.productionLineId},stage_id.in.(${stageIds.join(',')})`)
+    // Jobs on this line, plus any job attached to one of this line's sections even if its own
+    // production_line_id was never filled in — the section link is the stronger signal for a walk.
+    const sectionIds = loadedSections.map((s) => s.id)
+    // Retired jobs (merged away — see lib/jobs' mergeJobs) never appear in a pane, a list or a
+    // picker, exactly as retired sections and operations don't.
+    let jobQuery = supabase.from('jobs').select('*, teams ( id, name )').eq('is_active', true).order('name')
+    jobQuery = sectionIds.length > 0
+      ? jobQuery.or(`production_line_id.eq.${context.productionLineId},section_id.in.(${sectionIds.join(',')})`)
       : jobQuery.eq('production_line_id', context.productionLineId)
     const { data: jobRows, error: jobsError } = await jobQuery
     if (jobsError) { setVanError(jobsError.message); setLoadingVan(false); return }
 
     const loadedJobs: Job[] = ((jobRows ?? []) as unknown as RawJob[]).map((r) => ({
       id: r.id, name: r.name, primary_operator_id: r.primary_operator_id,
-      team_id: r.team_id, production_line_id: r.production_line_id, stage_id: r.stage_id,
+      team_id: r.team_id, production_line_id: r.production_line_id, section_id: r.section_id,
       created_at: r.created_at,
       teams: one(r.teams),
     }))
@@ -603,16 +718,24 @@ export default function TryOutsClient({ userId }: Props) {
     const jobIds = loadedJobs.map((j) => j.id)
     if (jobIds.length === 0) { setOperationsByJob({}); setLoadingVan(false); return }
 
-    const { data: opRows, error: opsError } = await supabase
-      .from('operations')
-      .select('*, primary_operator:primary_operator_id ( id, full_name ), secondary_operator:secondary_operator_id ( id, full_name )')
-      .in('job_id', jobIds)
-      .eq('is_active', true)
-      .order('name')
-    if (opsError) { setVanError(opsError.message); setLoadingVan(false); return }
+    // Chunked (lib/chunkedIn): jobIds is every job on the van's line, unbounded. is_active and
+    // the name ordering stay inside the callback. Chunking splits the JOB list, so every
+    // operation for a given job lands in exactly one chunk and the per-job name ordering the
+    // grouping below relies on survives — opRows is never read flat.
+    let opRows: RawOperation[]
+    try {
+      opRows = await selectIn<RawOperation>(jobIds, (chunk) => supabase
+        .from('operations')
+        .select('*, primary_operator:primary_operator_id ( id, full_name ), secondary_operator:secondary_operator_id ( id, full_name )')
+        .in('job_id', chunk)
+        .eq('is_active', true)
+        .order('name') as unknown as PromiseLike<{ data: RawOperation[] | null; error: { message: string } | null }>)
+    } catch (err) {
+      setVanError(err instanceof Error ? err.message : 'Could not load operations'); setLoadingVan(false); return
+    }
 
     const grouped: Record<string, Operation[]> = {}
-    for (const r of (opRows ?? []) as unknown as RawOperation[]) {
+    for (const r of opRows) {
       const op: Operation = {
         id: r.id, name: r.name, job_id: r.job_id,
         primary_operator_id: r.primary_operator_id, secondary_operator_id: r.secondary_operator_id,
@@ -629,9 +752,9 @@ export default function TryOutsClient({ userId }: Props) {
   useEffect(() => {
     // A merge selection belongs to the job it was started in — switching vans (or leaving the
     // view) must not carry it over.
-    setOpMode('normal'); setMergeSelected(new Set()); setMergeKeeperId(null)
+    opMerge.cancel()
     setShowUnallocated(false); setScopeError(null)
-    if (!van) { setStages([]); setJobs([]); setOperationsByJob({}); setVanTimes([]); setVanError(null); return }
+    if (!van) { setSections([]); setJobs([]); setOperationsByJob({}); setVanTimes([]); setVanError(null); return }
     loadVan(van)
   }, [van, loadVan])
 
@@ -645,20 +768,39 @@ export default function TryOutsClient({ userId }: Props) {
     return map
   }, [vanTimes])
 
-  /** Average per operation across THIS van's runs only — the shared averager, fed nothing but
-   * this chassis's times, so a "65m · 2 runs" here is the same math as everywhere else. */
-  const vanAvgByOperation = useMemo(
-    () => averageByOperation(vanTimes.map((t) => ({ id: t.id, operation_id: t.operationId, total_minutes: t.totalMinutes }))),
+  /** The current time per operation across THIS van's records — the shared lookup, fed nothing
+   * but this chassis's rows, so a "65m · current + 1 archived" here is the same rule as
+   * everywhere else. Was an average across runs; see OperationTimeStat for why it isn't. */
+  const vanStatByOperation = useMemo(
+    () => currentByOperation(vanTimes.map((t) => ({
+      id: t.id, operation_id: t.operationId, total_minutes: t.totalMinutes,
+      superseded_by: t.supersededBy, created_at: t.createdAt,
+    }))),
     [vanTimes]
   )
 
   // ── Drill-down derivation — the same shape /setup builds, minus the line filter ───────
-  /** The Team filter narrows the JOBS, never the stages: a stage belongs to one team, but a job
-   * sitting in it doesn't have to, so filtering stages would hide the very stage a filtered job
-   * is grouped under. Same rule as /setup. */
+  /** Every loaded section by id — the lookup teamForJob reads a job's team through. */
+  /** Team names for the derived job-team the panes show. */
+  const teamNameById = useMemo(() => new Map(lineTeams.map((t) => [t.id, t.name])), [lineTeams])
+
+  const sectionsById = useMemo(() => new Map(sections.map((s) => [s.id, s])), [sections])
+
+  /**
+   * The van's line's sections, narrowed by the Team filter. A section belongs to exactly one
+   * team and a job's team comes FROM its section, so choosing a team is choosing that team's
+   * part of the walk — the same rule /setup and /collect now follow.
+   */
+  const teamSections = useMemo(
+    () => (teamId ? sections.filter((s) => s.team_id === teamId) : sections),
+    [sections, teamId]
+  )
+
+  /** The Team filter over the jobs, applied to the team DERIVED from each job's section so it
+   * agrees with the section list above rather than with whatever jobs.team_id says. */
   const filteredJobs = useMemo(
-    () => (teamId ? jobs.filter((j) => j.team_id === teamId) : jobs),
-    [jobs, teamId]
+    () => (teamId ? jobs.filter((j) => teamForJob(j, sectionsById) === teamId) : jobs),
+    [jobs, teamId, sectionsById]
   )
 
   /**
@@ -685,50 +827,66 @@ export default function TryOutsClient({ userId }: Props) {
     [filteredJobs, scoped, showUnallocated, applyingJobIds]
   )
 
-  /** Loaded jobs bucketed by the pane-1 entry they belong to. A job whose stage_id is null, or
-   * points at a stage outside this line, lands in Unstaged. */
-  const jobsByStageKey = useMemo(() => {
+  /** Loaded jobs bucketed by the pane-1 entry they belong to. A job whose section_id is null, or
+   * points at a section outside this line, lands in Unsectioned. */
+  /** The unsorted tray jobs fall back to: the scoped TEAM's tray on this van's line. There is
+   * one tray per team now, so with no team filtered the line has several and none of them is
+   * "the line's" — findSectionTray returns null and the stray jobs land in the virtual bucket
+   * below, which is where work belonging to no team in view belongs. */
+  const noSectionTray = useMemo(
+    () => findSectionTray(sections, van?.productionLineId, teamId),
+    [sections, van?.productionLineId, teamId]
+  )
+
+  /**
+   * Jobs bucketed by the pane-1 row they belong under: their own section when it is in view,
+   * otherwise the line's unsorted tray. UNSECTIONED_KEY is the last resort only, for a line
+   * whose tray row is missing.
+   */
+  const jobsBySectionKey = useMemo(() => {
     const map = new Map<string, Job[]>()
-    const known = new Set(stages.map((s) => s.id))
+    const known = new Set(teamSections.map((s) => s.id))
+    const trayKey = noSectionTray && known.has(noSectionTray.id) ? noSectionTray.id : UNSECTIONED_KEY
     for (const job of scopedJobs) {
-      const key = job.stage_id && known.has(job.stage_id) ? job.stage_id : UNSTAGED_KEY
+      const key = job.section_id && known.has(job.section_id) ? job.section_id : trayKey
       const list = map.get(key)
       if (list) list.push(job)
       else map.set(key, [job])
     }
     return map
-  }, [scopedJobs, stages])
+  }, [scopedJobs, teamSections, noSectionTray])
 
   /**
-   * Pane 1's rows: EVERY stage on the line, in walk order, plus "Unstaged" at the bottom
-   * whenever it holds anything. A stage is line-level structure and is never model-scoped, so
-   * this list is deliberately unaffected by the model, the applies-list and the "show not
-   * apply" toggle — a stage with no applicable jobs still shows, with a count of 0. A line
-   * with no stages at all gets Unstaged as its single entry; no empty scaffolding is invented.
+   * Pane 1's rows: every section the Team filter leaves in scope, in walk order, plus "No
+   * section" at the bottom whenever it holds anything. Still deliberately unaffected by the
+   * MODEL — the applies-list and the "show what doesn't apply" toggle never remove a section, so
+   * one with no applicable jobs still shows with a count of 0. A line with no sections in scope
+   * gets "No section" as its single entry; no empty scaffolding is invented.
    */
-  const stageEntries = useMemo<StageEntry[]>(() => {
-    const entries: StageEntry[] = stages.map((s) => ({
-      key: s.id, name: s.name, stage: s, jobCount: (jobsByStageKey.get(s.id) ?? []).length,
+  const sectionEntries = useMemo<SectionEntry[]>(() => {
+    const entries: SectionEntry[] = teamSections.map((s) => ({
+      key: s.id, name: s.name, section: s, jobCount: (jobsBySectionKey.get(s.id) ?? []).length,
     }))
-    const unstagedCount = (jobsByStageKey.get(UNSTAGED_KEY) ?? []).length
-    if (stages.length === 0 || unstagedCount > 0) {
-      entries.push({ key: UNSTAGED_KEY, name: 'Unstaged', stage: null, jobCount: unstagedCount })
+    // Only where a real tray can't stand in — the same rule /setup and /collect follow.
+    const strayCount = (jobsBySectionKey.get(UNSECTIONED_KEY) ?? []).length
+    if (strayCount > 0 || (teamSections.length === 0 && !teamId)) {
+      entries.push({ key: UNSECTIONED_KEY, name: 'No section', section: null, jobCount: strayCount })
     }
     return entries
-  }, [stages, jobsByStageKey])
+  }, [teamSections, jobsBySectionKey, teamId])
 
-  // A persisted id can outlive the scope it was chosen in (van changed, stage deleted, job
+  // A persisted id can outlive the scope it was chosen in (van changed, section deleted, job
   // moved). Rather than write over the stored value, fall back to "nothing selected" whenever
   // the id isn't among the options actually available right now.
-  const activeStageKey = stageEntries.some((e) => e.key === stageKey) ? stageKey : ''
-  const activeStageEntry = stageEntries.find((e) => e.key === activeStageKey) ?? null
+  const activeSectionKey = sectionEntries.some((e) => e.key === sectionKey) ? sectionKey : ''
+  const activeSectionEntry = sectionEntries.find((e) => e.key === activeSectionKey) ?? null
 
-  const jobsInStage = useMemo(
-    () => (activeStageKey ? jobsByStageKey.get(activeStageKey) ?? [] : []),
-    [activeStageKey, jobsByStageKey]
+  const jobsInSection = useMemo(
+    () => (activeSectionKey ? jobsBySectionKey.get(activeSectionKey) ?? [] : []),
+    [activeSectionKey, jobsBySectionKey]
   )
-  const activeJobId = jobsInStage.some((j) => j.id === jobId) ? jobId : ''
-  const selectedJob = jobsInStage.find((j) => j.id === activeJobId) ?? null
+  const activeJobId = jobsInSection.some((j) => j.id === jobId) ? jobId : ''
+  const selectedJob = jobsInSection.find((j) => j.id === activeJobId) ?? null
 
   const jobOperations = useMemo(
     () => (activeJobId ? operationsByJob[activeJobId] ?? [] : []),
@@ -758,33 +916,32 @@ export default function TryOutsClient({ userId }: Props) {
     return map
   }, [timers, van])
 
-  /** The running dots on panes 1 and 2 — a stage or job is "running" when any operation under
+  /** The running dots on panes 1 and 2 — a section or job is "running" when any operation under
    * it has a timer, so leaving an operation still leaves a trail back to it. */
-  const { runningJobIds, runningStageKeys } = useMemo(() => {
+  const { runningJobIds, runningSectionKeys } = useMemo(() => {
     const jobIds = new Set<string>()
-    const stageKeys = new Set<string>()
-    if (vanTimersByOperation.size === 0) return { runningJobIds: jobIds, runningStageKeys: stageKeys }
+    const sectionKeys = new Set<string>()
+    if (vanTimersByOperation.size === 0) return { runningJobIds: jobIds, runningSectionKeys: sectionKeys }
 
-    const knownStages = new Set(stages.map((s) => s.id))
+    const knownSections = new Set(sections.map((s) => s.id))
     const jobById = new Map(jobs.map((j) => [j.id, j]))
     for (const [jId, ops] of Object.entries(operationsByJob)) {
       if (!ops.some((o) => vanTimersByOperation.has(o.id))) continue
       jobIds.add(jId)
       const job = jobById.get(jId)
-      stageKeys.add(job?.stage_id && knownStages.has(job.stage_id) ? job.stage_id : UNSTAGED_KEY)
+      sectionKeys.add(job?.section_id && knownSections.has(job.section_id) ? job.section_id : UNSECTIONED_KEY)
     }
-    return { runningJobIds: jobIds, runningStageKeys: stageKeys }
-  }, [vanTimersByOperation, operationsByJob, jobs, stages])
+    return { runningJobIds: jobIds, runningSectionKeys: sectionKeys }
+  }, [vanTimersByOperation, operationsByJob, jobs, sections])
 
   // ── Drill actions ────────────────────────────────────────────────────────────────────
-  function selectStage(key: string) { setStageKey(key); setJobId(''); setOperationId('') }
+  function selectSection(key: string) { setSectionKey(key); setJobId(''); setOperationId('') }
   function selectJob(id: string) { setJobId(id); setOperationId('') }
 
   // Changing what pane 3 is showing invalidates any merge selection held against the old job.
   useEffect(() => {
-    setOpMode('normal')
-    setMergeSelected(new Set())
-    setMergeKeeperId(null)
+    opMerge.cancel()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeJobId])
 
   // ── Structure writes (panes 1–3) ─────────────────────────────────────────────────────
@@ -794,15 +951,18 @@ export default function TryOutsClient({ userId }: Props) {
 
   async function addJob(name: string) {
     const trimmed = name.trim()
-    if (!trimmed || !activeStageEntry || !van) return
+    if (!trimmed || !activeSectionEntry || !van) return
     setVanError(null)
-    const stage = activeStageEntry.stage
+    // The virtual bucket still lands the job in the line's real tray where one exists, so a job
+    // is never created with a null section_id.
+    const section = activeSectionEntry.section ?? noSectionTray
     const { data, error } = await supabase.from('jobs').insert({
       name: trimmed,
-      // Line comes from the van; team from the filter if one is set, otherwise the stage's own.
+      // Line comes from the van; the team comes from the SECTION and nowhere else — the same
+      // rule setJobSection enforces on a move. A job added to the tray has no team yet.
       production_line_id: van.productionLineId,
-      team_id: teamId || stage?.team_id || null,
-      stage_id: stage?.id ?? null,
+      team_id: section?.team_id ?? null,
+      section_id: section?.id ?? null,
     }).select('id').single()
     if (error) { setVanError(error.message); return }
     // A job with no operations yet can't apply to the model (applicability is derived from its
@@ -813,12 +973,48 @@ export default function TryOutsClient({ userId }: Props) {
     if (data?.id) selectJob(data.id)
   }
 
-  async function renameOperation(id: string, name: string) {
+  // ── Renaming: open the shared drawers, and the ONE write behind the job one ──────────
+  function openJobDrawer(job: Job) {
+    setRenameNotice(null)
+    setJobDrawer(job)
+    showJobDrawer()
+  }
+  function closeJobDrawer() {
+    hideJobDrawer()
+    // After the slide-out, so the drawer doesn't blank mid-animation.
+    window.setTimeout(() => setJobDrawer(null), 320)
+  }
+
+  function openOperationDrawer(operation: Operation, jobName: string) {
+    setRenameNotice(null)
+    setOperationDrawer({ operation, jobName })
+    showOperationDrawer()
+  }
+  function closeOperationDrawer() {
+    hideOperationDrawer()
+    window.setTimeout(() => setOperationDrawer(null), 320)
+  }
+
+  /**
+   * The job drawer's save, name only.
+   *
+   * The `section` argument is deliberately IGNORED rather than passed to setJobSection: the
+   * drawer is opened `nameOnly`, so the user was never shown a section control and re-filing
+   * the job is not something this screen may do silently. Nothing else is written — the van's
+   * times, the operations' model links and the try-out itself all hang off ids, not the name.
+   */
+  async function saveJobName(job: Job, name: string): Promise<void> {
     const trimmed = name.trim()
-    if (!trimmed) return
+    if (!trimmed || trimmed === job.name) return
     setVanError(null)
-    const { error } = await supabase.from('operations').update({ name: trimmed }).eq('id', id)
-    if (error) { setVanError(error.message); return }
+    const { data, error } = await supabase
+      .from('jobs').update({ name: trimmed }).eq('id', job.id).select('id')
+    if (error) throw new Error(error.message)
+    // Read back: an update filtered out by RLS succeeds having changed nothing, which would
+    // otherwise show as a drawer closing on a name that never changed.
+    if (!data || data.length === 0) {
+      throw new Error('That job could not be renamed — the change was rejected by the database (check your permissions).')
+    }
     await refreshVan()
   }
 
@@ -879,7 +1075,18 @@ export default function TryOutsClient({ userId }: Props) {
   function toggleJobApplies(job: Job, currentlyApplies: boolean) {
     setScopeError(null)
     const operations = operationsByJob[job.id] ?? []
-    if (operations.length === 0) return
+
+    // A job with nothing under it can't be linked — applicability lives on operations, and there
+    // are none. Rather than block the tick (which strands a freshly-loaded job), take it as
+    // "this job applies, I just haven't written its first operation yet" and open the same
+    // add-operation modal the Operations pane uses, scoped to this job and pre-linked to this
+    // van's model. Creating that operation both fills the job and applies it, in one step.
+    if (operations.length === 0) {
+      setJobApplyNotice(null)
+      selectJob(job.id)
+      setNewOperationJob({ jobId: job.id, jobName: job.name, intent: 'apply' })
+      return
+    }
 
     if (!currentlyApplies) { applyJob(job, operations); return }
 
@@ -993,48 +1200,11 @@ export default function TryOutsClient({ userId }: Props) {
     }
   }
 
-  // ── Merge: fold duplicate operations into one keeper, retire the rest ─────────────────
-  function toggleMergeSelection(operationId: string) {
-    const next = new Set(mergeSelected)
-    if (next.has(operationId)) next.delete(operationId)
-    else next.add(operationId)
-    setMergeSelected(next)
-    // The keeper always has to be one of the selected operations — default to the first picked
-    // and only move it when the current keeper is deselected.
-    if (!mergeKeeperId || !next.has(mergeKeeperId)) setMergeKeeperId([...next][0] ?? null)
-  }
-
-  /**
-   * Merge — lib/mergeOperations, the same helper /setup and /collect call. It owns the write
-   * order, the all-or-nothing ownership guard and the post-move verification; this handler only
-   * decides what to do with the outcome on this screen.
-   */
-  async function runMerge(keeper: Operation, dups: Operation[]) {
-    if (!van) return
-    setMerging(true)
-    setVanError(null)
-    try {
-      const { stranded } = await mergeOperations(supabase, { keeper, dups, userId })
-      await loadVan(van)
-      setOperationId(keeper.id)
-      setMergeSelected(new Set())
-      setMergeKeeperId(null)
-      if (stranded.length > 0) setVanError(strandedMergeMessage(stranded))
-      else setOpMode('normal')
-    } catch (err) {
-      await loadVan(van)
-      setVanError(err instanceof Error ? err.message : 'Merge failed')
-    } finally {
-      setMerging(false)
-      setMergeConfirm(null)
-    }
-  }
-
   // ── Stopwatch actions ────────────────────────────────────────────────────────────────
   /**
    * One timer per operation: the Start button is hidden entirely once this operation has one,
    * so a second run can't be started on top of a first and quietly overwrite it in the bar.
-   * Concurrency across DIFFERENT operations (and different jobs and stages) is the point, and
+   * Concurrency across DIFFERENT operations (and different jobs and sections) is the point, and
    * is unrestricted.
    */
   /** Opens the Start confirmation. Writes nothing and starts nothing — the clock begins only
@@ -1329,8 +1499,6 @@ export default function TryOutsClient({ userId }: Props) {
   }
 
   // ── Van view (one van) ───────────────────────────────────────────────────────────────
-  const mergeKeeper = jobOperations.find((o) => o.id === mergeKeeperId && mergeSelected.has(o.id)) ?? null
-  const mergeDups = mergeKeeper ? jobOperations.filter((o) => mergeSelected.has(o.id) && o.id !== mergeKeeper.id) : []
   const timedOnVanCount = visibleOperations.filter((o) => (timesByOperation.get(o.id)?.length ?? 0) > 0).length
 
   return (
@@ -1354,6 +1522,16 @@ export default function TryOutsClient({ userId }: Props) {
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
           <span className="badge badge-blue">{vanTimes.length} time{vanTimes.length !== 1 ? 's' : ''} on this van</span>
+          {/* The badge says how many; this says who, on what, and when — the question the
+            * drill-down columns can't answer, since they show one operation at a time. */}
+          <button
+            className="btn-ghost"
+            style={{ padding: '6px 11px', fontSize: 12 }}
+            title="Every time recorded on this van — or across every van of this model"
+            onClick={openTimedLog}
+          >
+            Who have I timed?
+          </button>
           {van.tryoutId && (
             <button
               className="btn-ghost"
@@ -1383,7 +1561,7 @@ export default function TryOutsClient({ userId }: Props) {
         <select
           style={{ ...SEL, width: 'auto', minWidth: 200 }}
           value={teamId}
-          onChange={(e) => { setTeamId(e.target.value); setStageKey(''); setJobId(''); setOperationId('') }}
+          onChange={(e) => { setTeamId(e.target.value); setSectionKey(''); setJobId(''); setOperationId('') }}
         >
           <option value="">All teams</option>
           {lineTeams.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
@@ -1402,7 +1580,7 @@ export default function TryOutsClient({ userId }: Props) {
         {teamId && (
           <button
             type="button"
-            onClick={() => { setTeamId(''); setStageKey(''); setJobId(''); setOperationId('') }}
+            onClick={() => { setTeamId(''); setSectionKey(''); setJobId(''); setOperationId('') }}
             style={{ marginLeft: 'auto', fontSize: 12, fontWeight: 600, color: 'var(--text-mid)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'inherit' }}
           >
             Clear team filter
@@ -1415,6 +1593,22 @@ export default function TryOutsClient({ userId }: Props) {
 
       {/* What a job-level toggle just did — including how many timed operations it had to keep
         * linked, which is the one outcome a user can't infer from the resulting list. */}
+      {/* The rename drawer slides away on save, so what it did is reported here — the same
+          green line the applicability toggles use, in the same place. */}
+      {renameNotice && (
+        <div style={{ padding: '9px 14px', borderRadius: 8, background: 'var(--green-bg)', border: '1px solid #bbf7d0', color: '#15803d', fontSize: 13, marginBottom: 16, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+          <span>{renameNotice}</span>
+          <button
+            type="button"
+            onClick={() => setRenameNotice(null)}
+            aria-label="Dismiss"
+            style={{ background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'inherit', fontSize: 15, lineHeight: 1, color: 'inherit', flexShrink: 0 }}
+          >
+            ×
+          </button>
+        </div>
+      )}
+
       {jobApplyNotice && (
         <div style={{ padding: '9px 14px', borderRadius: 8, background: 'var(--green-bg)', border: '1px solid #bbf7d0', color: '#15803d', fontSize: 13, marginBottom: 16, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
           <span>{jobApplyNotice}</span>
@@ -1453,33 +1647,46 @@ export default function TryOutsClient({ userId }: Props) {
       {loadingVan ? (
         <p style={EMPTY}>Loading…</p>
       ) : !van.productionLineId ? (
-        <p style={EMPTY}>This van&apos;s model isn&apos;t on a production line, so there&apos;s no stage structure to walk</p>
+        <p style={EMPTY}>This van&apos;s model isn&apos;t on a production line, so there&apos;s no section structure to walk</p>
       ) : (
         <div className="finder-panes finder-panes-3">
-          <StagesPane
+          <SectionsPane
             supabase={supabase}
-            entries={stageEntries}
-            stages={stages}
+            entries={sectionEntries}
+            sections={sections}
             productionLineId={van.productionLineId}
             productionLineName={van.productionLineName}
             teams={lineTeams}
-            selectedKey={activeStageKey}
-            runningKeys={runningStageKeys}
-            // Navigation, plus create. A stage is line-level structure — not model-scoped —
+            selectedKey={activeSectionKey}
+            runningKeys={runningSectionKeys}
+            // Navigation, plus create. A section is line-level structure — not model-scoped —
             // so rename/reorder/delete stay on /setup: nothing here can renumber the walk or
-            // destroy a stage out from under the line (a line-wide footgun mid-van-walk).
-            // Adding is different — it only ever appends a stage to the end of the line, and a
+            // destroy a section out from under the line (a line-wide footgun mid-van-walk).
+            // Adding is different — it only ever appends a section to the end of the line, and a
             // van being walked can turn out to need a step the line doesn't have yet, so
             // leaving for /setup to get it would break the walk.
             readOnly
             allowAdd
-            onSelect={selectStage}
+            // And merge, for the same reason adding survives readOnly: a van walk is exactly
+            // where you find two sections that are really one. It folds jobs within a single
+            // team and retires the emptied section — no step of the walk is renumbered or
+            // destroyed under a van mid-tryout. Same dialog and same lib as /setup and /collect.
+            allowMerge
+            // The team is already answered by the filter bar above these panes, so the add form
+            // doesn't ask again — only "All teams" leaves it with nothing to inherit.
+            defaultTeamId={teamId}
+            onSelect={selectSection}
             onChanged={refreshVan}
           />
 
           <JobsPane
-            entry={activeStageEntry}
-            jobs={jobsInStage}
+            supabase={supabase}
+            userId={userId}
+            onChanged={refreshVan}
+            sectionsById={sectionsById}
+            teamNameById={teamNameById}
+            entry={activeSectionEntry}
+            jobs={jobsInSection}
             loading={loadingVan}
             operationsByJob={operationsByJob}
             selectedJobId={activeJobId}
@@ -1488,17 +1695,30 @@ export default function TryOutsClient({ userId }: Props) {
               appliesIds: applyingJobIds,
               targetLabel: van.model ?? 'this model',
               busyJobId: jobApplyBusyId,
-              // Applicability is derived from operations, so a job with none has nothing to
-              // link and the toggle would be a no-op — say why rather than let it look broken.
-              disabledReasons: Object.fromEntries(
-                jobsInStage
+              // Nothing to link a job TO until the van's model is known — the only case the
+              // toggle is genuinely dead.
+              disabledReasons: van.productId
+                ? undefined
+                : Object.fromEntries(
+                    jobsInSection.map((j) => [j.id, 'This van has no model linked to it, so nothing can be applied to it.'])
+                  ),
+              // A job with no operations keeps its toggle LIVE: applicability is derived from
+              // operations, so ticking it opens the add-operation flow for its first one
+              // (pre-linked to this model) rather than trying to link nothing.
+              toggleHints: Object.fromEntries(
+                jobsInSection
                   .filter((j) => (operationsByJob[j.id] ?? []).length === 0)
-                  .map((j) => [j.id, 'This job has no operations yet — add one and it will apply to this model automatically.'])
+                  .map((j) => [j.id, `This job has no operations yet — tick to add its first one, applying to ${van.model ?? 'this model'}.`])
               ),
               onToggle: toggleJobApplies,
             }}
             onSelect={selectJob}
             onAdd={addJob}
+            // The ✎ between the name and the Applies toggle — the shared JobEditDrawer, the
+            // same one /setup and /collect open from the same icon. Applies stays the primary
+            // action on the row and is untouched.
+            onEdit={openJobDrawer}
+            editHint="Rename this job"
           />
 
           <VanOperationsPane
@@ -1509,19 +1729,17 @@ export default function TryOutsClient({ userId }: Props) {
             scoped={scoped}
             modelOpIds={modelOpIds}
             timesByOperation={timesByOperation}
-            vanAvgByOperation={vanAvgByOperation}
+            vanStatByOperation={vanStatByOperation}
             timersByOperation={vanTimersByOperation}
             nowMs={nowMs}
             timedOnVanCount={timedOnVanCount}
             scopeBusyOpId={scopeBusy}
             selectedOperationId={activeOperationId}
-            mode={opMode}
-            selection={mergeSelected}
-            mergeKeeperId={mergeKeeperId}
-            merging={merging}
+            merge={opMerge}
+            mergeRows={opMergeRows}
             onSelect={setOperationId}
-            onRename={renameOperation}
-            onAdd={() => selectedJob && setNewOperationJob({ jobId: selectedJob.id, jobName: selectedJob.name })}
+            onEdit={(op, job) => openOperationDrawer(op, job.name)}
+            onAdd={() => selectedJob && setNewOperationJob({ jobId: selectedJob.id, jobName: selectedJob.name, intent: 'time' })}
             onAllocate={addToModel}
             onDeallocate={requestRemoveFromModel}
             onStart={(op, job) => requestStart({ operationId: op.id, operationName: op.name, jobName: job.name })}
@@ -1529,25 +1747,69 @@ export default function TryOutsClient({ userId }: Props) {
             onComplete={requestComplete}
             onOpenTimes={(op, job) => openTimeDetail({ operationId: op.id, operationName: op.name, jobName: job.name })}
             onAddManualTime={(op, job) => openCapture({ operationId: op.id, operationName: op.name, jobName: job.name })}
-            onEnterMerge={() => {
-              setOpMode((m) => (m === 'merge' ? 'normal' : 'merge'))
-              setMergeSelected(new Set())
-              setMergeKeeperId(null)
-            }}
-            onToggleSelection={toggleMergeSelection}
-            onPickKeeper={setMergeKeeperId}
-            onRequestMerge={() => { if (mergeKeeper && mergeDups.length > 0) setMergeConfirm({ keeper: mergeKeeper, dups: mergeDups }) }}
           />
         </div>
       )}
 
+      {/* ── Renaming: the two SHARED editors, in the same slide-over the other drawers on
+        * this screen use. Nothing here writes a time, a model link or the try-out — the job
+        * drawer writes jobs.name and the operation drawer goes through lib/operations'
+        * renameOperation, which is the only writer of operations.name in the app. ── */}
+      {jobDrawerOpen && jobDrawer && (
+        <>
+          <div className={'gaps-drawer-overlay' + (jobDrawerVisible ? ' gaps-drawer-overlay-visible' : '')} onClick={closeJobDrawer} />
+          <div className={'gaps-drawer' + (jobDrawerVisible ? ' gaps-drawer-visible' : '')} style={DRAWER_WIDTH}>
+            <JobEditDrawer
+              job={jobDrawer}
+              // Passed so the header can name the job's team correctly; the Section control
+              // itself is off — see nameOnly on JobEditDrawer.
+              sections={sections}
+              teams={lineTeams}
+              operationCount={(operationsByJob[jobDrawer.id] ?? []).length}
+              nameOnly
+              onSave={saveJobName}
+              onSaved={(summary) => { setRenameNotice(summary); closeJobDrawer() }}
+              onClose={closeJobDrawer}
+            />
+          </div>
+        </>
+      )}
+
+      {opDrawerOpen && operationDrawer && (
+        <>
+          <div className={'gaps-drawer-overlay' + (opDrawerVisible ? ' gaps-drawer-overlay-visible' : '')} onClick={closeOperationDrawer} />
+          <div className={'gaps-drawer' + (opDrawerVisible ? ' gaps-drawer-visible' : '')} style={DRAWER_WIDTH}>
+            <OperationEditDrawer
+              operation={operationDrawer.operation}
+              jobName={operationDrawer.jobName}
+              operators={lineOperators}
+              supabase={supabase}
+              onSaved={refreshVan}
+              onClose={closeOperationDrawer}
+            />
+          </div>
+        </>
+      )}
+
       {/* ── The persistent right-hand rail: every running/paused timer, wherever it was
         * started. Fixed, so it stays put while the panes are scrolled and drilled through. ── */}
+      {/* Left-hand slide-over: what has already been recorded, opposite the rail's what is
+        * running now. Unmounted when closed, so its queries only run when it is asked for. */}
+      {timedLogOpen && (
+        <TimedLogPanel
+          supabase={supabase}
+          van={van}
+          visible={timedLogVisible}
+          onClose={closeTimedLog}
+        />
+      )}
+
       <TimerRail
         timers={timers}
         nowMs={nowMs}
         currentContextKey={van.chassisId}
         onTogglePause={togglePause}
+        onRestart={restartTimer}
         onComplete={requestComplete}
         onDiscard={(timerId) => setCancelingTimerId(timerId)}
         onAddNote={addTimerNote}
@@ -1562,13 +1824,29 @@ export default function TryOutsClient({ userId }: Props) {
           // Always this van's model, and only it — a new operation created while walking a van
           // is by definition one that applies to it. Never any other model.
           autoLinkProductId={van.productId}
-          hint={`Added to ${newOperationJob.jobName}, then its stopwatch starts straight away for this van. Staff it in Operator later.`}
-          submitLabel="Create &amp; Time"
+          hint={
+            newOperationJob.intent === 'apply'
+              // Opened by pane 2's applies-toggle on an empty job: the point of this operation is
+              // to BE the thing that makes the job apply, so say that rather than talk about timing.
+              ? `Added to ${newOperationJob.jobName} and applied to ${van.model ?? 'this model'} — that first operation is what makes "${newOperationJob.jobName}" apply. Time it whenever you reach it.`
+              : `Added to ${newOperationJob.jobName}, then its stopwatch starts straight away for this van. Staff it in Operator later.`
+          }
+          submitLabel={newOperationJob.intent === 'apply' ? 'Create & Apply' : 'Create & Time'}
           onClose={() => setNewOperationJob(null)}
           onCreated={async (operationId, operationName, jobName) => {
+            const intent = newOperationJob.intent
             setNewOperationJob(null)
             await loadVan(van)
             setOperationId(operationId)
+            if (intent === 'apply') {
+              // The job's "Applies" state is derived, so it flips on by itself the moment this
+              // operation lands in the applies-list — nothing to write here. Just say what the
+              // tick ended up doing, in the same notice the job toggle uses.
+              setJobApplyNotice(
+                `"${jobName}" now applies to ${van.model ?? 'this model'} — "${operationName}" was added to it and linked.`
+              )
+              return
+            }
             // Straight into the Start step — creating the operation is only ever a step on the
             // way to timing it on this van, and it gets the same operator/opening-note prompt
             // as pressing Start on any other row.
@@ -1639,23 +1917,9 @@ export default function TryOutsClient({ userId }: Props) {
         />
       )}
 
-      {mergeConfirm && (
-        <ConfirmDialog
-          title={`Merge ${plural(mergeConfirm.dups.length, 'operation')} into "${mergeConfirm.keeper.name}"`}
-          message={`Move all recorded times and notes from the selected operations onto ${mergeConfirm.keeper.name}, then retire the others. They'll stop appearing across the app. This can be reversed by reactivating them in the database.`}
-          confirmLabel={merging ? 'Merging…' : 'Merge & retire'}
-          danger
-          onConfirm={() => { if (!merging) runMerge(mergeConfirm.keeper, mergeConfirm.dups) }}
-          onCancel={() => { if (!merging) setMergeConfirm(null) }}
-        >
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-            <span style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)' }}>Being retired</span>
-            {mergeConfirm.dups.map((d) => (
-              <span key={d.id} style={{ fontSize: 13, color: 'var(--text-mid)' }}>{d.name}</span>
-            ))}
-          </div>
-        </ConfirmDialog>
-      )}
+      {/* The operation-merge confirmation — the same component the Sections and Jobs panes use,
+        * fed by a preflight that has already run. See components/MergeMode. */}
+      <MergeConfirm merge={opMerge} />
 
       {/* ── Start a timer: the shared confirmation, before the clock begins ─────────── */}
       {startTarget && (
@@ -1663,7 +1927,7 @@ export default function TryOutsClient({ userId }: Props) {
           operationName={startTarget.operationName}
           jobName={startTarget.jobName}
           contextLabel={van.chassisNumber}
-          operators={operators}
+          operators={lineOperators}
           onStart={confirmStart}
           onCancel={() => setStartTarget(null)}
         />
@@ -1674,7 +1938,7 @@ export default function TryOutsClient({ userId }: Props) {
         <CompleteTimerDialog
           timer={completingTimer}
           contextLabel={`${completingTimer.chassisNumber ?? 'this van'} · ${van.model ?? 'this model'}`}
-          operators={operators}
+          operators={lineOperators}
           saving={completing}
           error={completeError}
           onSave={confirmComplete}
@@ -1720,7 +1984,7 @@ export default function TryOutsClient({ userId }: Props) {
                 supabase={supabase}
                 van={van}
                 target={capture}
-                operators={operators}
+                operators={lineOperators}
                 userId={userId}
                 existing={timesByOperation.get(capture.operationId) ?? []}
                 onSaved={async () => { await loadVan(van); closeCapture() }}
@@ -1751,6 +2015,7 @@ export default function TryOutsClient({ userId }: Props) {
                 supabase={supabase}
                 times={timesByOperation.get(timeDetail.operationId) ?? []}
                 userId={userId}
+                role={role}
                 onChanged={async () => { await loadVan(van) }}
                 onEmpty={closeTimeDetail}
                 onAddTime={() => openCapture(timeDetail)}
@@ -1789,11 +2054,11 @@ export default function TryOutsClient({ userId }: Props) {
  * don't fit a quarter-width column, and this is the column being worked in.
  */
 function VanOperationsPane({
-  job, operations, loading, van, scoped, modelOpIds, timesByOperation, vanAvgByOperation,
+  job, operations, loading, van, scoped, modelOpIds, timesByOperation, vanStatByOperation,
   timersByOperation, nowMs, timedOnVanCount, scopeBusyOpId, selectedOperationId,
-  mode, selection, mergeKeeperId, merging,
-  onSelect, onRename, onAdd, onAllocate, onDeallocate, onStart, onTogglePause, onComplete,
-  onOpenTimes, onAddManualTime, onEnterMerge, onToggleSelection, onPickKeeper, onRequestMerge,
+  merge, mergeRows,
+  onSelect, onEdit, onAdd, onAllocate, onDeallocate, onStart, onTogglePause, onComplete,
+  onOpenTimes, onAddManualTime,
 }: {
   job: Job | null
   operations: Operation[]
@@ -1802,7 +2067,7 @@ function VanOperationsPane({
   scoped: boolean
   modelOpIds: Set<string>
   timesByOperation: Map<string, VanTime[]>
-  vanAvgByOperation: Record<string, OperationTimeStat>
+  vanStatByOperation: Record<string, OperationTimeStat>
   timersByOperation: Map<string, ActiveTimer[]>
   nowMs: number
   timedOnVanCount: number
@@ -1810,12 +2075,13 @@ function VanOperationsPane({
    * allocate — either way its row's toggle is disabled while it's in flight. */
   scopeBusyOpId: string | null
   selectedOperationId: string
-  mode: 'normal' | 'merge'
-  selection: Set<string>
-  mergeKeeperId: string | null
-  merging: boolean
+  /** The shared merge flow, owned by the screen so it survives this pane's re-renders. */
+  merge: MergeModeState
+  mergeRows: MergeRow<Operation>[]
   onSelect: (id: string) => void
-  onRename: (id: string, name: string) => Promise<void>
+  /** Opens the SHARED operation editor. This pane used to rename inline with its own text
+   * field — the last such divergence in the app — and now does what every other pane does. */
+  onEdit: (op: Operation, job: Job) => void
   onAdd: () => void
   onAllocate: (op: Operation) => void
   onDeallocate: (op: Operation) => void
@@ -1826,74 +2092,40 @@ function VanOperationsPane({
   onComplete: (timer: ActiveTimer) => void
   onOpenTimes: (op: Operation, job: Job) => void
   onAddManualTime: (op: Operation, job: Job) => void
-  onEnterMerge: () => void
-  onToggleSelection: (id: string) => void
-  onPickKeeper: (id: string) => void
-  onRequestMerge: () => void
 }) {
-  const [editingId, setEditingId] = useState<string | null>(null)
-  const [editDraft, setEditDraft] = useState('')
-  const [busy, setBusy] = useState(false)
-
-  const selectedCount = operations.filter((o) => selection.has(o.id)).length
-  const inMerge = mode === 'merge'
-
-  async function commitRename(op: Operation) {
-    const trimmed = editDraft.trim()
-    if (!trimmed || trimmed === op.name) { setEditingId(null); return }
-    setBusy(true)
-    try { await onRename(op.id, trimmed) } finally { setBusy(false); setEditingId(null) }
-  }
-
   const subtitle = !job
     ? 'No job selected'
-    : inMerge
-      ? `${job.name} · merge — ${selectedCount} selected`
+    : merge.active
+      ? `${job.name} · ${merge.subtitle}`
       : `${job.name} · ${timedOnVanCount} of ${plural(operations.length, 'operation')} timed on ${van.chassisNumber}`
 
   return (
     <Pane
       title="Operations"
       subtitle={subtitle}
-      active={Boolean(selectedOperationId)}
+      active={merge.active ? merge.count > 0 : Boolean(selectedOperationId)}
       footer={
         job ? (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, width: '100%' }}>
-            {inMerge ? (
-              <>
-                <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                  {selectedCount < 2
-                    ? 'Tick two or more duplicates, then pick which one to keep.'
-                    : `Keeper: ${operations.find((o) => o.id === mergeKeeperId)?.name ?? '—'} · ${selectedCount - 1} will be retired`}
-                </span>
-                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                  <button
-                    className="btn-danger"
-                    style={{ padding: '6px 11px', fontSize: 12 }}
-                    disabled={merging || selectedCount < 2 || !mergeKeeperId}
-                    onClick={onRequestMerge}
-                  >
-                    {merging ? 'Merging…' : `Merge ${Math.max(selectedCount - 1, 0)} into keeper`}
-                  </button>
-                  <button className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12 }} disabled={merging} onClick={onEnterMerge}>Cancel</button>
-                </div>
-              </>
-            ) : (
+            {merge.active ? <MergeFooter merge={merge} /> : (
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                 <button className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12 }} onClick={onAdd}>+ Add operation</button>
-                {operations.length > 1 && (
-                  <button className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12 }} onClick={onEnterMerge}>Merge</button>
-                )}
+                {/* The one merge affordance, in the one place it lives on every pane. */}
+                <MergeFooter merge={merge} />
               </div>
             )}
           </div>
         ) : undefined
       }
     >
+      <MergeNotices merge={merge} />
+
       {!job ? (
         <p className="finder-pane-empty">Select a job.</p>
       ) : loading ? (
         <p className="finder-pane-empty">Loading…</p>
+      ) : merge.active ? (
+        mergeRows.map((row) => <MergeRowItem key={row.id} merge={merge} row={row} />)
       ) : operations.length === 0 ? (
         <p className="finder-pane-empty">
           {scoped
@@ -1902,53 +2134,10 @@ function VanOperationsPane({
         </p>
       ) : (
         operations.map((op) => {
-          // In merge mode the row is a checkbox and nothing else — the stopwatch and allocation
-          // controls would be a mis-click waiting to happen while the row's job is to be ticked.
-          if (inMerge) {
-            const isTicked = selection.has(op.id)
-            const isKeeper = mergeKeeperId === op.id
-            return (
-              <label
-                key={op.id}
-                className={'finder-row' + (isTicked ? ' finder-row-selected' : '')}
-                style={{ cursor: 'pointer' }}
-              >
-                <span className="finder-row-main">
-                  <input
-                    type="checkbox"
-                    checked={isTicked}
-                    onChange={() => onToggleSelection(op.id)}
-                    style={{ width: 15, height: 15, accentColor: 'var(--blue)', cursor: 'pointer', flexShrink: 0 }}
-                  />
-                  <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, flex: 1 }}>
-                    <span className="finder-row-name">{op.name}</span>
-                    {isTicked && (
-                      <span
-                        style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, fontWeight: 600, color: isKeeper ? 'var(--blue)' : 'var(--text-muted)', marginTop: 2 }}
-                        // Stopped here rather than at the label: letting the click bubble would
-                        // run the label's activation behaviour and untick the row's checkbox.
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        <input
-                          type="radio"
-                          name="merge-keeper"
-                          checked={isKeeper}
-                          onChange={() => onPickKeeper(op.id)}
-                          style={{ width: 13, height: 13, accentColor: 'var(--blue)', cursor: 'pointer' }}
-                        />
-                        Keep this one
-                      </span>
-                    )}
-                  </span>
-                </span>
-              </label>
-            )
-          }
-
           const isSelected = op.id === selectedOperationId
           const applies = modelOpIds.has(op.id)
           const times = timesByOperation.get(op.id) ?? []
-          const stat = vanAvgByOperation[op.id]
+          const stat = vanStatByOperation[op.id]
           const timer = timersByOperation.get(op.id)?.[0] ?? null
           const allocBusy = scopeBusyOpId === op.id || scopeBusyOpId === '__all__'
 
@@ -1964,59 +2153,42 @@ function VanOperationsPane({
             >
               {/* Row 1 — the name, its running dot, and the applies toggle. */}
               <div className="finder-row-op-head">
-                {editingId === op.id ? (
-                  <input
-                    autoFocus
-                    style={ROW_INPUT}
-                    value={editDraft}
-                    disabled={busy}
-                    onClick={(e) => e.stopPropagation()}
-                    onChange={(e) => setEditDraft(e.target.value)}
-                    onKeyDown={(e) => {
-                      e.stopPropagation()
-                      if (e.key === 'Enter') { e.preventDefault(); commitRename(op) }
-                      if (e.key === 'Escape') setEditingId(null)
-                    }}
-                    onBlur={() => commitRename(op)}
-                  />
-                ) : (
-                  <>
-                    {/* Titled as well as truncated: the row clips rather than wraps, so a long
-                        name has to stay reachable some other way. The dot sits OUTSIDE the
-                        ellipsised text — inside it a long name would clip the dot away — in a
-                        slot that is always reserved, so the name doesn't re-truncate the moment
-                        a timer starts. */}
-                    <span className="finder-row-name" title={op.name} style={{ flex: 1 }}>{op.name}</span>
-                    <span className="finder-row-op-dot">
-                      {timer && <RunningDot title={timer.isPaused ? 'A paused timer is on this operation' : 'A timer is running on this operation'} />}
+                {/* Titled as well as truncated: the row clips rather than wraps, so a long
+                    name has to stay reachable some other way. The dot sits OUTSIDE the
+                    ellipsised text — inside it a long name would clip the dot away — in a
+                    slot that is always reserved, so the name doesn't re-truncate the moment
+                    a timer starts. */}
+                <span className="finder-row-name" title={op.name} style={{ flex: 1 }}>{op.name}</span>
+                <span className="finder-row-op-dot">
+                  {timer && <RunningDot title={timer.isPaused ? 'A paused timer is on this operation' : 'A timer is running on this operation'} />}
+                </span>
+                <span className="finder-row-actions" onClick={(e) => e.stopPropagation()}>
+                  {/* The shared editor, not an inline field — same ✎, same drawer, same
+                      lib/operations writer as /setup, /collect and /line-config. */}
+                  <RenameButton title="Edit operation" onClick={() => onEdit(op, job)} />
+                  {/* The same control the Jobs pane uses, one grain down — this is the
+                      fine-grained override for the rare "this operation differs" case, so it
+                      reads identically rather than inventing a second vocabulary. */}
+                  <label
+                    title={
+                      applies
+                        ? `Stop this operation applying to ${van.model ?? 'this model'}`
+                        : `Make this operation apply to ${van.model ?? 'this model'}`
+                    }
+                    style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: allocBusy ? 'default' : 'pointer' }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={applies}
+                      disabled={allocBusy}
+                      onChange={() => (applies ? onDeallocate(op) : onAllocate(op))}
+                      style={{ width: 14, height: 14, accentColor: 'var(--blue)', cursor: allocBusy ? 'default' : 'pointer' }}
+                    />
+                    <span className={'badge ' + (applies ? 'badge-green' : 'badge-grey')}>
+                      {allocBusy ? '…' : applies ? 'Applies' : 'Doesn’t apply'}
                     </span>
-                    <span className="finder-row-actions" onClick={(e) => e.stopPropagation()}>
-                      <RenameButton title="Rename operation" onClick={() => { setEditingId(op.id); setEditDraft(op.name) }} />
-                      {/* The same control the Jobs pane uses, one grain down — this is the
-                          fine-grained override for the rare "this operation differs" case, so it
-                          reads identically rather than inventing a second vocabulary. */}
-                      <label
-                        title={
-                          applies
-                            ? `Stop this operation applying to ${van.model ?? 'this model'}`
-                            : `Make this operation apply to ${van.model ?? 'this model'}`
-                        }
-                        style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: allocBusy ? 'default' : 'pointer' }}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={applies}
-                          disabled={allocBusy}
-                          onChange={() => (applies ? onDeallocate(op) : onAllocate(op))}
-                          style={{ width: 14, height: 14, accentColor: 'var(--blue)', cursor: allocBusy ? 'default' : 'pointer' }}
-                        />
-                        <span className={'badge ' + (applies ? 'badge-green' : 'badge-grey')}>
-                          {allocBusy ? '…' : applies ? 'Applies' : 'Doesn’t apply'}
-                        </span>
-                      </label>
-                    </span>
-                  </>
-                )}
+                  </label>
+                </span>
               </div>
 
               {/* Row 2 — what is already recorded on THIS van. Always exactly one line: it goes
@@ -2032,9 +2204,9 @@ function VanOperationsPane({
                     onClick={() => job && onOpenTimes(op, job)}
                     title={`View, edit or delete this van's recorded times — ${times.map((t) => `${fmtMinutes(t.totalMinutes)}m · ${t.operatorName ?? 'no operator'} · ${fmtDate(t.createdAt)}`).join(', ')}`}
                   >
-                    ✓ {stat && stat.runs > 1
-                      ? `avg ${fmtMinutes(stat.avg)}m · ${stat.runs} runs`
-                      : `${fmtMinutes(stat?.avg ?? times[0].totalMinutes)}m · 1 run`} on this van
+                    ✓ {stat
+                      ? `${fmtMinutes(stat.minutes)}m${stat.archived > 0 ? ` · +${stat.archived} archived` : ''}`
+                      : `${fmtMinutes(times[0].totalMinutes)}m`} on this van
                     <PencilIcon />
                   </button>
                 )}
@@ -2118,11 +2290,12 @@ function VanOperationsPane({
  * calls onChanged to reload the van and the pane re-renders from the refreshed props.
  */
 function TimeDetailPanel({
-  supabase, times, userId, onChanged, onEmpty, onAddTime,
+  supabase, times, userId, role, onChanged, onEmpty, onAddTime,
 }: {
   supabase: SupabaseClient
   times: VanTime[]
   userId: string
+  role: UserRole | null
   onChanged: () => Promise<void>
   onEmpty: () => void
   onAddTime: () => void
@@ -2132,6 +2305,15 @@ function TimeDetailPanel({
   const [busyId, setBusyId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [confirmDelete, setConfirmDelete] = useState<VanTime | null>(null)
+
+  /**
+   * The same permission rules the /model-total drawer uses, from the same helper — this is the
+   * app's OTHER time-editing surface, and two surfaces offering different things for the same
+   * record is exactly what one shared helper exists to prevent. A user edits their own records
+   * and ownerless ones; only a manager or admin deletes.
+   */
+  const actor = useMemo<PermissionActor>(() => ({ userId, role }), [userId, role])
+  const canDelete = canDeleteTime(actor)
 
   const timeIdsKey = times.map((t) => t.id).join(',')
 
@@ -2145,8 +2327,11 @@ function TimeDetailPanel({
       const authorIds = [...new Set(notes.map((n) => n.created_by).filter((id): id is string => !!id))]
       const nameById = new Map<string, string | null>()
       if (authorIds.length > 0) {
-        const { data } = await supabase.from('profiles').select('id, full_name').in('id', authorIds)
-        for (const p of data ?? []) nameById.set(p.id, p.full_name)
+        // Chunked (lib/chunkedIn): one id per distinct note author across every note on the
+        // van. Feeds a Map, so chunk order is irrelevant.
+        const data = await selectIn<{ id: string; full_name: string | null }>(authorIds, (chunk) =>
+          supabase.from('profiles').select('id, full_name').in('id', chunk))
+        for (const p of data) nameById.set(p.id, p.full_name)
       }
       const grouped: Record<string, OperationTimeNote[]> = {}
       for (const n of notes) {
@@ -2210,6 +2395,9 @@ function TimeDetailPanel({
           const isBusy = busyId === t.id
           const draft = drafts[t.id] ?? ''
           const changed = draft.trim() !== '' && draft.trim() !== String(t.totalMinutes ?? '')
+          // Ownership is on the record, so this is asked per row rather than once for the panel.
+          const canEdit = canEditTime(actor, { collected_by: t.collectedBy })
+          const blockedReason = timeEditBlockedReason(actor, { collected_by: t.collectedBy }, t.operatorName)
           return (
             <div key={t.id} style={{ border: '1px solid var(--border)', borderRadius: 10, padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 10 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }}>
@@ -2223,26 +2411,35 @@ function TimeDetailPanel({
                   type="number" min={0} step="0.1" className="input"
                   style={{ width: 90, padding: '5px 8px', fontSize: 13 }}
                   value={draft}
-                  disabled={isBusy}
+                  disabled={isBusy || !canEdit}
+                  title={blockedReason ?? undefined}
                   onChange={(e) => setDrafts((prev) => ({ ...prev, [t.id]: e.target.value }))}
-                  onKeyDown={(e) => { if (e.key === 'Enter' && changed) saveMinutes(t) }}
+                  onKeyDown={(e) => { if (e.key === 'Enter' && changed && canEdit) saveMinutes(t) }}
                 />
                 <button
                   type="button" className="btn-primary" style={{ padding: '5px 11px', fontSize: 12 }}
-                  disabled={isBusy || !changed}
+                  disabled={isBusy || !changed || !canEdit}
+                  title={blockedReason ?? undefined}
                   onClick={() => saveMinutes(t)}
                 >
                   {isBusy ? '…' : 'Save'}
                 </button>
-                <button
-                  type="button"
-                  disabled={isBusy}
-                  onClick={() => setConfirmDelete(t)}
-                  style={{ marginLeft: 'auto', background: 'none', border: 'none', padding: 0, cursor: 'pointer', fontFamily: 'inherit', fontSize: 12, fontWeight: 600, color: 'var(--red)' }}
-                >
-                  Delete
-                </button>
+                {/* Manager/admin only, and absent rather than disabled — deleting a recorded time
+                    is not something a collector may do even to their own work. */}
+                {canDelete && (
+                  <button
+                    type="button"
+                    disabled={isBusy}
+                    onClick={() => setConfirmDelete(t)}
+                    style={{ marginLeft: 'auto', background: 'none', border: 'none', padding: 0, cursor: 'pointer', fontFamily: 'inherit', fontSize: 12, fontWeight: 600, color: 'var(--red)' }}
+                  >
+                    Delete
+                  </button>
+                )}
               </div>
+              {blockedReason && (
+                <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{blockedReason}</span>
+              )}
 
               <div>
                 <div style={{ ...JOB_LABEL, marginBottom: 6 }}>Notes</div>
@@ -2275,6 +2472,443 @@ function TimeDetailPanel({
   )
 }
 
+// ── "Who have I timed?" — the read-only log behind the left-hand slide-over ────────────────
+
+/** What the two scopes mean, and what each is labelled. */
+type TimedLogScope = 'van' | 'model'
+
+/** One recorded run, flattened for display. Everything is resolved to a name here so the list
+ * itself does no lookups while it renders. */
+interface TimedLogRow {
+  id: string
+  operationId: string
+  operationName: string
+  jobName: string | null
+  operatorName: string | null
+  chassisNumber: string | null
+  /** Whose team this run's work belongs to — derived section-first, see teamForJob. */
+  teamId: string | null
+  teamName: string | null
+  totalMinutes: number | null
+  createdAt: string
+  notes: string[]
+}
+
+interface TimedLogData {
+  rows: TimedLogRow[]
+  /** avg + runs keyed by operation id, over exactly the rows above — so "typical" means
+   * typical for the scope being looked at, not some other population. */
+  statByOperation: Record<string, OperationTimeStat>
+}
+
+const EMPTY_TIMED_LOG: TimedLogData = { rows: [], statByOperation: {} }
+
+/** The team dropdown's value for "runs whose job has no team at all" — a real state (an
+ * unsectioned job on a line that predates teams), and distinct from '' meaning All teams. */
+const NO_TEAM_KEY = '__no_team__'
+
+/**
+ * Every run recorded against this van, or against this van's MODEL across every van of it.
+ *
+ * Strictly read-only: it opens no editor and writes nothing. Editing and deleting a time
+ * already have one home — the per-operation time drawer on pane 3 — and a second write path
+ * over the same rows is how two screens end up disagreeing about what was recorded. This
+ * answers "who have I timed, and on what?", which the columns can't: they show one operation at
+ * a time, and the answer spans all of them.
+ *
+ * Names are resolved with the same batched `.in()` lookups loadVan uses rather than embedded
+ * relationships (see lib/operationTimes' note on why), chunked through READ_CHUNK because the
+ * model scope's id list is unbounded — a popular model has years of times across dozens of vans.
+ */
+async function fetchTimedLog(
+  supabase: SupabaseClient,
+  van: VanContext,
+  scope: TimedLogScope
+): Promise<TimedLogData> {
+  interface RawTime {
+    id: string; operation_id: string; operator_id: string | null; chassis_id: string | null
+    total_minutes: number | null; created_at: string; superseded_by: string | null
+  }
+  // Unfiltered by superseded_by throughout this function, deliberately: the timed log IS the
+  // history. The column is selected so the figure below can be picked by the shared helper.
+  const TIME_COLUMNS = 'id, operation_id, operator_id, chassis_id, total_minutes, created_at, superseded_by'
+
+  let times: RawTime[] = []
+  /** The (time, product) links behind the model scope — kept because currentForOperation is
+   * defined over them, not over the times alone. */
+  let timeModels: { operation_time_id: string; product_id: string }[] = []
+
+  if (scope === 'van') {
+    const { data, error } = await supabase
+      .from('operation_times')
+      .select(TIME_COLUMNS)
+      .eq('chassis_id', van.chassisId)
+      .order('created_at', { ascending: false })
+    if (error) throw new Error(error.message)
+    times = (data ?? []) as RawTime[]
+  } else {
+    if (!van.productId) return EMPTY_TIMED_LOG
+    // operation_times carries no product_id — which model a run counts for lives entirely in
+    // the junction, so the model scope starts there and reads the times back by id.
+    const { data: linkRows, error: linkError } = await supabase
+      .from('operation_time_models')
+      .select('operation_time_id, product_id')
+      .eq('product_id', van.productId)
+    if (linkError) throw new Error(linkError.message)
+    timeModels = (linkRows ?? []) as { operation_time_id: string; product_id: string }[]
+
+    const timeIds = [...new Set(timeModels.map((l) => l.operation_time_id))]
+    if (timeIds.length === 0) return EMPTY_TIMED_LOG
+
+    for (const batch of chunked(timeIds, READ_CHUNK)) {
+      const { data, error } = await supabase.from('operation_times').select(TIME_COLUMNS).in('id', batch)
+      if (error) throw new Error(error.message)
+      times.push(...((data ?? []) as RawTime[]))
+    }
+    // Sorted here rather than by the query: the rows arrive one batch at a time, so ordering
+    // per batch would interleave into something that only looks sorted.
+    times.sort((a, b) => b.created_at.localeCompare(a.created_at))
+  }
+
+  if (times.length === 0) return EMPTY_TIMED_LOG
+
+  // ── Names, in batched lookups keyed by the ids actually present ──
+  async function lookup<T>(table: string, columns: string, ids: string[]): Promise<T[]> {
+    if (ids.length === 0) return []
+    const out: T[] = []
+    for (const batch of chunked(ids, READ_CHUNK)) {
+      const { data, error } = await supabase.from(table).select(columns).in('id', batch)
+      if (error) throw new Error(error.message)
+      out.push(...((data ?? []) as unknown as T[]))
+    }
+    return out
+  }
+
+  const operationRows = await lookup<{ id: string; name: string; job_id: string | null }>(
+    'operations', 'id, name, job_id',
+    [...new Set(times.map((t) => t.operation_id))]
+  )
+  const operationById = new Map(operationRows.map((o) => [o.id, o]))
+
+  // section_id rides along with the name: a run's team is derived from the job's SECTION, so
+  // that is the only column needed — jobs.team_id is never consulted.
+  const jobRows = await lookup<{ id: string; name: string; section_id: string | null }>(
+    'jobs', 'id, name, section_id',
+    [...new Set(operationRows.map((o) => o.job_id).filter((id): id is string => !!id))]
+  )
+  const jobById = new Map(jobRows.map((j) => [j.id, j]))
+
+  // Team lives on the SECTION (see lib/sections' teamForJob), so the sections behind these jobs
+  // are the whole of the derivation; a job in the line's unsorted tray has no team yet.
+  const sectionRows = await lookup<{ id: string; team_id: string | null }>(
+    'sections', 'id, team_id',
+    [...new Set(jobRows.map((j) => j.section_id).filter((id): id is string => !!id))]
+  )
+  const sectionById = new Map(sectionRows.map((st) => [st.id, st]))
+
+  const teamIdByJobId = new Map(jobRows.map((j) => [j.id, teamForJob(j, sectionById)]))
+  const teamRows = await lookup<{ id: string; name: string }>(
+    'teams', 'id, name',
+    [...new Set([...teamIdByJobId.values()].filter((id): id is string => !!id))]
+  )
+  const teamNameById = new Map(teamRows.map((t) => [t.id, t.name]))
+
+  const operatorRows = await lookup<{ id: string; full_name: string }>(
+    'operators', 'id, full_name',
+    [...new Set(times.map((t) => t.operator_id).filter((id): id is string => !!id))]
+  )
+  const operatorNameById = new Map(operatorRows.map((o) => [o.id, o.full_name]))
+
+  // Only the model scope spans more than one van, so only it needs to say which.
+  const chassisRows = scope === 'model'
+    ? await lookup<{ id: string; chassisnumber: string }>(
+      'chassis', 'id, chassisnumber',
+      [...new Set(times.map((t) => t.chassis_id).filter((id): id is string => !!id))]
+    )
+    : []
+  const chassisNumberById = new Map(chassisRows.map((c) => [c.id, c.chassisnumber]))
+
+  // ── Notes, through the shared fetcher, grouped back onto their run ──
+  const notesByTimeId = new Map<string, string[]>()
+  for (const batch of chunked(times.map((t) => t.id), READ_CHUNK)) {
+    for (const note of await fetchOperationTimeNotes(supabase, batch)) {
+      const list = notesByTimeId.get(note.operation_time_id) ?? []
+      list.push(note.content)
+      notesByTimeId.set(note.operation_time_id, list)
+    }
+  }
+
+  const rows: TimedLogRow[] = times.map((t) => {
+    const operation = operationById.get(t.operation_id)
+    const job = operation?.job_id ? jobById.get(operation.job_id) ?? null : null
+    const teamId = job ? teamIdByJobId.get(job.id) ?? null : null
+    return {
+      id: t.id,
+      operationId: t.operation_id,
+      operationName: operation?.name ?? 'Unknown operation',
+      jobName: job?.name ?? null,
+      teamId,
+      teamName: teamId ? teamNameById.get(teamId) ?? null : null,
+      operatorName: t.operator_id ? operatorNameById.get(t.operator_id) ?? null : null,
+      chassisNumber: t.chassis_id ? chassisNumberById.get(t.chassis_id) ?? null : null,
+      totalMinutes: t.total_minutes,
+      createdAt: t.created_at,
+      notes: notesByTimeId.get(t.id) ?? [],
+    }
+  })
+
+  // The van scope is one chassis's records, so the per-operation current time is the right one;
+  // the model scope is defined by the junction, so it goes through the (operation, product)
+  // lookup and is re-keyed by operation id — the product is fixed at this van's, so the pair
+  // collapses.
+  let statByOperation: Record<string, OperationTimeStat> = {}
+  if (scope === 'van') {
+    statByOperation = currentByOperation(times)
+  } else if (van.productId) {
+    const byPair = currentForOperation(times, timeModels)
+    for (const [key, stat] of Object.entries(byPair)) {
+      const [operationId, productId] = key.split(':')
+      if (productId === van.productId) statByOperation[operationId] = stat
+    }
+  }
+
+  return { rows, statByOperation }
+}
+
+/**
+ * The left-hand slide-over. Mirrors the timer rail's side of the screen deliberately: the rail
+ * on the right is what is running NOW, this on the left is what has already been recorded, and
+ * both can be open at once without one covering the other.
+ *
+ * Refetches whenever the scope is switched — the two scopes are different queries over
+ * different key columns (chassis_id vs the operation_time_models junction), not one result
+ * filtered two ways, so there is nothing to cache between them.
+ */
+function TimedLogPanel({
+  supabase, van, visible, onClose,
+}: {
+  supabase: SupabaseClient
+  van: VanContext
+  /** Drives the slide-in class; mounting and unmounting is the caller's (useSlideOverDrawer). */
+  visible: boolean
+  onClose: () => void
+}) {
+  const [scope, setScope] = useState<TimedLogScope>('van')
+  const [teamFilter, setTeamFilter] = useState('')
+  const [data, setData] = useState<TimedLogData>(EMPTY_TIMED_LOG)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true); setError(null)
+    fetchTimedLog(supabase, van, scope)
+      .then((result) => { if (!cancelled) setData(result) })
+      .catch((err) => {
+        if (!cancelled) {
+          setData(EMPTY_TIMED_LOG)
+          setError(err instanceof Error ? err.message : 'Could not load the recorded times')
+        }
+      })
+      .finally(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
+  }, [supabase, van, scope])
+
+  const { rows, statByOperation } = data
+
+  /**
+   * Only the teams that actually have times in the current scope — an option that would filter
+   * to nothing is worse than no option at all, and which teams have been timed is itself part
+   * of the answer this panel gives.
+   */
+  const teamOptions = useMemo(() => {
+    const byId = new Map<string, string>()
+    let hasUnteamed = false
+    for (const row of rows) {
+      if (row.teamId) byId.set(row.teamId, row.teamName ?? 'Unnamed team')
+      else hasUnteamed = true
+    }
+    const options = [...byId.entries()]
+      .map(([key, label]) => ({ key, label }))
+      .sort((a, b) => a.label.localeCompare(b.label))
+    if (hasUnteamed) options.push({ key: NO_TEAM_KEY, label: 'No team' })
+    return options
+  }, [rows])
+
+  // Switching scope changes which teams are represented, and a filter left pointing at a team
+  // that has no times in the new scope would show an empty list with no visible cause.
+  useEffect(() => {
+    if (teamFilter && !teamOptions.some((o) => o.key === teamFilter)) setTeamFilter('')
+  }, [teamOptions, teamFilter])
+
+  const visibleRows = useMemo(() => {
+    if (!teamFilter) return rows
+    if (teamFilter === NO_TEAM_KEY) return rows.filter((r) => !r.teamId)
+    return rows.filter((r) => r.teamId === teamFilter)
+  }, [rows, teamFilter])
+
+  const totalMinutes = visibleRows.reduce((sum, r) => sum + (r.totalMinutes ?? 0), 0)
+  const operationCount = new Set(visibleRows.map((r) => r.operationId)).size
+  const modelLabel = van.model ?? 'this model'
+  const teamLabel = teamOptions.find((o) => o.key === teamFilter)?.label ?? null
+
+  // Both halves of what is being counted, in one line: the scope, then the team narrowing it.
+  const summary = loading
+    ? 'Loading…'
+    : (scope === 'van'
+      ? `${plural(visibleRows.length, 'time')} on this van`
+      : `${plural(visibleRows.length, 'time')} for ${modelLabel}`)
+      + (teamLabel ? ` · ${teamLabel}` : '')
+
+  return (
+    <>
+      <div className={'gaps-drawer-overlay' + (visible ? ' gaps-drawer-overlay-visible' : '')} onClick={onClose} />
+      <div
+        className={'gaps-drawer gaps-drawer-left' + (visible ? ' gaps-drawer-visible' : '')}
+        style={DRAWER_WIDTH}
+        role="dialog"
+        aria-label="Who have I timed?"
+      >
+        <div className="gaps-drawer-header">
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div className="gaps-drawer-title">Who have I timed?</div>
+            <div className="gaps-drawer-jobname">
+              {van.chassisNumber} · {modelLabel}
+            </div>
+          </div>
+          <button className="gaps-drawer-close" onClick={onClose} aria-label="Close">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+              <path d="M18 6L6 18M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+
+        {/* Scope, and what it currently adds up to. The two are together because the summary is
+          * only meaningful alongside the scope it counts — "12 times" means nothing on its own. */}
+        <div style={{ padding: '12px 20px', borderBottom: '1px solid var(--border)', display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <div role="group" aria-label="Which times to show" style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            {([
+              { key: 'van' as const, label: 'This van', title: `Only times recorded against ${van.chassisNumber}` },
+              { key: 'model' as const, label: `All times for ${modelLabel}`, title: `Every time recorded for ${modelLabel}, across every van of it` },
+            ]).map((option) => {
+              const active = scope === option.key
+              return (
+                <button
+                  key={option.key}
+                  type="button"
+                  className={active ? 'btn-primary' : 'btn-ghost'}
+                  style={{ padding: '6px 12px', fontSize: 12 }}
+                  aria-pressed={active}
+                  title={option.title}
+                  // Switching to the model scope with no model would query nothing; the button
+                  // says why rather than silently returning an empty list.
+                  disabled={option.key === 'model' && !van.productId}
+                  onClick={() => setScope(option.key)}
+                >
+                  {option.label}
+                </button>
+              )
+            })}
+          </div>
+
+          {/* Narrows whichever scope is selected — the two compose, they don't replace each
+            * other. Only rendered once there is more than one team to choose between: with a
+            * single team every option would be the whole list. */}
+          {teamOptions.length > 1 && (
+            <select
+              style={{ ...SEL, fontSize: 12, padding: '6px 9px' }}
+              value={teamFilter}
+              aria-label="Filter these times by team"
+              onChange={(e) => setTeamFilter(e.target.value)}
+            >
+              <option value="">All teams</option>
+              {teamOptions.map((o) => <option key={o.key} value={o.key}>{o.label}</option>)}
+            </select>
+          )}
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+            <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)' }}>{summary}</span>
+            {!loading && visibleRows.length > 0 && (
+              <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                {plural(operationCount, 'operation')} · {fmtMinutes(totalMinutes)} minutes total
+              </span>
+            )}
+            {!van.productId && (
+              <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                This van has no model linked, so there is no model-wide view of it.
+              </span>
+            )}
+          </div>
+        </div>
+
+        <div className="gaps-drawer-body">
+          {error ? (
+            <p style={{ ...ERR_BOX, margin: '12px 20px' }}>{error}</p>
+          ) : loading ? (
+            <p className="finder-pane-empty">Loading…</p>
+          ) : rows.length === 0 ? (
+            <p className="finder-pane-empty">
+              {scope === 'van'
+                ? `Nothing has been timed on ${van.chassisNumber} yet. Start a stopwatch on an operation and it will appear here.`
+                : `No times have been recorded for ${modelLabel} on any van yet.`}
+            </p>
+          ) : visibleRows.length === 0 ? (
+            // Only reachable in the moment before the effect above clears a stale filter, but
+            // "nothing timed yet" would be the wrong thing to say while a filter is on.
+            <p className="finder-pane-empty">
+              None of these {plural(rows.length, 'time')} belong to {teamLabel ?? 'that team'}. Choose All teams to see them.
+            </p>
+          ) : (
+            visibleRows.map((row) => {
+              const stat = statByOperation[row.operationId]
+              return (
+                <div key={row.id} className="gaps-drawer-item">
+                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'flex-start' }}>
+                    <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column', gap: 2 }}>
+                      <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)', wordBreak: 'break-word' }}>
+                        {row.operationName}
+                      </span>
+                      <span style={{ fontSize: 12, color: 'var(--text-muted)', wordBreak: 'break-word' }}>
+                        {row.jobName ?? 'No job'}
+                        {/* Named only while the list is mixed — with a team chosen it's on
+                          * every row and says nothing the summary hasn't already said. */}
+                        {!teamFilter && teamOptions.length > 1 && <> · {row.teamName ?? 'No team'}</>}
+                        {/* Only the model scope spans vans, so only it names one. */}
+                        {scope === 'model' && <> · {row.chassisNumber ?? 'No van'}</>}
+                      </span>
+                    </div>
+                    <span className="badge badge-blue" style={{ flexShrink: 0 }}>{fmtMinutes(row.totalMinutes)}m</span>
+                  </div>
+
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center', fontSize: 12, color: 'var(--text-mid)' }}>
+                    <span style={{ fontWeight: 600 }}>
+                      Timed: {row.operatorName ?? 'No operator recorded'}
+                    </span>
+                    <span style={{ color: 'var(--text-muted)' }}>{fmtDateTime(row.createdAt)}</span>
+                    {/* Which record is the live figure, and how much sits behind it. Only worth
+                        showing once this pair has more than the one record. */}
+                    {stat && stat.archived > 0 && (
+                      <span className="badge badge-grey">{fmtMinutes(stat.minutes)}m {historyLabel(stat)}</span>
+                    )}
+                  </div>
+
+                  {row.notes.length > 0 && (
+                    <ul style={{ margin: 0, paddingLeft: 16, display: 'flex', flexDirection: 'column', gap: 3 }}>
+                      {row.notes.map((note, index) => (
+                        <li key={index} style={{ fontSize: 12, color: 'var(--text-mid)', wordBreak: 'break-word' }}>{note}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )
+            })
+          )}
+        </div>
+      </div>
+    </>
+  )
+}
+
 // ── Manual entry panel: minutes typed in, with an optional operator and note ───────────────
 /**
  * The way in for a run nobody stopwatched — the figure is already known, so there's nothing to
@@ -2287,6 +2921,7 @@ function CapturePanel({
   supabase: SupabaseClient
   van: VanContext
   target: CaptureTarget
+  /** Already scoped to the van's production line by the host. */
   operators: OperatorOption[]
   userId: string
   existing: VanTime[]
@@ -2359,12 +2994,16 @@ function CapturePanel({
       <div className="capture-fields">
         <div>
           <label className="label">Operator — who was timed?</label>
-          <select style={SEL} value={operatorId} disabled={saving} onChange={(e) => setOperatorId(e.target.value)}>
-            <option value="">— None —</option>
-            {operators.map((o) => <option key={o.id} value={o.id}>{o.full_name}</option>)}
-          </select>
+          <OperatorSelect
+            operators={operators}
+            value={operatorId}
+            disabled={saving}
+            ariaLabel="Operator who was timed"
+            onChange={setOperatorId}
+          />
           <p style={{ fontSize: 11, color: 'var(--text-muted)', margin: '6px 0 0' }}>
-            Optional. Recorded against this van only — the operation&apos;s own primary operator isn&apos;t changed.
+            Optional, and only this van&apos;s production line. Recorded against this van only — the
+            operation&apos;s own primary operator isn&apos;t changed.
           </p>
         </div>
 

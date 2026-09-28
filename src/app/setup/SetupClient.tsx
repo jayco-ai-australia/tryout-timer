@@ -7,28 +7,42 @@ import ConfirmDialog from '@/components/ConfirmDialog'
 import ModelLinker, { ModelSeriesPicker } from '@/components/ModelLinker'
 import BulkModelLinkDrawer, { DRAWER_WIDTH, useSlideOverDrawer } from '@/components/BulkModelLinkDrawer'
 import JobEditDrawer from '@/components/JobEditDrawer'
+import DuplicateJobsDrawer from '@/components/DuplicateJobsDrawer'
 import JobFormModal from '@/components/JobFormModal'
 import OperationEditDrawer from '@/components/OperationEditDrawer'
 import OperatorAssign from '@/components/OperatorAssign'
 import {
-  averageForOperation, fetchOperationTimeNotes, operationProductKey, type OperationTimeStat,
+  currentForOperation, fetchOperationTimeNotes, historyLabel, operationProductKey, type OperationTimeStat,
 } from '@/lib/operationTimes'
 import { fmtDate, fmtMinutes } from '@/lib/format'
-import { setJobStage, sortStages } from '@/lib/stages'
-import { createOperation } from '@/lib/operations'
-import { mergeOperations, preflightMerge, strandedMergeMessage, type MergePreflight } from '@/lib/mergeOperations'
+import { findSectionTray, setJobSection, sortSections, teamForJob } from '@/lib/sections'
+import { logSupabaseError } from '@/lib/supabaseRead'
+import { createOperation, setOperationJob } from '@/lib/operations'
 import {
-  JobsPane, Pane, RenameButton, ROW_INPUT, StagesPane, UNSTAGED_KEY, plural,
-  type StageEntry,
+  JobsPane, Pane, RenameButton, ROW_INPUT, SectionsPane, UNSECTIONED_KEY, plural, teamNameForJob,
+  type SectionEntry,
 } from '@/components/FinderPanes'
+import {
+  MergeConfirm, MergeFooter, MergeNotices, MergeRowItem, useMergeMode,
+  type MergeModeState, type MergeRow,
+} from '@/components/MergeMode'
 import {
   chunked, fetchLinksForOperations, fetchTimedPairs, linkOperationsToModels,
   unlinkOperationsFromModels, READ_CHUNK,
 } from '@/lib/modelOperations'
+import { fetchAllChunked } from '@/lib/supabaseRead'
+import { modelsForLine } from '@/lib/lines'
 import { usePersistedFilter } from '@/lib/useLocalStorage'
-import type { Job, Operation, OperationTimeNote, Product, ProductionLine, Stage, Team, UserRole } from '@/lib/types'
+import { NO_SETUP_FOCUS, type SetupFocus } from '@/lib/setupLinks'
+import type { Job, Operation, OperationTimeNote, Product, ProductionLine, Section, Team, UserRole } from '@/lib/types'
 
-interface Props { lines: ProductionLine[]; role: UserRole; userId: string }
+interface Props {
+  lines: ProductionLine[]
+  role: UserRole
+  userId: string
+  /** Where a deep link wants this screen pointed, resolved server-side (lib/setupLinks). */
+  initialFocus?: SetupFocus
+}
 
 type SupabaseClient = ReturnType<typeof createClient>
 
@@ -54,7 +68,7 @@ interface RawTeamRef { id: string; name: string }
 interface RawOperatorRef { id: string; full_name: string }
 interface RawJob {
   id: string; name: string; primary_operator_id: string | null
-  team_id: string | null; production_line_id: string | null; stage_id: string | null; created_at: string
+  team_id: string | null; production_line_id: string | null; section_id: string | null; created_at: string
   teams: RawTeamRef | RawTeamRef[] | null
 }
 interface RawOperation {
@@ -63,7 +77,7 @@ interface RawOperation {
   primary_operator: RawOperatorRef | RawOperatorRef[] | null
   secondary_operator: RawOperatorRef | RawOperatorRef[] | null
 }
-interface RawJobOption { id: string; name: string; teams: RawTeamRef | RawTeamRef[] | null }
+interface RawJobOption { id: string; name: string; section_id: string | null }
 
 /** Chunking for this screen's own bulk reads (jobs → operations, coverage) — the same sizes
  * lib/modelOperations uses for the applies-list, imported from there so there is one answer to
@@ -79,8 +93,10 @@ interface RawJobOption { id: string; name: string; teams: RawTeamRef | RawTeamRe
  *
  * "Timed" follows lib/coverage.ts' definition — the *existence* of an operation_time linked to
  * the model via operation_time_models — not whether that time has a total_minutes value, so an
- * in-progress capture still counts as collected. (The averages shown in pane 4 come from the
- * shared averageForOperation, which does skip null minutes.)
+ * in-progress capture still counts as collected. Coverage is deliberately unmoved by the
+ * current-record rule: a superseded time is still a time that was collected, so a pair with
+ * nothing but archived records still counts as timed here. (The FIGURES shown in pane 4 come
+ * from the shared currentForOperation, which takes the current record and skips null minutes.)
  */
 interface OperationCoverage { timed: number; total: number }
 
@@ -125,9 +141,15 @@ function coverageBadgeClass(coverage: OperationCoverage): string {
   return 'badge-amber'
 }
 
+/**
+ * Spelled out against the JOB badge one pane to the left, which counts a different thing —
+ * "applies to 9 of 29 models" there, "timed on 1 of 29 models" here. Both are shown as "n / m"
+ * and they are NOT the same fraction; the tooltips are the disambiguation.
+ */
 function coverageTitle(coverage: OperationCoverage): string {
   if (coverage.total === 0) return 'No models linked to this operation yet'
-  return `${coverage.timed} of ${plural(coverage.total, 'linked model')} have at least one recorded time`
+  return `Timed on ${coverage.timed} of ${plural(coverage.total, 'model')} this operation is linked to `
+    + '— collection progress, not applicability (the job badge counts what the job applies to)'
 }
 
 function CoverageBadge({ coverage, loading }: { coverage: OperationCoverage | undefined; loading: boolean }) {
@@ -143,30 +165,70 @@ function CoverageBadge({ coverage, loading }: { coverage: OperationCoverage | un
 
 
 
-export default function SetupClient({ lines, role, userId }: Props) {
+export default function SetupClient({ lines, role, userId, initialFocus = NO_SETUP_FOCUS }: Props) {
   const supabase = useState(() => createClient())[0]
 
   // ── Filter bar: scopes every pane below ────────────────────────────────────────────────
-  const [lineId, setLineId] = usePersistedFilter('jmotion_setup_line')
+  // Each takes the deep link's value as an override where one was given — it wins over the
+  // remembered position outright, so arriving from /model-total's "Merge with another job…"
+  // lands on that job instead of wherever this screen was last left. See usePersistedFilter.
+  const [lineId, setLineId] = usePersistedFilter('jmotion_setup_line', '', initialFocus.lineId)
   const [teamId, setTeamId] = usePersistedFilter('jmotion_setup_team')
   // ── Drill position: persisted so a refresh comes back to the same operation ─────────────
-  const [stageKey, setStageKey] = usePersistedFilter('jmotion_setup_stage')
-  const [jobId, setJobId] = usePersistedFilter('jmotion_setup_job')
-  const [operationId, setOperationId] = usePersistedFilter('jmotion_setup_operation')
+  const [sectionKey, setSectionKey] = usePersistedFilter('jmotion_setup_section', '', initialFocus.sectionKey)
+  const [jobId, setJobId] = usePersistedFilter('jmotion_setup_job', '', initialFocus.jobId)
+  const [operationId, setOperationId] = usePersistedFilter('jmotion_setup_operation', '', initialFocus.operationId)
+  /**
+   * Whether the persisted filters above have finished restoring from localStorage.
+   *
+   * THIS IS THE RUNAWAY READ. usePersistedFilter starts at '' and restores in a mount effect, so
+   * the FIRST render of this screen has no line and no team — and loadJobs treats "no line, no
+   * team" as a legitimate "All lines" view and fetches EVERY JOB IN THE DATABASE, then every
+   * operation under them, then pages model_operations over the whole lot in 150-id chunks. That
+   * is the dozens of repeated reads: not one query firing dozens of times, but one sweep over
+   * thousands of operations that has no business running at all, immediately followed by the
+   * real scoped one when the restore lands a tick later.
+   *
+   * The hooks above register their restore effects BEFORE this one, so by the time this commits
+   * lineId/teamId already hold their stored values and the first fetch is the correct one. An
+   * "All lines" view chosen deliberately still works — it just isn't guessed at on mount.
+   */
+  const [filtersRestored, setFiltersRestored] = useState(false)
+  useEffect(() => { setFiltersRestored(true) }, [])
+
   // Deliberately not persisted — a search term is a momentary "find me this one operation",
   // not a scope the screen should still be in next time it's opened.
   const [search, setSearch] = useState('')
 
   const [allTeams, setAllTeams] = useState<Team[]>([])
-  const [allStages, setAllStages] = useState<Stage[]>([])
+  const [allSections, setAllSections] = useState<Section[]>([])
   const [allActiveOperators, setAllActiveOperators] = useState<OperatorOption[]>([])
-  const [allJobOptions, setAllJobOptions] = useState<JobMoveOption[]>([])
+  /** Every job, for the "move to another job" dropdown — raw, because its label carries the
+   * job's team and that is DERIVED from its section rather than stored on the row. */
+  const [allJobRows, setAllJobRows] = useState<RawJobOption[]>([])
 
   const [jobs, setJobs] = useState<Job[]>([])
   const [operationsByJob, setOperationsByJob] = useState<Record<string, Operation[]>>({})
   const [loadingJobs, setLoadingJobs] = useState(false)
 
   const [coverageByOp, setCoverageByOp] = useState<Record<string, OperationCoverage>>({})
+  /**
+   * The applies-list rows the coverage sweep already fetched, kept rather than discarded.
+   *
+   * The per-job "9 / 29 models" badge needs applicability for every job on the line, and this IS
+   * that data — the sweep reads model_operations for every loaded operation, which is a superset
+   * of what any job-level rollup needs. Keeping the rows adds no query; throwing them away and
+   * asking again per job would have added one per row.
+   */
+  const [modelLinkPairs, setModelLinkPairs] = useState<{ operation_id: string; product_id: string }[]>([])
+  /** Bumped to re-run the sweep alone after the job model panel writes — see jobModelsDrawer. */
+  const [applicabilityVersion, setApplicabilityVersion] = useState(0)
+  /** Every product, once. The badge's DENOMINATOR is "models on this line", which the sweep
+   * cannot supply: a product linked to nothing never appears in model_operations at all. Loaded
+   * with the other one-time reference data below and filtered by line client-side. */
+  /** Models for the line in scope, from lib/lines' modelsForLine. Named for what it holds: it
+   * is no longer every product in the database. */
+  const [lineProducts, setLineProducts] = useState<Product[]>([])
   const [loadingCoverage, setLoadingCoverage] = useState(false)
   /** Bumped whenever pane 4's ModelLinker writes, so the collected-times panel under it
    * re-reads instead of showing the model set it loaded with. */
@@ -189,17 +251,18 @@ export default function SetupClient({ lines, role, userId }: Props) {
   const [moveModal, setMoveModal] = useState<Operation | null>(null)
 
   // ── Pane 3 modes ───────────────────────────────────────────────────────────────────────
-  // 'bulk'  — multi-select operations, then apply one model set to all of them.
-  // 'merge' — multi-select duplicates, pick a keeper, move their times onto it and retire them.
-  // Both share one selection set: only one mode is ever live, and leaving either drops it.
-  const [opMode, setOpMode] = useState<'normal' | 'bulk' | 'merge'>('normal')
+  // 'bulk' — multi-select operations, then apply one model set to all of them. Merge is NOT a
+  // mode here any more: it lives in the shared merge-mode hook below, the same one the Sections
+  // and Jobs panes mount, so the three levels of the walk offer one affordance rather than three.
+  const [opMode, setOpMode] = useState<'normal' | 'bulk'>('normal')
   const [opSelection, setOpSelection] = useState<Set<string>>(new Set())
-  const [mergeKeeperId, setMergeKeeperId] = useState<string | null>(null)
-  const [mergeConfirm, setMergeConfirm] = useState<{ keeper: Operation; dups: Operation[] } | null>(null)
-  const [merging, setMerging] = useState(false)
   /** The optional operator strip in pane 3 — collapsed by default (phase-1: operators are
    * context only, so nothing on this screen waits on them). */
   const [operatorsOpen, setOperatorsOpen] = useState(false)
+  /** The duplicate-name reconciliation drawer — see components/DuplicateJobsDrawer. It is a
+   * drawer rather than a fourth pane because it is a reconciliation task over the WHOLE line,
+   * not another step of the Section → Job → Operation drill the panes exist for. */
+  const [duplicatesOpen, setDuplicatesOpen] = useState(false)
 
   const [blockedDeleteJob, setBlockedDeleteJob] = useState<string | null>(null)
   const [blockedDeleteOperation, setBlockedDeleteOperation] = useState<string | null>(null)
@@ -212,32 +275,112 @@ export default function SetupClient({ lines, role, userId }: Props) {
   // filter). ──────────────────────────────────────────────────────────────────────────────
   useEffect(() => {
     supabase.from('teams').select('*').order('name').then(({ data }) => setAllTeams(data ?? []))
-    reloadStages()
-    supabase.from('operators').select('id, full_name').eq('is_active', true).order('full_name')
-      .then(({ data }) => setAllActiveOperators((data ?? []) as OperatorOption[]))
-    supabase.from('jobs').select('id, name, teams ( id, name )').order('name').then(({ data }) => {
-      setAllJobOptions(((data ?? []) as unknown as RawJobOption[]).map((r) => {
-        const team = one(r.teams)
-        return { id: r.id, label: team ? `${r.name} — ${team.name}` : r.name }
-      }))
-    })
+    reloadSections()
+    // No is_active filter: `operators` has no such column (it lives on sections/jobs/operations
+    // only), and filtering on it here was a 400 on every load. Errors are surfaced rather than
+    // swallowed — a silently empty operator list reads as "nobody is set up", not as a failure.
+    supabase.from('operators').select('id, full_name').order('full_name')
+      .then(({ data, error }) => {
+        if (error) { logSupabaseError('operators (Setup picker list)', error); return }
+        setAllActiveOperators((data ?? []) as OperatorOption[])
+      })
+    // Feeds the "move to another job" dropdown — a list, so retired jobs are filtered out
+    // (lib/jobs). Sending an operation to a merged-away job would hide it from every screen.
+    supabase.from('jobs').select('id, name, section_id').eq('is_active', true).order('name')
+      .then(({ data }) => setAllJobRows((data ?? []) as RawJobOption[]))
   }, [supabase])
 
-  async function reloadStages() {
-    const { data } = await supabase.from('stages').select('*').order('sort_order')
-    setAllStages(sortStages((data ?? []) as Stage[]))
+  const teamOptions = lineId ? allTeams.filter((t) => t.production_line_id === lineId) : allTeams
+
+  /**
+   * The Team filter, ignored when the stored id isn't one of the teams currently on offer.
+   *
+   * THIS IS THE EMPTY SECTIONS PANE. sectionKey and jobId already fall back this way (see
+   * activeSectionKey/activeJobId below) but teamId did not, and it is persisted independently of
+   * the line. Pick Caravan + a Caravan team, switch to Motor Home in another session or after
+   * the team list changes, and localStorage restores BOTH — lineId wins for the line name, so
+   * the header says "Motor Home", while every Motor Home section is filtered against a Caravan
+   * team id and none match.
+   *
+   * That produced an empty pane with no error, because it is not a failure: sectionOptions is
+   * legitimately empty, and sectionEntries' fallback "No section" row is suppressed while a team
+   * filter is active (a team that owns no sections here genuinely has nothing to show). The two
+   * correct behaviours combined into "this line has no sections and no jobs yet" on a line with
+   * twelve of them.
+   *
+   * The stored value is left alone rather than cleared — same rule as the other two: a refresh
+   * restores the position when it still applies, and shows everything when it doesn't.
+   */
+  const activeTeamId = teamOptions.some((t) => t.id === teamId) ? teamId : ''
+
+  // ── Scope ──────────────────────────────────────────────────────────────────────────────
+  // Which line the screen is effectively looking at. Sections belong to exactly one line, so a
+  // team filter with no line chosen still resolves to that team's line — otherwise picking a
+  // team would silently switch section grouping off.
+  const scopeLineId = useMemo(() => {
+    if (lineId) return lineId
+    if (activeTeamId) return allTeams.find((t) => t.id === activeTeamId)?.production_line_id ?? ''
+    return ''
+  }, [lineId, activeTeamId, allTeams])
+
+  /**
+   * The models in scope — the "of 29 models" denominator on every job badge.
+   *
+   * Scoped by lib/lines rather than by fetching every product and filtering on
+   * production_line_id, which is what this did before. Two reasons, and the second is the
+   * important one: it stops reading the whole products table to count one line's worth, and a
+   * pre-assembly line owns no products at all, so the old client-side filter counted zero and
+   * every badge on Chassis, Sew, Lamination and the rest read "n / 0 models".
+   *
+   * Re-runs on the line in scope only. "All lines" (no line chosen) yields every product, which
+   * is what the unscoped view has always meant by it.
+   */
+  useEffect(() => {
+    let cancelled = false
+    modelsForLine(supabase, scopeLineId || null)
+      .then((rows) => { if (!cancelled) setLineProducts(rows) })
+      .catch((err) => { if (!cancelled) console.error('[setup] could not load models for this line:', err) })
+    return () => { cancelled = true }
+  }, [supabase, scopeLineId])
+
+  async function reloadSections() {
+    // Retired sections (merged away — see lib/sections' mergeSections) never appear in a list,
+    // a pane or a picker. Every section dropdown on this screen is built from allSections, so
+    // this one filter covers them all.
+    const { data } = await supabase.from('sections').select('*').eq('is_active', true).order('sort_order')
+    setAllSections(sortSections((data ?? []) as Section[]))
   }
 
+  /**
+   * Jobs in scope. Keyed on the LINE, not the team, because a job's team is derived from its
+   * section (see teamForJob) and jobs.team_id can lag behind a section move — filtering the
+   * query by it would drop jobs that belong to the chosen team by every rule the walk uses. The
+   * team narrowing happens client-side, over `scopedJobs` below.
+   *
+   * The team_id fallback is only for the first render, before allTeams has arrived and
+   * scopeLineId can resolve the chosen team's line; it keeps that moment from fetching every
+   * job in the database.
+   */
+  const jobsRunRef = useRef(0)
+
   async function loadJobs() {
+    // Same guard the coverage sweep below already carries. Two loadJobs calls can overlap
+    // whenever the scope changes, and the LAST TO FINISH wins rather than the last to start —
+    // a broad read is far slower than a narrow one, so without this the wrong one lands.
+    const runId = ++jobsRunRef.current
+    const isCurrent = () => jobsRunRef.current === runId
     setLoadingJobs(true)
-    let q = supabase.from('jobs').select('*, teams ( id, name )').order('name')
-    if (teamId) q = q.eq('team_id', teamId)
-    else if (lineId) q = q.eq('production_line_id', lineId)
+    // Retired jobs (merged away — see lib/jobs' mergeJobs) never appear in a pane, a list or a
+    // picker, exactly as retired sections and operations don't.
+    let q = supabase.from('jobs').select('*, teams ( id, name )').eq('is_active', true).order('name')
+    if (scopeLineId) q = q.eq('production_line_id', scopeLineId)
+    else if (activeTeamId) q = q.eq('team_id', activeTeamId)
     const { data: jobRows } = await q
+    if (!isCurrent()) return
 
     const loadedJobs: Job[] = ((jobRows ?? []) as unknown as RawJob[]).map((r) => ({
       id: r.id, name: r.name, primary_operator_id: r.primary_operator_id,
-      team_id: r.team_id, production_line_id: r.production_line_id, stage_id: r.stage_id,
+      team_id: r.team_id, production_line_id: r.production_line_id, section_id: r.section_id,
       created_at: r.created_at,
       teams: one(r.teams),
     }))
@@ -245,6 +388,7 @@ export default function SetupClient({ lines, role, userId }: Props) {
 
     const jobIds = loadedJobs.map((j) => j.id)
     if (jobIds.length === 0) { setOperationsByJob({}); setLoadingJobs(false); return }
+
 
     const grouped: Record<string, Operation[]> = {}
     for (const chunk of chunked(jobIds, READ_CHUNK)) {
@@ -266,55 +410,82 @@ export default function SetupClient({ lines, role, userId }: Props) {
         ;(grouped[op.job_id] ??= []).push(op)
       }
     }
+    if (!isCurrent()) return
     setOperationsByJob(grouped)
     setLoadingJobs(false)
   }
 
-  useEffect(() => { loadJobs() }, [supabase, lineId, teamId])
+  useEffect(() => {
+    if (!filtersRestored) return
+    loadJobs()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [supabase, scopeLineId, activeTeamId, filtersRestored])
 
   // ── Per-operation coverage for everything currently loaded ─────────────────────────────
-  // One pass over the whole scoped set (not per visible row), so drilling between stages/jobs
+  // One pass over the whole scoped set (not per visible row), so drilling between sections/jobs
   // or typing in the search box re-renders badges from data already in hand instead of firing
   // a fresh round of queries per keystroke.
-  const loadedOperationIds = useMemo(
-    () => Object.values(operationsByJob).flat().map((o) => o.id).sort(),
+  /**
+   * Keyed by CONTENT, not by identity. operationsByJob is a fresh object after every loadJobs —
+   * including a refreshAll that changed nothing — and a fresh array dependency re-ran this whole
+   * sweep each time. The joined string is the actual dependency; the array is derived from it,
+   * so it only changes identity when the id SET changes.
+   */
+  const loadedOperationIdsKey = useMemo(
+    () => Object.values(operationsByJob).flat().map((o) => o.id).sort().join(','),
     [operationsByJob]
+  )
+  const loadedOperationIds = useMemo(
+    () => (loadedOperationIdsKey ? loadedOperationIdsKey.split(',') : []),
+    [loadedOperationIdsKey]
   )
   const coverageRunRef = useRef(0)
 
   useEffect(() => {
     const runId = ++coverageRunRef.current
-    if (loadedOperationIds.length === 0) { setCoverageByOp({}); setLoadingCoverage(false); return }
+    if (loadedOperationIds.length === 0) { setCoverageByOp({}); setModelLinkPairs([]); setLoadingCoverage(false); return }
 
     let cancelled = false
     async function load() {
       setLoadingCoverage(true)
       try {
-        const modelOperations: { operation_id: string; product_id: string }[] = []
-        for (const chunk of chunked(loadedOperationIds, READ_CHUNK)) {
-          const { data, error } = await supabase
+        // All three reads go through fetchAllChunked: the id lists are still chunked at
+        // READ_CHUNK for URL length, and each chunk is now PAGED, because a 150-operation chunk
+        // asks for far more than the 1000-row response cap (this operation alone has 34 models)
+        // and the excess used to be dropped silently — which is exactly why every badge read
+        // "0 / 0". Each query carries a total order over its primary key, without which paging
+        // could repeat rows on one page and skip them on the next.
+        const modelOperations = await fetchAllChunked<{ operation_id: string; product_id: string }>(
+          loadedOperationIds, READ_CHUNK,
+          (chunk) => supabase
             .from('model_operations').select('operation_id, product_id').in('operation_id', chunk)
-          if (error) throw new Error(error.message)
-          modelOperations.push(...((data ?? []) as { operation_id: string; product_id: string }[]))
-        }
+            .order('operation_id').order('product_id'),
+          { table: 'model_operations' }
+        )
 
-        const operationTimes: { id: string; operation_id: string }[] = []
-        for (const chunk of chunked(loadedOperationIds, READ_CHUNK)) {
-          const { data, error } = await supabase
+        // NOT filtered to the current record, and it must never be: this feeds the coverage
+        // badges, and coverage asks "has this ever been timed?", not "what is the figure?". A
+        // pair whose only records are archived has still been timed. Filtering here would move
+        // coverage as a side effect of the labour-content rule, which is exactly what must not
+        // happen. It reads no minutes at all — see lib/coverage.ts.
+        const operationTimes = await fetchAllChunked<{ id: string; operation_id: string }>(
+          loadedOperationIds, READ_CHUNK,
+          (chunk) => supabase
             .from('operation_times').select('id, operation_id').in('operation_id', chunk)
-          if (error) throw new Error(error.message)
-          operationTimes.push(...((data ?? []) as { id: string; operation_id: string }[]))
-        }
+            .order('id'),
+          { table: 'operation_times' }
+        )
 
-        const operationTimeModels: { operation_time_id: string; product_id: string }[] = []
-        for (const chunk of chunked(operationTimes.map((t) => t.id), READ_CHUNK)) {
-          const { data, error } = await supabase
+        const operationTimeModels = await fetchAllChunked<{ operation_time_id: string; product_id: string }>(
+          operationTimes.map((t) => t.id), READ_CHUNK,
+          (chunk) => supabase
             .from('operation_time_models').select('operation_time_id, product_id').in('operation_time_id', chunk)
-          if (error) throw new Error(error.message)
-          operationTimeModels.push(...((data ?? []) as { operation_time_id: string; product_id: string }[]))
-        }
+            .order('operation_time_id').order('product_id'),
+          { table: 'operation_time_models' }
+        )
 
         if (cancelled || coverageRunRef.current !== runId) return
+        setModelLinkPairs(modelOperations)
         setCoverageByOp(computeOperationCoverage({
           operationIds: loadedOperationIds, modelOperations, operationTimes, operationTimeModels,
         }))
@@ -323,6 +494,7 @@ export default function SetupClient({ lines, role, userId }: Props) {
         // badges fall back to "—" and the rest of the page keeps working.
         if (!cancelled && coverageRunRef.current === runId) {
           setCoverageByOp({})
+          setModelLinkPairs([])
           console.error('[setup] could not load operation coverage:', err)
         }
       } finally {
@@ -331,30 +503,90 @@ export default function SetupClient({ lines, role, userId }: Props) {
     }
     load()
     return () => { cancelled = true }
-  }, [supabase, loadedOperationIds])
+  }, [supabase, loadedOperationIds, applicabilityVersion])
+
+  /**
+   * ── Per-job model applicability, derived from the sweep above ─────────────────────────
+   *
+   * "A job applies to a model if ANY of its operations is linked to it" — the settled job-level
+   * rollup (lib/modelOperations' jobsApplying), computed here over the rows the coverage sweep
+   * ALREADY fetched. No per-job query, nothing fetched inside a map, no extra effect: the
+   * model_operations read count for a page load is exactly what it was.
+   *
+   * Both dependencies are state that changes only when a load completes, never per render, so
+   * this recomputes once per sweep rather than on every keystroke in the search box.
+   *
+   * NOT to be confused with the coverage badge on operation rows: that one is timed/linked for
+   * one operation, this is applies/all-models-on-the-line for a whole job. See JobsPane.
+   */
+  const jobModelIds = useMemo(() => {
+    const jobByOperation = new Map<string, string>()
+    for (const [jid, ops] of Object.entries(operationsByJob)) for (const o of ops) jobByOperation.set(o.id, jid)
+    const byJob = new Map<string, Set<string>>()
+    for (const pair of modelLinkPairs) {
+      const jid = jobByOperation.get(pair.operation_id)
+      if (!jid) continue
+      const set = byJob.get(jid)
+      if (set) set.add(pair.product_id)
+      else byJob.set(jid, new Set([pair.product_id]))
+    }
+    return byJob
+  }, [modelLinkPairs, operationsByJob])
+
+  const jobModelCounts = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const [jid, set] of jobModelIds) counts.set(jid, set.size)
+    return counts
+  }, [jobModelIds])
+
+  /** The denominator: models on the line in scope — see the loader above. Deliberately NOT
+   * re-filtered by production_line_id here: on a pre-assembly line these rows carry the id of
+   * the BUILD line the model really belongs to, and re-filtering would zero the count again. */
+  const lineProductCount = scopeLineId ? lineProducts.length : 0
+
+  // ── The job's model panel ──────────────────────────────────────────────────────────────
+  // Reuses BulkModelLinkDrawer rather than adding a second drawer or a second write path; the
+  // per-job variant is that component in "job mode" — see jobLinkCounts there.
+  const [modelJob, setModelJob] = useState<Job | null>(null)
+  const {
+    open: jobModelsOpen, visible: jobModelsVisible,
+    openDrawer: showJobModels, closeDrawer: hideJobModels,
+  } = useSlideOverDrawer()
+
+  const modelJobOperations = useMemo(
+    () => (modelJob ? operationsByJob[modelJob.id] ?? [] : []),
+    [modelJob, operationsByJob]
+  )
+
+  /**
+   * How many of THIS job's operations each model is linked to — the "3 of 8 operations" partial
+   * state. Same rows as the badge, narrowed to one job, so the panel and the badge cannot
+   * disagree and neither costs a read.
+   */
+  const modelJobLinkCounts = useMemo(() => {
+    const counts = new Map<string, number>()
+    if (!modelJob) return counts
+    const opIds = new Set(modelJobOperations.map((o) => o.id))
+    for (const pair of modelLinkPairs) {
+      if (!opIds.has(pair.operation_id)) continue
+      counts.set(pair.product_id, (counts.get(pair.product_id) ?? 0) + 1)
+    }
+    return counts
+  }, [modelJob, modelJobOperations, modelLinkPairs])
+
+  function openJobModels(job: Job) {
+    setModelJob(job)
+    showJobModels()
+  }
 
   // Refresh the "move to another job" list too, so a job just added/renamed/deleted shows up
   // there without a full page reload.
   async function refreshAll() {
     await loadJobs()
-    const { data } = await supabase.from('jobs').select('id, name, teams ( id, name )').order('name')
-    setAllJobOptions(((data ?? []) as unknown as RawJobOption[]).map((r) => {
-      const team = one(r.teams)
-      return { id: r.id, label: team ? `${r.name} — ${team.name}` : r.name }
-    }))
+    // Same list, same filter as the initial load above — see lib/jobs.
+    const { data } = await supabase.from('jobs').select('id, name, section_id').eq('is_active', true).order('name')
+    setAllJobRows((data ?? []) as RawJobOption[])
   }
-
-  const teamOptions = lineId ? allTeams.filter((t) => t.production_line_id === lineId) : allTeams
-
-  // ── Scope ──────────────────────────────────────────────────────────────────────────────
-  // Which line the screen is effectively looking at. Stages belong to exactly one line, so a
-  // team filter with no line chosen still resolves to that team's line — otherwise picking a
-  // team would silently switch stage grouping off.
-  const scopeLineId = useMemo(() => {
-    if (lineId) return lineId
-    if (teamId) return allTeams.find((t) => t.id === teamId)?.production_line_id ?? ''
-    return ''
-  }, [lineId, teamId, allTeams])
 
   const scopeLineName = lines.find((l) => l.id === scopeLineId)?.name ?? null
   const scopeTeams = useMemo(
@@ -362,66 +594,114 @@ export default function SetupClient({ lines, role, userId }: Props) {
     [allTeams, scopeLineId]
   )
 
-  /** The scoped line's stages, in walk order. Deliberately NOT narrowed by the team filter: a
-   * stage belongs to one team, but a job sitting in it doesn't have to, so filtering here would
-   * hide the very stage a filtered job is grouped under. */
-  const stageOptions = useMemo(
-    () => (scopeLineId ? sortStages(allStages.filter((s) => s.production_line_id === scopeLineId)) : []),
-    [allStages, scopeLineId]
+  /**
+   * The scoped line's sections, in walk order — narrowed by the Team filter, because a section
+   * belongs to exactly one team and a job's team now comes FROM its section. Choosing a team is
+   * therefore choosing that team's part of the walk, and the sections it doesn't own have
+   * nothing in them to show.
+   */
+  const sectionOptions = useMemo(() => {
+    if (!scopeLineId) return []
+    const onLine = allSections.filter((s) => s.production_line_id === scopeLineId)
+    return sortSections(activeTeamId ? onLine.filter((s) => s.team_id === activeTeamId) : onLine)
+  }, [allSections, scopeLineId, activeTeamId])
+
+  /** Every loaded section by id — the lookup teamForJob reads a job's team through. Built from
+   * ALL sections, not the scoped ones: a job's team is a property of the section it points at,
+   * whether or not that section is in the current view. */
+  /** Team names for the derived job-team the panes show. */
+  const teamNameById = useMemo(() => new Map(allTeams.map((t) => [t.id, t.name])), [allTeams])
+
+  const sectionsById = useMemo(() => new Map(allSections.map((s) => [s.id, s])), [allSections])
+
+  /** The "move to another job" labels, with each job's team derived through its section. */
+  const allJobOptions = useMemo<JobMoveOption[]>(() => allJobRows.map((r) => {
+    const jobTeamId = teamForJob(r, sectionsById)
+    const teamName = jobTeamId ? teamNameById.get(jobTeamId) ?? null : null
+    return { id: r.id, label: teamName ? `${r.name} — ${teamName}` : r.name }
+  }), [allJobRows, sectionsById, teamNameById])
+
+  /**
+   * The jobs the panes actually work over. The Team filter is applied here, on the team derived
+   * from each job's section, so it agrees with the section list above rather than with whatever
+   * jobs.team_id happens to say.
+   */
+  const scopedJobs = useMemo(
+    () => (activeTeamId ? jobs.filter((j) => teamForJob(j, sectionsById) === activeTeamId) : jobs),
+    [jobs, activeTeamId, sectionsById]
   )
 
-  // ── Pane 1 data: stages + the virtual Unstaged bucket ──────────────────────────────────
-  /** Loaded jobs bucketed by the pane-1 entry they belong to. A job whose stage_id is null, or
-   * points at a stage outside this line, lands in Unstaged — the same rule /tryouts' walk uses. */
-  const jobsByStageKey = useMemo(() => {
+  // ── Pane 1 data: the line's sections, its unsorted tray, and the legacy stray bucket ───
+  /** The unsorted tray jobs fall back to: the scoped TEAM's tray on the scoped line. There is
+   * one tray per team now, so with no team filtered the line has several and none of them is
+   * "the line's" — findSectionTray returns null and the stray jobs land in the virtual bucket
+   * below, which is where work belonging to no team in view belongs. */
+  const noSectionTray = useMemo(
+    () => findSectionTray(allSections, scopeLineId, activeTeamId),
+    [allSections, scopeLineId, activeTeamId]
+  )
+
+  /**
+   * Loaded jobs bucketed by the pane-1 row they belong under: their own section when it is in
+   * view, otherwise the line's unsorted tray — which is where a job with no section_id (or one
+   * pointing at another line's section) belongs. UNSECTIONED_KEY is only the last resort, for a
+   * view with no line in scope and for a line whose tray row is missing.
+   */
+  const jobsBySectionKey = useMemo(() => {
     const map = new Map<string, Job[]>()
-    const known = new Set(stageOptions.map((s) => s.id))
-    for (const job of jobs) {
-      const key = job.stage_id && known.has(job.stage_id) ? job.stage_id : UNSTAGED_KEY
+    const known = new Set(sectionOptions.map((s) => s.id))
+    const trayKey = noSectionTray && known.has(noSectionTray.id) ? noSectionTray.id : UNSECTIONED_KEY
+    for (const job of scopedJobs) {
+      const key = job.section_id && known.has(job.section_id) ? job.section_id : trayKey
       const list = map.get(key)
       if (list) list.push(job)
       else map.set(key, [job])
     }
     return map
-  }, [jobs, stageOptions])
+  }, [scopedJobs, sectionOptions, noSectionTray])
 
   /**
-   * Pane 1's rows: the line's stages in walk order, plus "Unstaged" at the bottom whenever it
-   * holds anything. A line with no stages at all (Caravan, Motor Home) gets Unstaged as its
-   * single entry — every job lives there, and no empty stage scaffolding is invented.
+   * Pane 1's rows: the line's sections in walk order, plus "Unsectioned" at the bottom whenever it
+   * holds anything. A line with no sections at all gets Unsectioned as its single entry — every
+   * job lives there, and no empty section scaffolding is invented.
+   *
+   * That fallback row is suppressed while a team filter is active, because a team that owns no
+   * sections on this line genuinely has nothing to show. Correct — but combined with a STALE
+   * team id it rendered a fully-sectioned line as empty, which is what activeTeamId now prevents.
    */
-  const stageEntries = useMemo<StageEntry[]>(() => {
-    const entries: StageEntry[] = stageOptions.map((s) => ({
-      key: s.id, name: s.name, stage: s, jobCount: (jobsByStageKey.get(s.id) ?? []).length,
+  const sectionEntries = useMemo<SectionEntry[]>(() => {
+    const entries: SectionEntry[] = sectionOptions.map((s) => ({
+      key: s.id, name: s.name, section: s, jobCount: (jobsBySectionKey.get(s.id) ?? []).length,
     }))
-    const unstagedCount = (jobsByStageKey.get(UNSTAGED_KEY) ?? []).length
-    if (stageOptions.length === 0 || unstagedCount > 0) {
-      // With no line in scope the bucket holds every job in the filter — staged ones included,
-      // since their stages belong to lines this view isn't looking at — so it isn't "Unstaged".
+    // The virtual bucket, only where a real tray can't stand in: anything that actually landed
+    // there is shown rather than silently dropped, and an empty pane with no line in scope still
+    // gets its "All jobs" row. With a tray in view this count is 0 and no row is added.
+    const strayCount = (jobsBySectionKey.get(UNSECTIONED_KEY) ?? []).length
+    if (strayCount > 0 || (sectionOptions.length === 0 && !activeTeamId)) {
       entries.push({
-        key: UNSTAGED_KEY,
-        name: scopeLineId ? 'Unstaged' : 'All jobs',
-        stage: null,
-        jobCount: unstagedCount,
+        key: UNSECTIONED_KEY,
+        name: scopeLineId ? 'No section' : 'All jobs',
+        section: null,
+        jobCount: strayCount,
       })
     }
     return entries
-  }, [stageOptions, jobsByStageKey, scopeLineId])
+  }, [sectionOptions, jobsBySectionKey, scopeLineId, activeTeamId])
 
-  // A persisted id can outlive the scope it was chosen in (line changed, stage deleted, job
+  // A persisted id can outlive the scope it was chosen in (line changed, section deleted, job
   // moved). Rather than write over the stored value, fall back to "nothing selected" whenever
   // the id isn't among the options actually available right now — so a refresh restores the
   // position when it still exists, and shows an empty state when it doesn't.
-  const activeStageKey = stageEntries.some((e) => e.key === stageKey) ? stageKey : ''
-  const activeStageEntry = stageEntries.find((e) => e.key === activeStageKey) ?? null
+  const activeSectionKey = sectionEntries.some((e) => e.key === sectionKey) ? sectionKey : ''
+  const activeSectionEntry = sectionEntries.find((e) => e.key === activeSectionKey) ?? null
 
   // ── Pane 2 data ────────────────────────────────────────────────────────────────────────
-  const jobsInStage = useMemo(
-    () => (activeStageKey ? jobsByStageKey.get(activeStageKey) ?? [] : []),
-    [activeStageKey, jobsByStageKey]
+  const jobsInSection = useMemo(
+    () => (activeSectionKey ? jobsBySectionKey.get(activeSectionKey) ?? [] : []),
+    [activeSectionKey, jobsBySectionKey]
   )
-  const activeJobId = jobsInStage.some((j) => j.id === jobId) ? jobId : ''
-  const selectedJob = jobsInStage.find((j) => j.id === activeJobId) ?? null
+  const activeJobId = jobsInSection.some((j) => j.id === jobId) ? jobId : ''
+  const selectedJob = jobsInSection.find((j) => j.id === activeJobId) ?? null
 
   // ── Pane 3 data ────────────────────────────────────────────────────────────────────────
   const operations = useMemo(
@@ -431,9 +711,30 @@ export default function SetupClient({ lines, role, userId }: Props) {
   const activeOperationId = operations.some((o) => o.id === operationId) ? operationId : ''
   const selectedOperation = operations.find((o) => o.id === activeOperationId) ?? null
 
+  /**
+   * Pane 3's merge mode — the same hook the Sections and Jobs panes mount, at the operation
+   * level. The pane is already scoped to one job, so every row shares a group; the key is
+   * computed from job_id anyway, because that is the rule lib/mergeOperations enforces and the
+   * two must not be able to disagree.
+   */
+  const opMergeRows = useMemo<MergeRow<Operation>[]>(
+    () => operations.map((op) => ({ id: op.id, name: op.name, groupKey: `job:${op.job_id}`, subject: op })),
+    [operations]
+  )
+  const opMerge = useMergeMode({
+    level: 'operation',
+    supabase,
+    userId,
+    rows: opMergeRows,
+    onMerged: async () => {
+      await refreshAll()
+      setPanelDataVersion((v) => v + 1)
+    },
+  })
+
   // ── Drill actions ──────────────────────────────────────────────────────────────────────
-  function selectStage(key: string) {
-    setStageKey(key)
+  function selectSection(key: string) {
+    setSectionKey(key)
     setJobId('')
     setOperationId('')
   }
@@ -443,66 +744,93 @@ export default function SetupClient({ lines, role, userId }: Props) {
   }
 
   /** Search's "take me to it": set all three panes at once so the operation is on screen in
-   * context (its stage, its job) rather than as a lone row. */
+   * context (its section, its job) rather than as a lone row. */
   function revealOperation(op: Operation, job: Job) {
-    const inLine = job.stage_id && stageOptions.some((s) => s.id === job.stage_id)
-    setStageKey(inLine ? (job.stage_id as string) : UNSTAGED_KEY)
+    const inLine = job.section_id && sectionOptions.some((s) => s.id === job.section_id)
+    setSectionKey(inLine ? (job.section_id as string) : UNSECTIONED_KEY)
     setJobId(job.id)
     setOperationId(op.id)
   }
+
+  /**
+   * Deep-linked operation merge: arm the pane's merge mode with this operation already ticked,
+   * leaving the TARGET to be chosen here — which is the whole point of sending the user to this
+   * screen instead of merging from /model-total. A merge moves times and notes and retires a
+   * row for every model on the line; the choice of what survives belongs on the screen that owns
+   * the structure.
+   *
+   * Fires once, and only once the operation is actually in `operations` — merge.toggle looks the
+   * row up by id and silently ignores an id it can't find, so arming before the pane has loaded
+   * would open an empty merge mode with nothing ticked.
+   */
+  const armedMerge = useRef(false)
+  useEffect(() => {
+    if (armedMerge.current) return
+    if (initialFocus.merge !== 'operation' || !initialFocus.operationId) return
+    if (!operations.some((o) => o.id === initialFocus.operationId)) return
+    armedMerge.current = true
+    opMerge.start()
+    opMerge.toggle(initialFocus.operationId)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [operations, initialFocus])
 
   // Changing what pane 3 is showing invalidates any multi-select held against the old job.
   useEffect(() => {
     setOpMode('normal')
     setOpSelection(new Set())
-    setMergeKeeperId(null)
+    // A merge armed by the deep link must survive this — it fires on the same pass that first
+    // sets activeJobId, and cancelling here would undo it before the user sees it.
+    if (!armedMerge.current) opMerge.cancel()
     setOperatorsOpen(false)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeJobId])
 
   // ── Search across everything loaded ────────────────────────────────────────────────────
-  const stageNameById = useMemo(() => new Map(allStages.map((s) => [s.id, s.name])), [allStages])
+  const sectionNameById = useMemo(() => new Map(allSections.map((s) => [s.id, s.name])), [allSections])
   const searchTerm = search.trim().toLowerCase()
   const searching = searchTerm.length > 0
 
   /** Every operation whose name matches, anywhere in the Line/Team scope — each carries its own
-   * job (and stage) so a name that repeats across jobs is still unambiguous. */
+   * job (and section) so a name that repeats across jobs is still unambiguous. */
   const searchResults = useMemo(() => {
     if (!searching) return []
-    const rows: { operation: Operation; job: Job; stageName: string | null }[] = []
-    for (const job of jobs) {
+    const rows: { operation: Operation; job: Job; sectionName: string | null }[] = []
+    for (const job of scopedJobs) {
       for (const op of operationsByJob[job.id] ?? []) {
         if (!op.name.toLowerCase().includes(searchTerm)) continue
-        rows.push({ operation: op, job, stageName: job.stage_id ? stageNameById.get(job.stage_id) ?? null : null })
+        rows.push({ operation: op, job, sectionName: job.section_id ? sectionNameById.get(job.section_id) ?? null : null })
       }
     }
     return rows.sort((a, b) => a.operation.name.localeCompare(b.operation.name) || a.job.name.localeCompare(b.job.name))
-  }, [searching, searchTerm, jobs, operationsByJob, stageNameById])
+  }, [searching, searchTerm, scopedJobs, operationsByJob, sectionNameById])
 
+  // Raw teamId, not activeTeamId, on purpose: a stored team that no longer applies is still
+  // something Clear should be offered for and able to reset.
   const filtersActive = Boolean(lineId || teamId || search)
 
   function clearFilters() {
     setLineId(''); setTeamId(''); setSearch('')
-    setStageKey(''); setJobId(''); setOperationId('')
+    setSectionKey(''); setJobId(''); setOperationId('')
   }
 
-  // ── Stage writes (pane 1) ──────────────────────────────────────────────────────────────
-  async function afterStageChange() {
-    await reloadStages()
+  // ── Section writes (pane 1) ──────────────────────────────────────────────────────────────
+  async function afterSectionChange() {
+    await reloadSections()
     await loadJobs()
   }
 
   // ── Job writes (pane 2) ────────────────────────────────────────────────────────────────
   /**
-   * The single save path behind the job drawer: rename, then re-stage. Both are optional — the
-   * drawer only asks for what actually changed — and the re-stage goes through stages.ts'
-   * setJobStage, so the job's team/line follow the target stage rather than being written here.
+   * The single save path behind the job drawer: rename, then re-section. Both are optional — the
+   * drawer only asks for what actually changed — and the re-section goes through sections.ts'
+   * setJobSection, so the job's team/line follow the target section rather than being written here.
    *
-   * Deliberately does NOT follow the job to its new stage. Once a job moves to another team's
-   * stage the current Line→Team filter may legitimately exclude it, and chasing it would mean
+   * Deliberately does NOT follow the job to its new section. Once a job moves to another team's
+   * section the current Line→Team filter may legitimately exclude it, and chasing it would mean
    * silently rewriting the filter the user set. It drops out of the list and the returned
    * summary is what tells them where it went.
    */
-  async function saveJobEdit(job: Job, name: string, stage: Stage | null): Promise<void> {
+  async function saveJobEdit(job: Job, name: string, section: Section | null): Promise<void> {
     setPageError(null)
     const trimmed = name.trim()
 
@@ -511,12 +839,12 @@ export default function SetupClient({ lines, role, userId }: Props) {
       if (error) throw new Error(error.message)
     }
 
-    const currentStageId = job.stage_id ?? null
-    if ((stage?.id ?? null) !== currentStageId) {
-      await setJobStage(supabase, job.id, stage)
+    const currentSectionId = job.section_id ?? null
+    if ((section?.id ?? null) !== currentSectionId) {
+      await setJobSection(supabase, job.id, section)
     }
 
-    await reloadStages()
+    await reloadSections()
     await refreshAll()
   }
 
@@ -540,16 +868,18 @@ export default function SetupClient({ lines, role, userId }: Props) {
 
   async function addJob(name: string) {
     const trimmed = name.trim()
-    if (!trimmed || !activeStageEntry) return
+    if (!trimmed || !activeSectionEntry) return
     setPageError(null)
-    const stage = activeStageEntry.stage
+    // Adding under the virtual bucket still lands the job in the line's real tray, so a job is
+    // never created with a null section_id where a tray exists to hold it.
+    const section = activeSectionEntry.section ?? noSectionTray
     const { data, error } = await supabase.from('jobs').insert({
       name: trimmed,
-      // Line and team come from the pane context: the scoped line, and the team filter if one
-      // is set — otherwise the stage's own team, which is the team that stage belongs to.
       production_line_id: scopeLineId || null,
-      team_id: teamId || stage?.team_id || null,
-      stage_id: stage?.id ?? null,
+      // The SECTION owns the team — the same rule setJobSection enforces on a move. A job added
+      // to the unsorted tray gets no team, because unsorted work isn't anybody's yet.
+      team_id: section?.team_id ?? null,
+      section_id: section?.id ?? null,
     }).select('id').single()
     if (error) { setPageError(error.message); return }
     await refreshAll()
@@ -596,11 +926,10 @@ export default function SetupClient({ lines, role, userId }: Props) {
     await refreshAll()
   }
 
-  // ── Pane 3 multi-select (shared by bulk-link and merge) ────────────────────────────────
-  function enterMode(mode: 'bulk' | 'merge') {
+  // ── Pane 3 multi-select (bulk model linking) ───────────────────────────────────────────
+  function enterMode(mode: 'bulk') {
     setOpMode((cur) => (cur === mode ? 'normal' : mode))
     setOpSelection(new Set())
-    setMergeKeeperId(null)
     setPageError(null)
   }
 
@@ -609,15 +938,10 @@ export default function SetupClient({ lines, role, userId }: Props) {
     if (next.has(id)) next.delete(id)
     else next.add(id)
     setOpSelection(next)
-    // The keeper always has to be one of the selected operations — default to the first picked
-    // and only move it when the current keeper is deselected.
-    if (!mergeKeeperId || !next.has(mergeKeeperId)) setMergeKeeperId([...next][0] ?? null)
   }
 
   function setAllOpSelection(selected: boolean) {
-    const next = selected ? new Set(operations.map((o) => o.id)) : new Set<string>()
-    setOpSelection(next)
-    setMergeKeeperId(selected ? operations[0]?.id ?? null : null)
+    setOpSelection(selected ? new Set(operations.map((o) => o.id)) : new Set<string>())
   }
 
   // Only operations still present in the job count — one deleted or moved away under the
@@ -626,8 +950,6 @@ export default function SetupClient({ lines, role, userId }: Props) {
     () => operations.filter((o) => opSelection.has(o.id)),
     [operations, opSelection]
   )
-  const mergeKeeper = selectedOperations.find((o) => o.id === mergeKeeperId) ?? null
-  const mergeDups = mergeKeeper ? selectedOperations.filter((o) => o.id !== mergeKeeper.id) : []
 
   // Slide-in choreography and Escape handling come from the shared drawer module.
   const {
@@ -648,38 +970,12 @@ export default function SetupClient({ lines, role, userId }: Props) {
     window.setTimeout(() => setOperationDrawer(null), 320)
   }
 
-  /**
-   * Merge — lib/mergeOperations, the same helper /tryouts and /collect call. It owns the write
-   * order, the all-or-nothing ownership guard and the post-move verification; this handler only
-   * decides what to do with the outcome on this screen.
-   */
-  async function runMerge(keeper: Operation, dups: Operation[]) {
-    setMerging(true)
-    setPageError(null)
-    try {
-      const { stranded } = await mergeOperations(supabase, { keeper, dups, userId })
-      await refreshAll()
-      setPanelDataVersion((v) => v + 1)
-      setOperationId(keeper.id)
-      setOpSelection(new Set())
-      setMergeKeeperId(null)
-      if (stranded.length > 0) setPageError(strandedMergeMessage(stranded))
-      else setOpMode('normal')
-    } catch (err) {
-      await refreshAll()
-      setPageError(err instanceof Error ? err.message : 'Merge failed')
-    } finally {
-      setMerging(false)
-      setMergeConfirm(null)
-    }
-  }
-
   return (
     <main className="page-wide">
       <div style={{ marginBottom: 16 }}>
         <h1 style={{ fontSize: 24, fontWeight: 700, color: 'var(--text)', margin: 0 }}>Setup</h1>
         <p style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 4 }}>
-          Drill down the line&apos;s structure — Stage → Job → Operation → Models. Each column is filled by what you pick in the one to its left.
+          Drill down the line&apos;s structure — Section → Job → Operation → Models. Each column is filled by what you pick in the one to its left.
         </p>
       </div>
 
@@ -689,15 +985,15 @@ export default function SetupClient({ lines, role, userId }: Props) {
           <select
             style={SEL}
             value={lineId}
-            onChange={(e) => { setLineId(e.target.value); setTeamId(''); setStageKey(''); setJobId(''); setOperationId('') }}
+            onChange={(e) => { setLineId(e.target.value); setTeamId(''); setSectionKey(''); setJobId(''); setOperationId('') }}
           >
             <option value="">All production lines</option>
             {lines.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
           </select>
           <select
             style={SEL}
-            value={teamId}
-            onChange={(e) => { setTeamId(e.target.value); setStageKey(''); setJobId(''); setOperationId('') }}
+            value={activeTeamId}
+            onChange={(e) => { setTeamId(e.target.value); setSectionKey(''); setJobId(''); setOperationId('') }}
           >
             <option value="">All teams</option>
             {teamOptions.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
@@ -710,6 +1006,19 @@ export default function SetupClient({ lines, role, userId }: Props) {
             onChange={(e) => setSearch(e.target.value)}
             style={{ flex: 1, minWidth: 240, fontSize: 13 }}
           />
+          {/* Structure reconciliation, not structure browsing. It needs ONE line: duplicate
+              names only mean anything within a line, and job merge cannot cross one anyway. */}
+          <button
+            type="button"
+            className="btn-ghost"
+            disabled={!scopeLineId}
+            title={scopeLineId
+              ? 'Find job names that appear more than once on this line, with the operations and recorded times behind each copy'
+              : 'Pick a single production line first — duplicate names are only meaningful within one'}
+            onClick={() => setDuplicatesOpen(true)}
+          >
+            Duplicate jobs
+          </button>
           {filtersActive && (
             <button
               type="button"
@@ -733,7 +1042,7 @@ export default function SetupClient({ lines, role, userId }: Props) {
             </div>
           </div>
           <div style={{ maxHeight: 260, overflowY: 'auto' }}>
-            {searchResults.map(({ operation, job, stageName }) => (
+            {searchResults.map(({ operation, job, sectionName }) => (
               <button
                 key={operation.id}
                 type="button"
@@ -749,8 +1058,8 @@ export default function SetupClient({ lines, role, userId }: Props) {
                   <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>{operation.name}</span>
                   <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
                     {job.name}
-                    {stageName && <> · {stageName}</>}
-                    {job.teams?.name && <> · {job.teams.name}</>}
+                    {sectionName && <> · {sectionName}</>}
+                    <> · {teamNameForJob(job, sectionsById, teamNameById)}</>
                   </span>
                 </span>
                 <CoverageBadge coverage={coverageByOp[operation.id]} loading={loadingCoverage} />
@@ -762,7 +1071,7 @@ export default function SetupClient({ lines, role, userId }: Props) {
 
       {pageError && <p style={{ ...ERR_BOX, marginBottom: 16 }}>{pageError}</p>}
 
-      {/* Where a just-moved job went. A job reassigned to another team's stage legitimately
+      {/* Where a just-moved job went. A job reassigned to another team's section legitimately
           drops out of the current Line→Team filter, so without this it would simply vanish. */}
       {jobNotice && (
         <div style={{ ...OK_BOX, marginBottom: 16, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
@@ -779,29 +1088,43 @@ export default function SetupClient({ lines, role, userId }: Props) {
       )}
 
       <div className="finder-panes">
-        <StagesPane
+        <SectionsPane
           supabase={supabase}
-          entries={stageEntries}
-          stages={stageOptions}
+          entries={sectionEntries}
+          sections={sectionOptions}
           productionLineId={scopeLineId}
           productionLineName={scopeLineName}
           teams={scopeTeams}
-          selectedKey={activeStageKey}
-          onSelect={selectStage}
-          onChanged={afterStageChange}
+          selectedKey={activeSectionKey}
+          // Section merge, the same control /tryouts and /collect get — one component, one lib.
+          allowMerge
+          onSelect={selectSection}
+          onChanged={afterSectionChange}
         />
 
         <JobsPane
-          entry={activeStageEntry}
-          jobs={jobsInStage}
+          supabase={supabase}
+          userId={userId}
+          onChanged={refreshAll}
+          sectionsById={sectionsById}
+          teamNameById={teamNameById}
+          entry={activeSectionEntry}
+          jobs={jobsInSection}
           loading={loadingJobs}
           operationsByJob={operationsByJob}
           selectedJobId={activeJobId}
+          modelApplicability={{
+            countByJobId: jobModelCounts,
+            total: lineProductCount,
+            loading: loadingCoverage,
+            onOpen: openJobModels,
+          }}
+          autoStartMergeJobId={initialFocus.merge === 'job' ? initialFocus.jobId : undefined}
           canDelete={role === 'admin'}
           onSelect={selectJob}
           onAdd={addJob}
           onEdit={openJobDrawer}
-          onEditTeamLine={(job) => setJobModal({ mode: 'edit', job })}
+          onEditLine={(job) => setJobModal({ mode: 'edit', job })}
           onDeleteRequest={requestDeleteJob}
         />
 
@@ -816,8 +1139,8 @@ export default function SetupClient({ lines, role, userId }: Props) {
           canDelete={role === 'admin'}
           mode={opMode}
           selection={opSelection}
-          mergeKeeperId={mergeKeeperId}
-          merging={merging}
+          merge={opMerge}
+          mergeRows={opMergeRows}
           operatorsOpen={operatorsOpen}
           selectedOperation={selectedOperation}
           onSelect={setOperationId}
@@ -828,9 +1151,7 @@ export default function SetupClient({ lines, role, userId }: Props) {
           onEnterMode={enterMode}
           onToggleSelection={toggleOpSelection}
           onSetAllSelection={setAllOpSelection}
-          onPickKeeper={setMergeKeeperId}
           onOpenBulkDrawer={openBulkDrawer}
-          onRequestMerge={() => { if (mergeKeeper && mergeDups.length > 0) setMergeConfirm({ keeper: mergeKeeper, dups: mergeDups }) }}
           onToggleOperators={() => setOperatorsOpen((v) => !v)}
           onOperatorChange={refreshAll}
         />
@@ -849,9 +1170,8 @@ export default function SetupClient({ lines, role, userId }: Props) {
           mode={jobModal.mode}
           job={jobModal.job}
           defaultLineId={lineId}
-          defaultTeamId={teamId}
           lines={lines}
-          allTeams={allTeams}
+          sections={allSections}
           supabase={supabase}
           onClose={() => setJobModal(null)}
           onSaved={refreshAll}
@@ -919,20 +1239,9 @@ export default function SetupClient({ lines, role, userId }: Props) {
           onCancel={() => setConfirmDeleteJob(null)}
         />
       )}
-      {mergeConfirm && (
-        <ConfirmDialog
-          title={`Merge ${plural(mergeConfirm.dups.length, 'operation')} into "${mergeConfirm.keeper.name}"`}
-          message={`Move all recorded times and notes from the selected operations onto ${mergeConfirm.keeper.name}, then retire the others. They'll stop appearing across the app. This can be reversed by reactivating them in the database.`}
-          confirmLabel={merging ? 'Merging…' : 'Merge & retire'}
-          danger
-          onConfirm={() => { if (!merging) runMerge(mergeConfirm.keeper, mergeConfirm.dups) }}
-          onCancel={() => { if (!merging) setMergeConfirm(null) }}
-        >
-          <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12, color: 'var(--text-mid)' }}>
-            {mergeConfirm.dups.map((d) => <li key={d.id}>{d.name}</li>)}
-          </ul>
-        </ConfirmDialog>
-      )}
+      {/* The operation-merge confirmation — the same component the Sections and Jobs panes use,
+        * fed by a preflight that has already run. See components/MergeMode. */}
+      <MergeConfirm merge={opMerge} />
 
       {/* ── Job edit / reassign drawer ─────────────────────────────────────────────────── */}
       {jobDrawer && (
@@ -941,10 +1250,10 @@ export default function SetupClient({ lines, role, userId }: Props) {
           <div className={'gaps-drawer' + (jobDrawerVisible ? ' gaps-drawer-visible' : '')} style={DRAWER_WIDTH}>
             <JobEditDrawer
               job={jobDrawer}
-              // Every stage on the job's OWN line, across all its teams — reassigning to
-              // another team's stage is the point, so this must not be narrowed by the Team
+              // Every section on the job's OWN line, across all its teams — reassigning to
+              // another team's section is the point, so this must not be narrowed by the Team
               // filter. Falls back to the scoped line for a job that has no line of its own.
-              stages={sortStages(allStages.filter((s) => s.production_line_id === (jobDrawer.production_line_id ?? scopeLineId)))}
+              sections={sortSections(allSections.filter((s) => s.production_line_id === (jobDrawer.production_line_id ?? scopeLineId)))}
               teams={allTeams}
               operationCount={(operationsByJob[jobDrawer.id] ?? []).length}
               onSave={saveJobEdit}
@@ -973,6 +1282,28 @@ export default function SetupClient({ lines, role, userId }: Props) {
       )}
 
       {/* ── Bulk model-link drawer: many operations × many models in one apply ─────────── */}
+      {/* ── The job's model panel ─────────────────────────────────────────────────────
+          Same drawer, same write path, in job mode — opened from the "N / M models" badge on a
+          Jobs-pane row. onApplied bumps applicabilityVersion alone rather than calling
+          refreshAll: only the applies-list changed, so re-reading jobs and operations to update
+          one badge would be work for nothing. */}
+      {jobModelsOpen && modelJob && (
+        <>
+          <div className={'gaps-drawer-overlay' + (jobModelsVisible ? ' gaps-drawer-overlay-visible' : '')} onClick={hideJobModels} />
+          <div className={'gaps-drawer' + (jobModelsVisible ? ' gaps-drawer-visible' : '')} style={DRAWER_WIDTH}>
+            <BulkModelLinkDrawer
+              productionLineId={modelJob.production_line_id ?? scopeLineId}
+              subjectLabel={modelJob.name}
+              operations={modelJobOperations}
+              jobLinkCounts={modelJobLinkCounts}
+              supabase={supabase}
+              onClose={hideJobModels}
+              onApplied={async () => { setApplicabilityVersion((v) => v + 1) }}
+            />
+          </div>
+        </>
+      )}
+
       {bulkDrawerOpen && selectedJob && (
         <>
           <div className={'gaps-drawer-overlay' + (bulkDrawerVisible ? ' gaps-drawer-overlay-visible' : '')} onClick={closeBulkDrawer} />
@@ -988,6 +1319,19 @@ export default function SetupClient({ lines, role, userId }: Props) {
           </div>
         </>
       )}
+
+      {/* Mounted only while open: it reads every job, operation and recorded time on the line,
+          and that is not work to do behind a closed drawer. */}
+      {duplicatesOpen && scopeLineId && (
+        <DuplicateJobsDrawer
+          supabase={supabase}
+          userId={userId}
+          productionLineId={scopeLineId}
+          productionLineName={scopeLineName ?? 'This line'}
+          onClose={() => setDuplicatesOpen(false)}
+          onChanged={refreshAll}
+        />
+      )}
     </main>
   )
 }
@@ -996,12 +1340,12 @@ export default function SetupClient({ lines, role, userId }: Props) {
 
 // ── Job edit / reassign slide-over ─────────────────────────────────────────────────────────
 /**
- * Rename a job and move it to another stage — including a stage belonging to a different team,
+ * Rename a job and move it to another section — including a section belonging to a different team,
  * which is the case the old footer dropdown couldn't express safely.
  *
- * The stage list is grouped by team via <optgroup>, because "Fit-out 3" means nothing without
+ * The section list is grouped by team via <optgroup>, because "Fit-out 3" means nothing without
  * knowing whose Fit-out 3 it is, and picking one silently changes the job's team (see
- * stages.ts' setJobStage). That consequence is stated in the confirm rather than discovered
+ * sections.ts' setJobSection). That consequence is stated in the confirm rather than discovered
  * afterwards, and the confirm also says what rides along: the job's operations and their
  * recorded times, which need no migration because they hang off job_id/operation_id.
  *
@@ -1009,20 +1353,23 @@ export default function SetupClient({ lines, role, userId }: Props) {
  */
 // ── Pane 3: Operations ─────────────────────────────────────────────────────────────────────
 /**
- * The selected job's active operations, each with its model-coverage badge. Two multi-select
- * modes live here rather than in a drawer of their own — "Bulk link" (apply one model set to
- * many operations at once) and "Merge" (fold duplicates into a keeper) — because both are
- * chosen from this same list. Only one is ever live, and the row turns into a checkbox for the
- * duration so the per-operation actions can't be mis-clicked.
+ * The selected job's active operations, each with its model-coverage badge.
+ *
+ * Two multi-select flows live here rather than in a drawer of their own, because both are chosen
+ * from this same list: "Bulk link" (apply one model set to many operations at once), which is
+ * local to this screen, and Merge, which is the shared merge mode from components/MergeMode —
+ * the identical affordance the Sections and Jobs panes to the left of this one offer. Only one
+ * is ever live, and the row turns into a checkbox for the duration so the per-operation actions
+ * can't be mis-clicked.
  *
  * Operator assignment sits in the footer, collapsed: it stays fully editable, but nothing on
  * this screen waits on it (phase-1: operators are context only).
  */
 function OperationsPane({
   job, operations, loading, coverageByOp, loadingCoverage, selectedOperationId, selectedOperation,
-  operators, canDelete, mode, selection, mergeKeeperId, merging, operatorsOpen,
+  operators, canDelete, mode, selection, merge, mergeRows, operatorsOpen,
   onSelect, onEdit, onAdd, onMove, onDeleteRequest, onEnterMode, onToggleSelection,
-  onSetAllSelection, onPickKeeper, onOpenBulkDrawer, onRequestMerge, onToggleOperators, onOperatorChange,
+  onSetAllSelection, onOpenBulkDrawer, onToggleOperators, onOperatorChange,
 }: {
   job: Job | null
   operations: Operation[]
@@ -1033,10 +1380,11 @@ function OperationsPane({
   selectedOperation: Operation | null
   operators: OperatorOption[]
   canDelete: boolean
-  mode: 'normal' | 'bulk' | 'merge'
+  mode: 'normal' | 'bulk'
   selection: Set<string>
-  mergeKeeperId: string | null
-  merging: boolean
+  /** The shared merge flow, owned by the screen so it survives this pane's re-renders. */
+  merge: MergeModeState
+  mergeRows: MergeRow<Operation>[]
   operatorsOpen: boolean
   onSelect: (id: string) => void
   /** Opens the shared operation editor. Distinct from onSelect so the row's click can stay
@@ -1045,12 +1393,10 @@ function OperationsPane({
   onAdd: () => void
   onMove: (op: Operation) => void
   onDeleteRequest: (op: Operation) => void
-  onEnterMode: (mode: 'bulk' | 'merge') => void
+  onEnterMode: (mode: 'bulk') => void
   onToggleSelection: (id: string) => void
   onSetAllSelection: (selected: boolean) => void
-  onPickKeeper: (id: string) => void
   onOpenBulkDrawer: () => void
-  onRequestMerge: () => void
   onToggleOperators: () => void
   onOperatorChange: () => void
 }) {
@@ -1060,21 +1406,21 @@ function OperationsPane({
 
   const subtitle = !job
     ? 'No job selected'
-    : mode === 'bulk'
-      ? `${job.name} · bulk link — ${selectedCount} selected`
-      : mode === 'merge'
-        ? `${job.name} · merge — ${selectedCount} selected`
+    : merge.active
+      ? `${job.name} · ${merge.subtitle}`
+      : mode === 'bulk'
+        ? `${job.name} · bulk link — ${selectedCount} selected`
         : `${job.name} · ${plural(operations.length, 'operation')}`
 
   return (
     <Pane
       title="Operations"
       subtitle={subtitle}
-      active={Boolean(selectedOperationId)}
+      active={merge.active ? merge.count > 0 : Boolean(selectedOperationId)}
       footer={
         job ? (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, width: '100%' }}>
-            {mode === 'bulk' ? (
+            {merge.active ? <MergeFooter merge={merge} /> : mode === 'bulk' ? (
               <>
                 <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
                   <button
@@ -1093,35 +1439,15 @@ function OperationsPane({
                   <button className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12 }} onClick={() => onEnterMode('bulk')}>Done</button>
                 </div>
               </>
-            ) : mode === 'merge' ? (
-              <>
-                <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                  {selectedCount < 2
-                    ? 'Tick two or more duplicates, then pick which one to keep.'
-                    : `Keeper: ${operations.find((o) => o.id === mergeKeeperId)?.name ?? '—'} · ${selectedCount - 1} will be retired`}
-                </span>
-                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                  <button
-                    className="btn-danger"
-                    style={{ padding: '6px 11px', fontSize: 12 }}
-                    disabled={merging || selectedCount < 2 || !mergeKeeperId}
-                    onClick={onRequestMerge}
-                  >
-                    {merging ? 'Merging…' : `Merge ${Math.max(selectedCount - 1, 0)} into keeper`}
-                  </button>
-                  <button className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12 }} disabled={merging} onClick={() => onEnterMode('merge')}>Cancel</button>
-                </div>
-              </>
             ) : (
               <>
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                   <button className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12 }} onClick={onAdd}>+ Add operation</button>
                   {operations.length > 1 && (
-                    <>
-                      <button className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12 }} onClick={() => onEnterMode('bulk')}>Bulk link</button>
-                      <button className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12 }} onClick={() => onEnterMode('merge')}>Merge</button>
-                    </>
+                    <button className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12 }} onClick={() => onEnterMode('bulk')}>Bulk link</button>
                   )}
+                  {/* The one merge affordance, in the one place it lives on every pane. */}
+                  <MergeFooter merge={merge} />
                 </div>
 
                 {selectedOperation && (
@@ -1162,19 +1488,29 @@ function OperationsPane({
         ) : undefined
       }
     >
+      <MergeNotices merge={merge} />
+
       {!job ? (
         <p className="finder-pane-empty">Select a job.</p>
       ) : loading ? (
         <p className="finder-pane-empty">Loading…</p>
+      ) : merge.active ? (
+        mergeRows.map((row) => (
+          <MergeRowItem
+            key={row.id}
+            merge={merge}
+            row={row}
+            meta={row.subject.primary_operator?.full_name ?? 'No operator'}
+          />
+        ))
       ) : operations.length === 0 ? (
         <p className="finder-pane-empty">No operations under {job.name} yet — add one below.</p>
       ) : (
         operations.map((op) => {
           const isSelected = op.id === selectedOperationId
           const isTicked = selection.has(op.id)
-          const isKeeper = mergeKeeperId === op.id
 
-          // In a select mode the row is a checkbox and nothing else — the per-operation
+          // In bulk-link mode the row is a checkbox and nothing else — the per-operation
           // actions would be a mis-click waiting to happen while the row's job is to be ticked.
           if (inSelectMode) {
             return (
@@ -1192,23 +1528,6 @@ function OperationsPane({
                   />
                   <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, flex: 1 }}>
                     <span className="finder-row-name">{op.name}</span>
-                    {mode === 'merge' && isTicked && (
-                      <span
-                        style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, fontWeight: 600, color: isKeeper ? 'var(--blue)' : 'var(--text-muted)', marginTop: 2 }}
-                        // Stopped here rather than at the label: letting the click bubble would
-                        // run the label's activation behaviour and untick the row's checkbox.
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        <input
-                          type="radio"
-                          name="merge-keeper"
-                          checked={isKeeper}
-                          onChange={() => onPickKeeper(op.id)}
-                          style={{ width: 13, height: 13, accentColor: 'var(--blue)', cursor: 'pointer' }}
-                        />
-                        Keep this one
-                      </span>
-                    )}
                   </span>
                 </span>
                 <CoverageBadge coverage={coverageByOp[op.id]} loading={loadingCoverage} />
@@ -1296,6 +1615,9 @@ interface CollectedTimeRow {
   id: string
   totalMinutes: number | null
   createdAt: string
+  /** null = this is the current record for its model; set = archived behind that record. Drives
+   * the badge on each row, so history reads as history rather than as more of the same. */
+  supersededBy: string | null
   /** operations_times.operator_id → name. Context only: "who was timed". Nothing on this
    * screen requires an operation to have a primary/secondary operator set, and this is not
    * that — it's whoever the recorded run was captured against. */
@@ -1337,9 +1659,12 @@ function OperationCoverageTimesPanel({
       try {
         const [{ data: linkRows, error: linkError }, { data: timeRows, error: timeError }] = await Promise.all([
           supabase.from('model_operations').select('product_id').eq('operation_id', operationId),
+          // Every record, current and archived — this pane IS the history for an operation, and
+          // it labels each row below. superseded_by is selected so currentForOperation can pick
+          // the figure and so each row can say which one it is.
           supabase
             .from('operation_times')
-            .select('id, total_minutes, created_at, operator_id')
+            .select('id, total_minutes, created_at, operator_id, superseded_by')
             .eq('operation_id', operationId)
             .order('created_at', { ascending: false }),
         ])
@@ -1347,11 +1672,11 @@ function OperationCoverageTimesPanel({
         if (timeError) throw new Error(timeError.message)
 
         const linkedIds = new Set((linkRows ?? []).map((r) => r.product_id as string))
-        const times = (timeRows ?? []) as { id: string; total_minutes: number | null; created_at: string; operator_id: string | null }[]
+        const times = (timeRows ?? []) as { id: string; total_minutes: number | null; created_at: string; operator_id: string | null; superseded_by: string | null }[]
         const timeIds = times.map((t) => t.id)
 
         // Which model(s) each time belongs to — operation_times carries no product_id of its
-        // own, exactly as averageForOperation and lib/coverage.ts both assume.
+        // own, exactly as currentForOperation and lib/coverage.ts both assume.
         const timeModels: { operation_time_id: string; product_id: string }[] = []
         for (const chunk of chunked(timeIds, READ_CHUNK)) {
           const { data, error: err } = await supabase
@@ -1399,14 +1724,18 @@ function OperationCoverageTimesPanel({
           id: t.id,
           totalMinutes: t.total_minutes,
           createdAt: t.created_at,
+          supersededBy: t.superseded_by,
           operatorName: t.operator_id ? operatorNameById.get(t.operator_id) ?? null : null,
           notes: notesByTime.get(t.id) ?? [],
         }]))
 
-        // The same shared averager every other screen uses — re-shaped to the (operation_id,
-        // times) rows it expects, then read back per product for this one operation.
-        const stats = averageForOperation(
-          times.map((t) => ({ id: t.id, operation_id: operationId, total_minutes: t.total_minutes })),
+        // The same shared current-record lookup every other screen uses — re-shaped to the
+        // (operation_id, times) rows it expects, then read back per product for this operation.
+        const stats = currentForOperation(
+          times.map((t) => ({
+            id: t.id, operation_id: operationId, total_minutes: t.total_minutes,
+            superseded_by: t.superseded_by, created_at: t.created_at,
+          })),
           timeModels
         )
 
@@ -1507,7 +1836,7 @@ function OperationCoverageTimesPanel({
                         <span className="gaps-drawer-item-status gaps-drawer-item-status-missing">Not yet timed</span>
                       ) : (
                         <span className="gaps-drawer-item-status gaps-drawer-item-status-ok">
-                          {group.stat ? `${group.stat.avg.toFixed(1)}m avg · ` : ''}{plural(group.times.length, 'time')}
+                          {group.stat ? `${group.stat.minutes.toFixed(1)}m · ${historyLabel(group.stat)}` : plural(group.times.length, 'time')}
                         </span>
                       )}
                     </div>
@@ -1520,7 +1849,13 @@ function OperationCoverageTimesPanel({
                             style={{ padding: '7px 9px', borderRadius: 6, background: 'var(--surface)', border: '1px solid var(--border)' }}
                           >
                             <div style={{ display: 'flex', gap: 10, alignItems: 'baseline', flexWrap: 'wrap' }}>
-                              <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)' }}>{fmtMinutes(time.totalMinutes)}m</span>
+                              <span style={{ fontSize: 13, fontWeight: 700, color: time.supersededBy ? 'var(--text-muted)' : 'var(--text)' }}>{fmtMinutes(time.totalMinutes)}m</span>
+                              {/* Which of these rows IS the figure above. Without it the list
+                                  reads as several equally-live numbers, which is what the
+                                  averaging rule used to make them. */}
+                              {time.supersededBy
+                                ? <span className="badge badge-grey">archived</span>
+                                : <span className="badge badge-green">current</span>}
                               <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
                                 Timed: {time.operatorName ?? 'Unknown operator'}
                               </span>
@@ -1656,8 +1991,15 @@ function MoveOperationModal({
     e.preventDefault()
     if (!targetJobId) return
     setSaving(true); setError(null)
-    const { error: err } = await supabase.from('operations').update({ job_id: targetJobId }).eq('id', operation.id)
-    if (err) { setError(err.message); setSaving(false); return }
+    try {
+      // The single writer of operations.job_id — the same one lib/jobs' mergeJobs re-files
+      // through, so a move means the same thing however it is reached (read-back check included).
+      await setOperationJob(supabase, operation.id, targetJobId)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not move that operation')
+      setSaving(false)
+      return
+    }
     setSaving(false)
     await onSaved()
     onClose()

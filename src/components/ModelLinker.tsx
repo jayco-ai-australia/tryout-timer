@@ -2,14 +2,16 @@
 
 import { useEffect, useMemo, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
+import { selectIn } from '@/lib/chunkedIn'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import ConfirmDialog from '@/components/ConfirmDialog'
 import {
-  addOperationTimeNote, averageForOperation, deleteOperationTimeNote, fetchOperationTimeNotes,
+  addOperationTimeNote, currentForOperation, deleteOperationTimeNote, fetchOperationTimeNotes, historyLabel,
   operationProductKey, recordOperationTime, updateOperationTimeNote, type OperationTimeStat,
 } from '@/lib/operationTimes'
 import { linkOperationsToModels, unlinkOperationsFromModels } from '@/lib/modelOperations'
 import { fmtDate, fmtMinutes } from '@/lib/format'
+import { modelsForLine } from '@/lib/lines'
 import type { OperationTimeNote, Product } from '@/lib/types'
 
 /**
@@ -58,6 +60,8 @@ interface TimeDetailRow {
   total_minutes: number | null
   created_at: string
   collectedByName: string | null
+  /** null = the current record for this model; set = archived behind that one. */
+  superseded_by: string | null
 }
 
 /**
@@ -283,14 +287,22 @@ export function ModelSeriesPicker({
             {seriesNotes?.[group.series] && (
               <p style={{ fontSize: 11, color: 'var(--text-muted)', margin: '0 0 6px' }}>{seriesNotes[group.series]}</p>
             )}
-            <div className="checkbox-list" style={{ maxHeight: 'none' }}>
+            {/* Multi-column when the rows are plain checkboxes: a 60-model series is three
+              * columns of 20 on a tablet rather than 60 lines running down past the Save
+              * button. A picker with an expandable block under a row (ModelLinker's time
+              * entry) stays single-column — that block is full-width and a grid cell would
+              * squash it. Every row is at least 44px tall either way; see .checkbox-row. */}
+            <div
+              className={'checkbox-list' + (renderRowExtra ? '' : ' checkbox-list-grid')}
+              style={{ maxHeight: 'none' }}
+            >
               {group.products.map((p) => {
                 const isSelected = selectedIds.has(p.id)
                 const extra = renderRowExtra?.(p, isSelected)
                 return (
                   <div key={p.id} className="checkbox-row" style={{ flexDirection: 'column', alignItems: 'stretch', cursor: 'default', gap: 6 }}>
                     <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, cursor: 'pointer' }}>
-                      <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
                         <input type="checkbox" checked={isSelected} onChange={() => onToggle(p, isSelected)} />
                         {p.model}
                       </span>
@@ -346,16 +358,28 @@ export default function ModelLinker({ operationId, operationName, productionLine
       { data: modelOps, error: modelOpsError },
       { data: times, error: timesError },
     ] = await Promise.all([
+      // lib/lines, not a products-by-line query: a pre-assembly line owns no products and
+      // inherits the models of the lines it feeds. Wrapped back into the { data, error } shape
+      // the destructure below expects, so a failure is collected into loadErrors with the rest
+      // rather than rejecting the whole Promise.all.
       productionLineId
-        ? supabase.from('products').select('*').eq('production_line_id', productionLineId).order('model')
+        ? modelsForLine(supabase, productionLineId)
+            .then((data) => ({ data, error: null as { message: string } | null }))
+            .catch((err: unknown) => ({
+              data: [] as Product[],
+              error: { message: err instanceof Error ? err.message : 'Could not load this line’s models' },
+            }))
         : Promise.resolve({ data: [] as Product[], error: null }),
       supabase.from('model_operations').select('product_id').eq('operation_id', operationId),
       // Flat select, no embedded relationship — collected_by's name (when needed) is merged in
       // below from a separate profiles query, so this can't fail because a relationship name
       // doesn't resolve.
+      // Every record, current and archived — this drawer lists the individual records per
+      // model, so it is a history view. superseded_by is selected so the figure can be picked by
+      // the shared helper and each record labelled with what it is.
       supabase
         .from('operation_times')
-        .select('id, total_minutes, created_at, collected_by')
+        .select('id, total_minutes, created_at, collected_by, superseded_by')
         .eq('operation_id', operationId)
         .order('created_at', { ascending: false }),
     ])
@@ -364,10 +388,15 @@ export default function ModelLinker({ operationId, operationName, productionLine
     if (timesError) loadErrors.push(timesError.message)
 
     const timeIds = (times ?? []).map((t) => t.id)
-    const [{ data: timeModels, error: timeModelsError }, notesResult] = await Promise.all([
-      timeIds.length > 0
-        ? supabase.from('operation_time_models').select('operation_time_id, product_id').in('operation_time_id', timeIds)
-        : Promise.resolve({ data: [] as { operation_time_id: string; product_id: string }[], error: null }),
+    const [timeModelsResult, notesResult] = await Promise.all([
+      // Chunked (lib/chunkedIn): timeIds is every recorded run on this operation, which grows
+      // with history — one run per model per re-measure. Feeds currentForOperation and the link
+      // list, neither of which reads it positionally, so chunk-order concatenation is fine.
+      // Errors are collected rather than thrown, like every other read in this loader.
+      selectIn<{ operation_time_id: string; product_id: string }>(timeIds, (chunk) =>
+        supabase.from('operation_time_models').select('operation_time_id, product_id').in('operation_time_id', chunk))
+        .then((data) => ({ data, error: null as string | null }))
+        .catch((err) => ({ data: [] as { operation_time_id: string; product_id: string }[], error: err instanceof Error ? err.message : 'Could not load model links' })),
       // Notes are only ever shown behind the time-entry drawer (/model-total) — /setup has no UI
       // for them, so skip the extra round trip there entirely. A failure here is caught and
       // surfaced rather than left to throw, so the rest of the drawer still loads.
@@ -377,7 +406,8 @@ export default function ModelLinker({ operationId, operationName, productionLine
             .catch((err) => ({ data: [] as OperationTimeNote[], error: err instanceof Error ? err.message : 'Could not load notes' }))
         : Promise.resolve({ data: [] as OperationTimeNote[], error: null as string | null }),
     ])
-    if (timeModelsError) loadErrors.push(timeModelsError.message)
+    const timeModels = timeModelsResult.data
+    if (timeModelsResult.error) loadErrors.push(timeModelsResult.error)
     if (notesResult.error) loadErrors.push(notesResult.error)
     const notes = notesResult.data
 
@@ -388,17 +418,25 @@ export default function ModelLinker({ operationId, operationName, productionLine
     for (const n of notes) if (n.created_by) profileIds.add(n.created_by)
     const nameById = new Map<string, string | null>()
     if (profileIds.size > 0) {
-      const { data: profileRows, error: profilesError } = await supabase
-        .from('profiles').select('id, full_name').in('id', [...profileIds])
-      if (profilesError) loadErrors.push(profilesError.message)
-      for (const row of profileRows ?? []) nameById.set(row.id, row.full_name)
+      // Chunked (lib/chunkedIn): one id per distinct author across every time and note on this
+      // operation. Feeds a Map, so chunk order is irrelevant.
+      try {
+        const profileRows = await selectIn<{ id: string; full_name: string | null }>([...profileIds], (chunk) =>
+          supabase.from('profiles').select('id, full_name').in('id', chunk))
+        for (const row of profileRows) nameById.set(row.id, row.full_name)
+      } catch (err) {
+        loadErrors.push(err instanceof Error ? err.message : 'Could not load author names')
+      }
     }
 
-    // Re-shape the (operation_id, times) rows the shared averager expects, so this stays on
-    // the exact same math as every other screen — then remap its "operationId:productId" keys
-    // down to plain productId, since this component is always scoped to one operation.
-    const rawTimes = (times ?? []).map((t) => ({ id: t.id, operation_id: operationId, total_minutes: t.total_minutes }))
-    const pairStats = averageForOperation(rawTimes, timeModels ?? [])
+    // Re-shape the (operation_id, times) rows the shared lookup expects, so this stays on the
+    // exact same rule as every other screen — then remap its "operationId:productId" keys down
+    // to plain productId, since this component is always scoped to one operation.
+    const rawTimes = (times ?? []).map((t) => ({
+      id: t.id, operation_id: operationId, total_minutes: t.total_minutes,
+      superseded_by: t.superseded_by, created_at: t.created_at,
+    }))
+    const pairStats = currentForOperation(rawTimes, timeModels)
     const nextStats: Record<string, OperationTimeStat> = {}
     for (const p of prodRows ?? []) {
       const s = pairStats[operationProductKey(operationId, p.id)]
@@ -419,8 +457,9 @@ export default function ModelLinker({ operationId, operationName, productionLine
       total_minutes: t.total_minutes,
       created_at: t.created_at,
       collectedByName: t.collected_by ? nameById.get(t.collected_by) ?? null : null,
+      superseded_by: t.superseded_by,
     })))
-    setTimeModelLinks(timeModels ?? [])
+    setTimeModelLinks(timeModels)
     setNotesByTime(nextNotesByTime)
     if (loadErrors.length > 0) setFieldError(loadErrors[0])
     setLoading(false)
@@ -435,8 +474,11 @@ export default function ModelLinker({ operationId, operationName, productionLine
   async function toggleModelLink(product: Product, isLinked: boolean) {
     setFieldError(null)
     if (isLinked) {
-      const stat = stats[product.id]
-      if (stat && stat.runs > 0) {
+      // Asked of the LINKS, not of the figure. "Has this pair ever been timed?" is the same
+      // question coverage asks, and an archived-only pair must answer yes — reading it off
+      // `stats` would tie the unlink guard to the current-record rule and quietly wave through
+      // an unlink of a model whose every record happens to be superseded.
+      if (timedProductIds.has(product.id)) {
         setBlockedUnlink({ productLabel: `${product.product_code} — ${product.model}` })
         return
       }
@@ -472,7 +514,7 @@ export default function ModelLinker({ operationId, operationName, productionLine
     const linked = seriesProducts.filter((p) => linkedProductIds.has(p.id))
     // Same integrity guard as a single unlink — a model with recorded times is kept, not
     // silently dropped, and we say so.
-    const kept = linked.filter((p) => (stats[p.id]?.runs ?? 0) > 0)
+    const kept = linked.filter((p) => timedProductIds.has(p.id))
     const toUnlink = linked.filter((p) => !kept.some((k) => k.id === p.id))
 
     const note = kept.length > 0 ? `${kept.length} model${kept.length !== 1 ? 's' : ''} kept — has recorded times` : null
@@ -519,9 +561,17 @@ export default function ModelLinker({ operationId, operationName, productionLine
     }
   }
 
+  /** Products with ANY recorded time for this operation — the unlink guard's question, and
+   * lib/coverage.ts's definition of timed. Existence only: a pair whose records are all
+   * superseded has still been timed, and unlinking it would orphan that history. */
+  const timedProductIds = useMemo(
+    () => new Set(timeModelLinks.map((tm) => tm.product_id)),
+    [timeModelLinks]
+  )
+
   // Every operation_times row for a given product, newest first — the "individual time
   // records" list under an expanded model row. operation_times has no product_id of its own,
-  // so this joins through timeModelLinks the same way averageForOperation does internally.
+  // so this joins through timeModelLinks the same way currentForOperation does internally.
   const recordsByProduct = useMemo(() => {
     const detailById = new Map(timeDetails.map((t) => [t.id, t]))
     const map = new Map<string, TimeDetailRow[]>()
@@ -561,7 +611,7 @@ export default function ModelLinker({ operationId, operationName, productionLine
           if (!isLinked) return null
           const stat = stats[p.id]
           const badge = stat ? (
-            <><CheckIcon /> {stat.avg.toFixed(1)}m · {stat.runs} run{stat.runs !== 1 ? 's' : ''}</>
+            <><CheckIcon /> {stat.minutes.toFixed(1)}m · {stat.archived === 0 ? 'current' : `+${stat.archived}`}</>
           ) : (
             <><XIcon /> Not timed</>
           )
@@ -594,7 +644,12 @@ export default function ModelLinker({ operationId, operationName, productionLine
                   style={{ display: 'flex', gap: 12, padding: '8px 10px', border: '1px solid var(--border)', borderRadius: 8, background: 'var(--bg)' }}
                 >
                   <div style={{ width: 130, flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 2 }}>
-                    <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)' }}>{fmtMinutes(record.total_minutes)}m</span>
+                    <span style={{ fontSize: 13, fontWeight: 700, color: record.superseded_by ? 'var(--text-muted)' : 'var(--text)' }}>{fmtMinutes(record.total_minutes)}m</span>
+                    {/* The figure above this list is ONE of these records, not their average —
+                        so which one it is has to be on the row. */}
+                    <span className={'badge ' + (record.superseded_by ? 'badge-grey' : 'badge-green')} style={{ alignSelf: 'flex-start' }}>
+                      {record.superseded_by ? 'archived' : 'current'}
+                    </span>
                     <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{fmtDate(record.created_at)}</span>
                     {record.collectedByName && (
                       <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>by {record.collectedByName}</span>

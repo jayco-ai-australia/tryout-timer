@@ -7,6 +7,7 @@ import { ModelSeriesPicker } from '@/components/ModelLinker'
 import {
   fetchLinksForOperations, fetchTimedPairs, linkOperationsToModels, unlinkOperationsFromModels,
 } from '@/lib/modelOperations'
+import { modelsForLine } from '@/lib/lines'
 import type { Operation, Product } from '@/lib/types'
 
 /**
@@ -88,7 +89,7 @@ interface BulkApplyResult {
 }
 
 export default function BulkModelLinkDrawer({
-  productionLineId, subjectLabel, operations, supabase, allowReplace = true, onClose, onApplied,
+  productionLineId, subjectLabel, operations, supabase, allowReplace = true, jobLinkCounts, onClose, onApplied,
 }: {
   /** Whose products to offer. Null -> nothing to link against, and the drawer says so. */
   productionLineId: string | null
@@ -98,6 +99,21 @@ export default function BulkModelLinkDrawer({
   supabase: SupabaseClient
   /** Offer the destructive "make the model set exactly this" mode. Add-only when false. */
   allowReplace?: boolean
+  /**
+   * JOB MODE. Product id → how many of `operations` it is currently linked to, supplied by the
+   * caller from data it already holds (never fetched here).
+   *
+   * Its presence turns this drawer into the per-job model panel /setup's Jobs pane opens: ticks
+   * START at the current state instead of empty, Replace is the only behaviour (tick = link
+   * every operation of the job, untick = unlink them), and a model linked to SOME of the job's
+   * operations says so on its row. That partial state is the reason this mode exists — four
+   * Caravan models carry 1 of 8 operations on one job, and until now that was invisible without
+   * running SQL.
+   *
+   * Without it the drawer is unchanged: a pending Add/Replace choice over a hand-picked set of
+   * operations, starting empty because those operations generally don't agree on one answer.
+   */
+  jobLinkCounts?: Map<string, number>
   onClose: () => void
   onApplied: () => Promise<void>
 }) {
@@ -105,11 +121,18 @@ export default function BulkModelLinkDrawer({
   const [loading, setLoading] = useState(true)
   // Starts empty by design — this is a pending choice, not the current link state of any one
   // operation (the selected operations generally don't agree on one).
-  const [pickedIds, setPickedIds] = useState<Set<string>>(new Set())
+  const jobMode = !!jobLinkCounts
+  // Seeded from the current link state in job mode — the panel is a picture of what IS, which is
+  // what makes unticking mean "unlink". Lazy initialiser: the drawer is mounted fresh each time
+  // it opens, so this runs once per opening.
+  const [pickedIds, setPickedIds] = useState<Set<string>>(
+    () => new Set(jobLinkCounts ? [...jobLinkCounts.entries()].filter(([, n]) => n > 0).map(([id]) => id) : [])
+  )
   const [mode, setMode] = useState<'add' | 'replace'>('add')
   // Replace can only ever be reached where it is offered — a caller turning it off mid-flight
-  // must not leave a stale 'replace' armed behind a hidden radio.
-  const effectiveMode = allowReplace ? mode : 'add'
+  // must not leave a stale 'replace' armed behind a hidden radio. Job mode is always Replace:
+  // its ticks describe the whole desired set, so Add would make unticking silently do nothing.
+  const effectiveMode = jobMode ? 'replace' : allowReplace ? mode : 'add'
   const [confirming, setConfirming] = useState(false)
   const [applying, setApplying] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -125,11 +148,18 @@ export default function BulkModelLinkDrawer({
         if (!cancelled) { setProducts([]); setLoading(false) }
         return
       }
-      const { data, error: err } = await supabase
-        .from('products').select('*').eq('production_line_id', productionLineId).order('model')
-      if (cancelled) return
-      if (err) setError(err.message)
-      setProducts((data ?? []) as Product[])
+      try {
+        // THE model-list question, asked in the one place that knows the answer — a pre-assembly
+        // line (Chassis, Sew, …) owns no products and inherits the models of the lines it feeds,
+        // so the old `production_line_id = <this line>` query left this drawer with nothing to
+        // tick on exactly the lines whose work most needs linking. See lib/lines.
+        const rows = await modelsForLine(supabase, productionLineId)
+        if (cancelled) return
+        setProducts(rows)
+      } catch (err) {
+        if (cancelled) return
+        setError(err instanceof Error ? err.message : 'Could not load this line’s models')
+      }
       setLoading(false)
     }
     load()
@@ -226,8 +256,10 @@ export default function BulkModelLinkDrawer({
     <>
       <div className="gaps-drawer-header">
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div className="gaps-drawer-title">Link models</div>
-          <div className="gaps-drawer-jobname">{subjectLabel} · {plural(opCount, 'operation')} selected</div>
+          <div className="gaps-drawer-title">{jobMode ? 'Models this job applies to' : 'Link models'}</div>
+          <div className="gaps-drawer-jobname">
+            {subjectLabel} · {plural(opCount, 'operation')}{jobMode ? '' : ' selected'}
+          </div>
         </div>
         <button className="gaps-drawer-close" onClick={onClose} aria-label="Close">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
@@ -271,7 +303,13 @@ export default function BulkModelLinkDrawer({
           </div>
         )}
 
-        {allowReplace ? (
+        {jobMode ? (
+          <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '0 0 16px', lineHeight: 1.55 }}>
+            Ticked models are the ones <strong>{subjectLabel}</strong> applies to. Ticking links every
+            one of its {plural(opCount, 'operation')} to that model; unticking unlinks them.
+            A model with recorded times is always kept.
+          </p>
+        ) : allowReplace ? (
         <div style={{ marginBottom: 16 }}>
           <div style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', marginBottom: 8 }}>
             How to apply
@@ -324,7 +362,7 @@ export default function BulkModelLinkDrawer({
           <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>
             {productionLineId
               ? 'No products found for this production line'
-              : 'This job has no production line, so there are no models to link. Set one in Setup, under Team / Line, first.'}
+              : 'This job has no production line, so there are no models to link. Set one in Setup, under Line, first.'}
           </p>
         ) : (
           <ModelSeriesPicker
@@ -332,6 +370,21 @@ export default function BulkModelLinkDrawer({
             selectedIds={pickedIds}
             onToggle={togglePicked}
             onToggleSeries={toggleSeries}
+            renderRowStatus={jobMode ? (product) => {
+              const linked = jobLinkCounts?.get(product.id) ?? 0
+              // Only the PARTIAL case is worth a badge: nothing linked is already the unticked
+              // state, and all-linked is the plain ticked one.
+              if (linked === 0 || linked >= opCount) return null
+              return (
+                <span
+                  className="badge badge-amber"
+                  style={{ fontSize: 10 }}
+                  title={`Only ${linked} of this job's ${opCount} operations are linked to ${product.model}. Leaving it ticked links the rest.`}
+                >
+                  {linked} of {plural(opCount, 'operation')}
+                </span>
+              )
+            } : undefined}
           />
         )}
       </div>
