@@ -1,5 +1,7 @@
 import { createServerClient } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
+import { canAccessAdminArea } from '@/lib/permissions'
+import type { UserRole } from '@/lib/types'
 
 export async function middleware(request: NextRequest) {
   let supabaseResponse = NextResponse.next({ request })
@@ -46,7 +48,10 @@ export async function middleware(request: NextRequest) {
     return NextResponse.redirect(url)
   }
 
-  // Admin-only routes: check role
+  // Admin-only routes. ADMIN ONLY — a manager is redirected here exactly as a plain user is.
+  // /admin and /config are authority over the application; manager is authority over recorded
+  // work. Asked through canAccessAdminArea so this can't be widened independently of the other
+  // two gates on the same question (app/admin/page.tsx and components/Nav.tsx).
   if (user && (pathname.startsWith('/admin') || pathname.startsWith('/config'))) {
     const { data: profile } = await supabase
       .from('profiles')
@@ -54,7 +59,7 @@ export async function middleware(request: NextRequest) {
       .eq('id', user.id)
       .single()
 
-    if (profile?.role !== 'admin') {
+    if (!canAccessAdminArea((profile?.role ?? null) as UserRole | null)) {
       const url = request.nextUrl.clone()
       url.pathname = '/dashboard'
       return NextResponse.redirect(url)

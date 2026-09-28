@@ -2,7 +2,8 @@ import { createClient } from '@/lib/supabase/server'
 import { redirect } from 'next/navigation'
 import Nav from '@/components/Nav'
 import AdminClient from './AdminClient'
-import type { Profile, OperationTimeWithRelations, OperatorChangeRequest } from '@/lib/types'
+import { canAccessAdminArea } from '@/lib/permissions'
+import type { Profile, OperationTimeWithRelations, OperatorChangeRequest, UserRole } from '@/lib/types'
 
 export default async function AdminPage() {
   const supabase = await createClient()
@@ -10,7 +11,9 @@ export default async function AdminPage() {
   if (!user) redirect('/login')
 
   const { data: profile } = await supabase.from('profiles').select('role').eq('id', user.id).single()
-  if (profile?.role !== 'admin') redirect('/dashboard')
+  // The server-side half of the middleware gate — same helper, same answer, so a manager is
+  // turned away here too even if the middleware were ever bypassed.
+  if (!canAccessAdminArea((profile?.role ?? null) as UserRole | null)) redirect('/dashboard')
 
   const [{ data: profiles }, { data: records }, { data: requests }] = await Promise.all([
     supabase.from('profiles').select('id, full_name, role, created_at').order('created_at', { ascending: false }),

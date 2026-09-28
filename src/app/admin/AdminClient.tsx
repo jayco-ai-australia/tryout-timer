@@ -5,7 +5,16 @@ import { createClient } from '@/lib/supabase/client'
 import ConfirmDialog from '@/components/ConfirmDialog'
 import { fmtDate, fmtMinutes } from '@/lib/format'
 import { deleteOperationTime } from '@/lib/operationTimes'
-import type { ChangeRequestStatus, OperatorChangeRequest, Profile, OperationTimeWithRelations } from '@/lib/types'
+import type { ChangeRequestStatus, OperatorChangeRequest, Profile, OperationTimeWithRelations, UserRole } from '@/lib/types'
+
+/** The role picker's options, in ascending authority. Labels are what an admin reads; the
+ * values are the column's own. Typed as UserRole so widening the union surfaces here rather
+ * than leaving a role nobody can be assigned. */
+const ROLE_OPTIONS: { value: UserRole; label: string; hint: string }[] = [
+  { value: 'user', label: 'User', hint: 'Edits their own recorded times. Cannot delete times.' },
+  { value: 'manager', label: 'Manager', hint: 'Edits and deletes any recorded time. No Admin or Config access.' },
+  { value: 'admin', label: 'Admin', hint: 'Everything a manager can do, plus Admin and Config.' },
+]
 
 interface Props {
   profiles: Profile[]
@@ -24,7 +33,7 @@ export default function AdminClient({ profiles: initialProfiles, records: initia
   const [confirm, setConfirm] = useState<{ type: 'user' | 'record'; id: string } | null>(null)
   const [busyRequestId, setBusyRequestId] = useState<string | null>(null)
 
-  async function handleRoleChange(userId: string, newRole: 'user' | 'admin') {
+  async function handleRoleChange(userId: string, newRole: UserRole) {
     const { error } = await supabase.from('profiles').update({ role: newRole }).eq('id', userId)
     if (!error) setProfiles((prev) => prev.map((p) => p.id === userId ? { ...p, role: newRole } : p))
   }
@@ -98,9 +107,16 @@ export default function AdminClient({ profiles: initialProfiles, records: initia
                   <td className="primary">{profile.full_name ?? <em style={{ color: 'var(--text-muted)' }}>No name</em>}</td>
                   <td>{fmtDate(profile.created_at)}</td>
                   <td>
-                    <select className="select" style={{ minWidth: 0, padding: '4px 8px', fontSize: 12 }} value={profile.role} onChange={(e) => handleRoleChange(profile.id, e.target.value as 'user' | 'admin')}>
-                      <option value="user">User</option>
-                      <option value="admin">Admin</option>
+                    <select
+                      className="select"
+                      style={{ minWidth: 0, padding: '4px 8px', fontSize: 12 }}
+                      value={profile.role}
+                      title={ROLE_OPTIONS.find((r) => r.value === profile.role)?.hint}
+                      onChange={(e) => handleRoleChange(profile.id, e.target.value as UserRole)}
+                    >
+                      {ROLE_OPTIONS.map((r) => (
+                        <option key={r.value} value={r.value} title={r.hint}>{r.label}</option>
+                      ))}
                     </select>
                   </td>
                   <td className="right">
