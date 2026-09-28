@@ -1,0 +1,30 @@
+/*
+ * Page setup for /labour-matrix's printout — route-scoped, for the same reason
+ * /model-total's and /pre-assembly-coverage's are: `@page` cannot be scoped by a selector, so an
+ * unnamed rule sitting in globals.css would re-paper every other printable screen in the app.
+ * Route-imported CSS ships only on the route that asks for it, which gives the scoping that the
+ * cascade won't.
+ *
+ * A3 LANDSCAPE. The document is a grid of models down and jobs across; A4 portrait would fit
+ * about six job columns, which is not a matrix, it is a list. /roadmap prints A3 landscape for
+ * the same reason — its Gantt is wider than a portrait page — and this follows it.
+ *
+ * ── Why this is an UNNAMED @page and /roadmap's is named ──────────────────────────────────
+ * /roadmap uses `@page roadmap-sheet {…}` + `page: roadmap-sheet`, because its print block lives
+ * in globals.css where a bare `@page` WOULD be document-wide and would drag /model-total's A4
+ * collection sheet onto A3 landscape with it. That is the right fix for a rule in a global file
+ * and the wrong one here: NAMED PAGES ARE NOT SUPPORTED IN SAFARI (nor Firefox), and where the
+ * rule is ignored so are the size AND the margins — the print then silently takes whatever the
+ * user's print dialog happens to be set to, which for a wide grid means an A4 portrait sheet
+ * with three quarters of the columns missing.
+ *
+ * A route-scoped file doesn't have globals.css's problem in the first place, so it can use the
+ * form every browser honours. Same approach as /roadmap, one known defect removed.
+ *
+ * 10mm side margins rather than 12: every millimetre here is another fraction of a job column,
+ * and the printer's own unprintable edge is the real floor.
+ */
+@page {
+  size: A3 landscape;
+  margin: 9mm 10mm;
+}
