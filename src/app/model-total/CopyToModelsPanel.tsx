@@ -6,7 +6,12 @@ import ConfirmDialog from '@/components/ConfirmDialog'
 import { ModelSeriesPicker } from '@/components/ModelLinker'
 import { addOperationTimeNote, copiedNoteFor, recordOperationTime } from '@/lib/operationTimes'
 import { buildReportHref } from '@/lib/reports'
-import { chunked, linkOperationsToModels, READ_CHUNK } from '@/lib/modelOperations'
+import { linkOperationsToModels, READ_CHUNK } from '@/lib/modelOperations'
+// Every read in this file goes through these. The three that did not were the last unpaged reads
+// in this feature, and on a copy path a short read is not a cosmetic problem: it silently narrows
+// what gets copied, or — in the pre-flight — understates what the targets already hold.
+import { fetchAllChunked, fetchAllRows, type RangeableQuery } from '@/lib/supabaseRead'
+import { selectIn } from '@/lib/chunkedIn'
 import { fmtMinutes } from '@/lib/format'
 import type { createClient } from '@/lib/supabase/client'
 import type { Product } from '@/lib/types'
@@ -99,6 +104,13 @@ interface CopyOutcomeTarget {
   product: Product
   created: number
   linked: number
+  /**
+   * The applicability write failed for this target, so NO times were copied to it and it is
+   * unchanged. This is the whole point of tracking it per target: the alternative — writing the
+   * times anyway and mentioning the link failure in a list — is what produced 554 recorded times
+   * for pairs their model is not recorded as doing.
+   */
+  skippedForLinkFailure: boolean
 }
 
 interface CopyOutcome {
@@ -116,6 +128,13 @@ interface CopyOutcome {
    * blank is not worth writing. Counted so the total still adds up. */
   skipped: number
   failures: string[]
+  /**
+   * The loop itself threw and stopped early, so the targets with no `perTarget` entry were never
+   * attempted at all. Distinct from `failures` being non-empty, which is a copy that ran to the
+   * end with problems in it — the two need different words and the old code could report the
+   * first as the second, or as a success.
+   */
+  aborted: boolean
 }
 
 export default function CopyToModelsPanel({
@@ -152,7 +171,12 @@ export default function CopyToModelsPanel({
   const [runs, setRuns] = useState<SourceRun[] | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
 
-  const [confirmState, setConfirmState] = useState<{ alreadyTimed: number } | null>(null)
+  /** The pre-flight's answer. `alreadyTimed: null` means the check could not be completed — kept
+   * distinct from 0, which is a finding. `checkError` carries the reason so the dialog can state
+   * it rather than only logging it. */
+  const [confirmState, setConfirmState] = useState<
+    { alreadyTimed: number | null; checkError: string | null } | null
+  >(null)
   const [checking, setChecking] = useState(false)
   const [running, setRunning] = useState(false)
   const [progress, setProgress] = useState({ done: 0, total: 0 })
@@ -173,21 +197,32 @@ export default function CopyToModelsPanel({
     let cancelled = false
     async function load() {
       try {
-        const { data: links, error: linkError } = await supabase
-          .from('operation_time_models').select('operation_time_id').eq('product_id', sourceProduct.id)
-        if (linkError) throw new Error(linkError.message)
-        const timeIds = [...new Set((links ?? []).map((l) => l.operation_time_id as string))]
+        // PAGED. This read decides what the whole copy consists of, and it used to be a raw
+        // `.select().eq()`: PostgREST caps a response at 1000 rows and returns the cap as an
+        // ordinary 200 with a short array, so a source model with more than 1000 time links
+        // silently copied a subset and reported the subset as the whole job. Ordered by
+        // operation_time_id, which is a total order here because the filter pins product_id —
+        // paging over an unordered query can skip and repeat rows.
+        const links = await fetchAllRows<{ operation_time_id: string }>(
+          () => supabase
+            .from('operation_time_models').select('operation_time_id')
+            .eq('product_id', sourceProduct.id)
+            .order('operation_time_id') as unknown as RangeableQuery<{ operation_time_id: string }>,
+          { table: 'operation_time_models' },
+        )
+        const timeIds = [...new Set(links.map((l) => l.operation_time_id))]
 
-        const rows: SourceRun[] = []
-        for (const chunk of chunked(timeIds, READ_CHUNK)) {
-          const { data, error } = await supabase
+        // Identity lookup by primary key, so selectIn (chunked, not paged) is complete by
+        // construction: a chunk of at most READ_CHUNK ids can return at most that many rows, and
+        // `superseded_by is null` only narrows it further. See lib/chunkedIn on the distinction.
+        const rows = (await selectIn<{ operation_id: string; total_minutes: number | null; operator_id: string | null }>(
+          timeIds,
+          (chunk) => supabase
             .from('operation_times').select('operation_id, total_minutes, operator_id')
-            .in('id', chunk).is('superseded_by', null)
-          if (error) throw new Error(error.message)
-          for (const r of (data ?? []) as { operation_id: string; total_minutes: number | null; operator_id: string | null }[]) {
-            rows.push({ operationId: r.operation_id, totalMinutes: r.total_minutes, operatorId: r.operator_id })
-          }
-        }
+            .in('id', chunk).is('superseded_by', null),
+        )).map((r) => ({
+          operationId: r.operation_id, totalMinutes: r.total_minutes, operatorId: r.operator_id,
+        } satisfies SourceRun))
         if (!cancelled) setRuns(rows)
       } catch (err) {
         if (!cancelled) { setRuns([]); setLoadError(err instanceof Error ? err.message : 'Could not load this model’s recorded runs') }
@@ -258,34 +293,41 @@ export default function CopyToModelsPanel({
     setChecking(true)
     try {
       const targetProductIds = targets.map((p) => p.id)
-      const linkRows: { operation_time_id: string; product_id: string }[] = []
-      for (const chunk of chunked(targetProductIds, READ_CHUNK)) {
-        const { data, error } = await supabase
+      // FAN-OUT — one product matches many link rows — so chunked AND paged. Unpaged, this
+      // undercounted what the targets already hold, which is the one number the warning states.
+      // Total order over the junction's primary key, which paging requires.
+      const linkRows = await fetchAllChunked<{ operation_time_id: string; product_id: string }>(
+        targetProductIds, READ_CHUNK,
+        (chunk) => supabase
           .from('operation_time_models').select('operation_time_id, product_id').in('product_id', chunk)
-        if (error) throw new Error(error.message)
-        linkRows.push(...((data ?? []) as { operation_time_id: string; product_id: string }[]))
-      }
+          .order('operation_time_id').order('product_id') as unknown as RangeableQuery<{ operation_time_id: string; product_id: string }>,
+        { table: 'operation_time_models' },
+      )
       const timeIds = [...new Set(linkRows.map((l) => l.operation_time_id))]
       // NOT filtered to the current record: this is the "already timed" warning, and a target
       // whose only records are archived has still been timed. Same existence question coverage
       // asks — see lib/coverage.ts.
-      const opByTimeId = new Map<string, string>()
-      for (const chunk of chunked(timeIds, READ_CHUNK)) {
-        const { data, error } = await supabase
-          .from('operation_times').select('id, operation_id').in('id', chunk)
-        if (error) throw new Error(error.message)
-        for (const r of (data ?? []) as { id: string; operation_id: string }[]) opByTimeId.set(r.id, r.operation_id)
-      }
+      //
+      // Identity lookup by primary key, so selectIn is complete — see the source read above.
+      const timeRows = await selectIn<{ id: string; operation_id: string }>(
+        timeIds,
+        (chunk) => supabase.from('operation_times').select('id, operation_id').in('id', chunk),
+      )
+      const opByTimeId = new Map(timeRows.map((r) => [r.id, r.operation_id]))
       const existing = new Set<string>()
       for (const l of linkRows) {
         const opId = opByTimeId.get(l.operation_time_id)
         if (opId && selectedOperationIds.has(opId)) existing.add(`${l.product_id}:${opId}`)
       }
-      setConfirmState({ alreadyTimed: existing.size })
+      setConfirmState({ alreadyTimed: existing.size, checkError: null })
     } catch (err) {
-      // A failed pre-flight must not block the copy — it only removes the warning, so say so
-      // rather than pretending the check passed.
-      setConfirmState({ alreadyTimed: -1 })
+      // A failed pre-flight must not block the copy — it removes a warning, it does not make the
+      // copy unsafe. But it must not be reported as a number either: `alreadyTimed: null` is "we
+      // could not find out", which the dialog says in words, with the reason, instead of leaving
+      // it in the console for nobody. It used to be a magic -1 that every `> 0` test read as
+      // "none already timed".
+      const message = err instanceof Error ? err.message : 'the check was rejected'
+      setConfirmState({ alreadyTimed: null, checkError: message })
       console.error('[copy] could not pre-check target times:', err)
     } finally {
       setChecking(false)
@@ -305,10 +347,12 @@ export default function CopyToModelsPanel({
       jobNames: selectedJobs.map((j) => j.jobName),
       perTarget: [],
       linked: 0, created: 0, notes: 0,
-      // Runs with no usable minutes are never attempted, so they're counted once here rather
-      // than discovered inside the loop.
-      skipped: (selectedRuns.length - copyableRuns.length) * targets.length,
+      // Accumulated per target actually ATTEMPTED, not multiplied out up front: a target skipped
+      // for a link failure had none of its runs attempted, so counting its blanks as "skipped for
+      // having no recorded minutes" would describe work that was never reached.
+      skipped: 0,
       failures: [],
+      aborted: false,
     }
     // The one definition of this string lives in lib/operationTimes beside the parser that reads
     // it back — see the note there. Same text as before; it is now recognisable afterwards.
@@ -317,17 +361,60 @@ export default function CopyToModelsPanel({
 
     try {
       for (const target of copiedTo) {
-        const perTarget: CopyOutcomeTarget = { product: target, created: 0, linked: 0 }
+        const perTarget: CopyOutcomeTarget = {
+          product: target, created: 0, linked: 0, skippedForLinkFailure: false,
+        }
         result.perTarget.push(perTarget)
 
         // 1. Applicability, in one batched upsert per target — every selected operation,
         //    timed or not. Existing links are no-ops.
-        const linkResult = await linkOperationsToModels(
-          supabase, opIds.map((operation_id) => ({ operation_id, product_id: target.id }))
-        )
+        //
+        //    A THROW IS THE SAME FAILURE AS A RETURNED ERROR. linkOperationsToModels reports by
+        //    return value today, but a caller that only handled one of the two would skip the
+        //    guard below the day that changed.
+        let linkResult: { linked: number; attempted: number; error: string | null }
+        try {
+          linkResult = await linkOperationsToModels(
+            supabase, opIds.map((operation_id) => ({ operation_id, product_id: target.id }))
+          )
+        } catch (err) {
+          linkResult = {
+            linked: 0,
+            attempted: opIds.length,
+            error: err instanceof Error ? err.message : 'the write was rejected',
+          }
+        }
         result.linked += linkResult.linked
         perTarget.linked = linkResult.linked
-        if (linkResult.error) result.failures.push(`Linking operations to ${target.model}: ${linkResult.error}`)
+
+        /**
+         * ── THE GUARD ─────────────────────────────────────────────────────────────────────
+         *
+         * If applicability did not land, this target gets NO TIMES. It used to get all of them:
+         * the error was pushed onto a list and the loop fell straight through into the writes,
+         * which is the one code path in this app that directly produces a recorded time for an
+         * (operation, model) pair the model is not recorded as doing. 554 such records exist in
+         * this database and 18,211 minutes hang off them; they are invisible in coverage and
+         * counted in totals, and nothing in the app can tell you which of the two is wrong.
+         *
+         * Skipping the target leaves it exactly as it was — the upsert is idempotent, so
+         * whatever links did land are correct and re-running the copy after fixing the cause is
+         * safe. Every other target still runs: one model's permissions or one rejected chunk is
+         * not a reason to abandon the rest.
+         */
+        if (linkResult.error) {
+          perTarget.skippedForLinkFailure = true
+          result.failures.push(
+            `${target.model}: the applies-list could not be written (${linkResult.error}), so NO times `
+            + 'were copied to it — it is unchanged. Fix that and run the copy again for this model.'
+          )
+          // The progress bar is sized in records, and this target's records were never attempted.
+          // Without this the bar stops short of its own total and reads as a copy still running.
+          setProgress((p) => ({ ...p, done: p.done + copyableRuns.length }))
+          continue
+        }
+
+        result.skipped += selectedRuns.length - copyableRuns.length
 
         // 2. One new time per copyable source run. Sequential on purpose: recordOperationTime
         //    does several round trips of its own, and firing hundreds concurrently is how a
@@ -363,6 +450,29 @@ export default function CopyToModelsPanel({
           setProgress((p) => ({ ...p, done: p.done + 1 }))
         }
       }
+    } catch (err) {
+      /**
+       * The loop stopped early. There was no catch here at all: `finally` still set the outcome
+       * and called onCompleted(), so the panel rendered a success-shaped result with an empty
+       * failure list and a short target list, while the rejection escaped as an unhandled
+       * promise. A copy that stopped after two of six models looked exactly like a copy of two
+       * models that went fine.
+       *
+       * Everything written before this point is committed and correct — the writes are
+       * sequential and each target's links land before its times — so the honest report is
+       * "these targets are done, these were never attempted", which is what `aborted` plus the
+       * missing perTarget entries say.
+       */
+      result.aborted = true
+      const notAttempted = copiedTo.filter((t) => !result.perTarget.some((p) => p.product.id === t.id))
+      result.failures.push(
+        `The copy stopped early: ${err instanceof Error ? err.message : 'an unexpected error'}.`
+        + (notAttempted.length > 0
+          ? ` ${plural(notAttempted.length, 'model')} not attempted at all: ${notAttempted.map((t) => t.model).join(', ')}.`
+          : '')
+        + ' Nothing already written has been undone; re-running the copy for the models below is safe.'
+      )
+      console.error('[copy] stopped early:', err)
     } finally {
       setOutcome(result)
       setRunning(false)
@@ -411,11 +521,16 @@ export default function CopyToModelsPanel({
           */}
           {outcome && (
             <div style={outcome.failures.length > 0 ? ERR_BOX : OK_BOX}>
+              {/* Three outcomes, three headings. "Copied with problems" over a copy that stopped
+                  after two of six models understates it, and the old code could print "Copy
+                  complete" over exactly that. */}
               <div style={{ fontWeight: 700, marginBottom: 6 }}>
-                {outcome.failures.length > 0 ? 'Copied with problems' : 'Copy complete'}
+                {outcome.aborted
+                  ? 'Copy stopped early'
+                  : outcome.failures.length > 0 ? 'Copied with problems' : 'Copy complete'}
               </div>
 
-              {outcome.perTarget.length === 1 ? (
+              {outcome.perTarget.length === 1 && !outcome.perTarget[0].skippedForLinkFailure ? (
                 // One target: one sentence, which is the common case and reads as a plain
                 // statement rather than a report with a list of length one.
                 <div style={{ fontSize: 12, lineHeight: 1.6 }}>
@@ -431,10 +546,28 @@ export default function CopyToModelsPanel({
                     {outcome.perTarget.map((t) => (
                       <li key={t.product.id}>
                         <ModelButton product={t.product} onOpenModel={onOpenModel} onClose={close} />
-                        {' '}— {plural(t.created, 'time record')}, {plural(t.linked, 'operation')} linked.
+                        {/* A skipped target is named as UNCHANGED, not as "0 records" — the
+                            difference between "nothing landed" and "nothing was attempted,
+                            deliberately" is the whole point of the guard. */}
+                        {t.skippedForLinkFailure
+                          ? <> — <strong>skipped, unchanged</strong>: its applies-list could not be written, so no times were copied.</>
+                          : <> — {plural(t.created, 'time record')}, {plural(t.linked, 'operation')} linked.</>}
                       </li>
                     ))}
                   </ul>
+                </div>
+              )}
+
+              {/* The targets the loop never got to. They have no perTarget row, so without this
+                  they would simply be absent from a report the reader assumes is complete. */}
+              {outcome.aborted && outcome.targets.length > outcome.perTarget.length && (
+                <div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.6 }}>
+                  <strong>Not attempted at all:</strong>{' '}
+                  {outcome.targets
+                    .filter((t) => !outcome.perTarget.some((p) => p.product.id === t.id))
+                    .map((t) => t.model)
+                    .join(', ')}
+                  . These models are unchanged.
                 </div>
               )}
 
@@ -461,7 +594,9 @@ export default function CopyToModelsPanel({
                   written with no stopwatch timestamps and a "today" report would not obviously
                   contain it. One link per target: the report's Model filter is single-valued. */}
               <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-                {outcome.perTarget.slice(0, MAX_LISTED_TARGETS).map((t) => (
+                {outcome.perTarget
+                  .filter((t) => !t.skippedForLinkFailure && t.created > 0)
+                  .slice(0, MAX_LISTED_TARGETS).map((t) => (
                   <Link
                     key={t.product.id}
                     className="finder-row-action"
@@ -629,17 +764,25 @@ export default function CopyToModelsPanel({
           onCancel={() => setConfirmState(null)}
         >
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12, fontSize: 12, color: 'var(--text-mid)' }}>
-            {confirmState.alreadyTimed > 0 && (
+            {confirmState.alreadyTimed !== null && confirmState.alreadyTimed > 0 && (
               <p style={{ margin: 0 }}>
                 <strong>{confirmState.alreadyTimed} target operation{confirmState.alreadyTimed === 1 ? '' : 's'} already
                 {confirmState.alreadyTimed === 1 ? ' has' : ' have'} times</strong> — copies will be added
                 alongside them, not replace them.
               </p>
             )}
-            {confirmState.alreadyTimed === -1 && (
-              <p style={{ margin: 0, color: 'var(--red)' }}>
-                Couldn&apos;t check whether the targets already have times — the copy will still run,
-                and would add to any that do.
+            {/* The check failed. Said here, with the reason, and framed as a MISSING ANSWER rather
+                than as a finding — the alternative was a dialog that looked exactly like one
+                reporting "nothing already timed", which is the number a reader takes as fact. */}
+            {confirmState.alreadyTimed === null && (
+              <p style={{ margin: 0, padding: '8px 10px', borderRadius: 6, background: 'var(--amber-bg)', border: '1px solid #fde68a', color: '#92400e', lineHeight: 1.55 }}>
+                <strong>Couldn’t check what the targets already hold.</strong> This dialog normally
+                says how many target operations are already timed; that figure is unknown for this
+                copy, so treat it as unknown rather than as none. The copy itself is unaffected and
+                will add to anything that is already there.
+                {confirmState.checkError && (
+                  <> <span style={{ opacity: 0.8 }}>({confirmState.checkError})</span></>
+                )}
               </p>
             )}
 
