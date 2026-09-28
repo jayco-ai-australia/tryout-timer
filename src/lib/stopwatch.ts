@@ -119,6 +119,26 @@ export function toggleTimerPause(timers: ActiveTimer[], timerId: string, atMs: n
   })
 }
 
+/**
+ * Back to 00:00, held there: the clock is re-stamped to now, the banked pause time is thrown
+ * away, and the timer is left PAUSED rather than running. A restart is what happens when a run
+ * has to be done again from the top, and the person restarting it is not, at that instant,
+ * ready to start working — auto-running would begin timing them walking back to the van.
+ *
+ * pausedAt is set to the same instant as startedAt, so the in-progress pause exactly cancels
+ * the wall clock and the display sits on 0:00 until Start is pressed (which banks that pause
+ * through toggleTimerPause like any other).
+ *
+ * Everything the run is ABOUT is kept — the operation, the models, the operator, the notes
+ * written so far. Only the elapsed time is discarded, which is why the caller confirms first.
+ */
+export function restartTimer(timers: ActiveTimer[], timerId: string, atMs: number = Date.now()): ActiveTimer[] {
+  const at = new Date(atMs).toISOString()
+  return timers.map((t) => (
+    t.timerId === timerId ? { ...t, startedAt: at, pausedSeconds: 0, isPaused: true, pausedAt: at } : t
+  ))
+}
+
 export function dropTimer(timers: ActiveTimer[], timerId: string): ActiveTimer[] {
   return timers.filter((t) => t.timerId !== timerId)
 }
@@ -252,6 +272,8 @@ export interface Stopwatches {
   nowMs: number
   start: (input: NewTimerInput) => ActiveTimer
   togglePause: (timerId: string) => void
+  /** Resets one timer to 0:00 and leaves it paused — see restartTimer. */
+  restart: (timerId: string) => void
   /** Drops a timer without recording anything — its pending notes go with it. */
   discard: (timerId: string) => void
   /** Adds a note to a running timer without stopping it. */
@@ -281,6 +303,10 @@ export function useStopwatches(storageKey: string): Stopwatches {
     setTimers((prev) => toggleTimerPause(prev, timerId))
   }, [setTimers])
 
+  const restart = useCallback((timerId: string) => {
+    setTimers((prev) => restartTimer(prev, timerId))
+  }, [setTimers])
+
   const discard = useCallback((timerId: string) => {
     setTimers((prev) => dropTimer(prev, timerId))
   }, [setTimers])
@@ -293,5 +319,5 @@ export function useStopwatches(storageKey: string): Stopwatches {
     setTimers((prev) => removeTimerNote(prev, timerId, index))
   }, [setTimers])
 
-  return { timers, nowMs, start, togglePause, discard, addNote, removeNote, setTimers }
+  return { timers, nowMs, start, togglePause, restart, discard, addNote, removeNote, setTimers }
 }
