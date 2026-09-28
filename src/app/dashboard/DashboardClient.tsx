@@ -1,18 +1,22 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { createClient } from '@/lib/supabase/client'
 import {
   chunked, fetchLinksForOperations, READ_CHUNK,
 } from '@/lib/modelOperations'
+import { fetchAllChunked } from '@/lib/supabaseRead'
+import { modelsForLine } from '@/lib/lines'
 import { modelTotalMinutes, operationProductKey } from '@/lib/operationTimes'
 import {
   aggregateCoverage, computeCoverageCombos, modelCoverageFromCombos, type ModelCoverage,
 } from '@/lib/coverage'
 import { fetchFutureBuilds, fmtScheduleDate, todayIsoDate } from '@/lib/schedule'
+import { periodBounds, periodRangeLabel } from '@/lib/periods'
 import { fmtHours, fmtMinutes } from '@/lib/format'
 import { usePersistedFilter } from '@/lib/useLocalStorage'
+import CollectorsPanel from '@/components/CollectorsPanel'
 import type { ProductionLine, UserRole } from '@/lib/types'
 
 /**
@@ -44,9 +48,9 @@ import type { ProductionLine, UserRole } from '@/lib/types'
  * date column; nothing here parses, coerces or string-compares it.
  *
  * ── Everything else is reused ─────────────────────────────────────────────────────────────
- * Labour totals come from modelTotalMinutes (lib/operationTimes) — the "average per operation,
- * then sum" rule, not a fresh SUM() — fed once from data fetched for the whole line rather than
- * per model. The applies-list read is fetchLinksForOperations, the chunking is
+ * Labour totals come from modelTotalMinutes (lib/operationTimes) — the "current record per
+ * operation, then sum" rule, not a fresh SUM() — fed once from data fetched for the whole line
+ * rather than per model. The applies-list read is fetchLinksForOperations, the chunking is
  * lib/modelOperations', and the schedule read is lib/schedule.
  */
 
@@ -84,27 +88,6 @@ function coveragePctClass(pct: number | null): string {
 
 function pctLabel(pct: number | null): string {
   return pct == null ? '—' : `${pct.toFixed(1)}%`
-}
-
-/**
- * Local midnight today, and the Monday-start week boundaries around it. Local, not UTC:
- * "collected today" means the collector's today, at the tablet in the shed, and
- * operation_times.created_at is a timestamptz so the comparison is exact either way.
- *
- * "This week" runs from Monday to now (a partial week, by design — it's a progress figure);
- * "last week" is the full Monday–Sunday before it. They therefore aren't like-for-like, which
- * is why each card prints the window it counted rather than just a name.
- */
-function periodBounds() {
-  const now = new Date()
-  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate())
-  // getDay(): 0 = Sunday. Shift so Monday is the first day of the week.
-  const daysSinceMonday = (todayStart.getDay() + 6) % 7
-  const thisWeekStart = new Date(todayStart)
-  thisWeekStart.setDate(todayStart.getDate() - daysSinceMonday)
-  const lastWeekStart = new Date(thisWeekStart)
-  lastWeekStart.setDate(thisWeekStart.getDate() - 7)
-  return { todayStart, thisWeekStart, lastWeekStart }
 }
 
 interface CoverageSummary {
@@ -223,51 +206,104 @@ export default function DashboardClient({ role, lines, initialLineId }: Props) {
     today: 0, thisWeek: 0, lastWeek: 0, todayLabel: '', thisWeekLabel: '', lastWeekLabel: '',
   })
 
+  /**
+   * Which load is allowed to write to state.
+   *
+   * THIS IS THE LINE FILTER BUG, and it is worth being precise about it because the query that
+   * looked wrong was never wrong. Every read below is correctly scoped by `lineId` already; what
+   * was missing is that a load could still be in flight when the next one starts, and the LAST
+   * ONE TO FINISH won — not the last one to start.
+   *
+   * On mount that is not a race, it is a certainty, and it always resolves the wrong way:
+   *   1. First render uses `initialLineId`, which for an admin is '' — load #1 starts, unscoped,
+   *      and sweeps every model in the business.
+   *   2. usePersistedFilter's mount effect then restores the saved line, `lineId` changes, and
+   *      load #2 starts correctly scoped to (say) Caravan.
+   *   3. Load #2 is reading 89 models; load #1 is reading every model, every applies-list row,
+   *      every recorded time and all 5,660 chassis. #2 lands first, paints Caravan, and is then
+   *      overwritten by #1 with the whole business.
+   *
+   * What made it read as "only the schedule table leaks" is that the headings are derived from
+   * the LIVE `lineId` while the figures came from the stale load — so the page said "How much of
+   * Caravan is covered" over business-wide numbers, and the schedule table was simply the one
+   * block listing model names you can eyeball against the filter. The coverage headline was
+   * equally stale; "89 models" was just not obviously the wrong 89.
+   *
+   * A monotonic sequence number is enough: a load that is no longer the newest writes nothing —
+   * not its results, not its error, not even setLoading(false), which would otherwise clear the
+   * spinner out from under the load still running.
+   */
+  const loadSeq = useRef(0)
+
   const load = useCallback(async () => {
+    const seq = ++loadSeq.current
+    const isCurrent = () => loadSeq.current === seq
+
     setLoading(true)
     setError(null)
     try {
       // ── 1. The line's models ────────────────────────────────────────────────────────
-      let productQuery = supabase.from('products').select('id, model, product_series, production_line_id')
-      if (lineId) productQuery = productQuery.eq('production_line_id', lineId)
-      const { data: productRows, error: productsError } = await productQuery
-      if (productsError) throw new Error(productsError.message)
-      const products = (productRows ?? []) as {
-        id: string; model: string; product_series: string | null; production_line_id: string | null
-      }[]
+      // THE model list for the line in scope — lib/lines, not a products-by-line query. A
+      // pre-assembly line (Chassis, Sew, …) owns no products and inherits the models of the
+      // lines it feeds, so the old filter gave those lines an empty table and a coverage
+      // denominator of zero. Unfiltered ("All production lines") it still means every product.
+      //
+      // Still paged inside the resolver, for the reason this read has always been paged: an
+      // unpaged select stops at PostgREST's 1,000-row cap as a normal 200 with a short array,
+      // dropping models off both the coverage denominator and this table with nothing on screen
+      // to say so. The table's own ordering is applied client-side by sortRows either way.
+      //
+      // NOTE these rows' `production_line_id` is the model's OWN line, which for a pre-assembly
+      // line in scope is the build line it was inherited from. That is exactly what
+      // openModelTotal wants to seed below: Model Total has to open on a line whose model list
+      // actually holds the model.
+      const products = await modelsForLine(supabase, lineId || null)
+      // Cheap early exit: the line changed while this was reading, so everything below it is
+      // work for a scope nobody is looking at any more.
+      if (!isCurrent()) return
       const productIds = products.map((p) => p.id)
 
       // ── 2. The applies-list, scoped to those models ─────────────────────────────────
       // Scoped by PRODUCT, not by the operation's line: an operation doesn't have to sit on the
       // same line as the model it applies to, and often doesn't for imported data. The unit
       // being counted is "this operation is allocated to this model", so the model decides.
-      const modelOperations: { operation_id: string; product_id: string }[] = []
-      for (const chunk of chunked(productIds, READ_CHUNK)) {
-        const { data, error: err } = await supabase
+      // Paged, not just chunked: one 150-model chunk of the applies-list runs to thousands of
+      // rows, well past the 1000-row response cap, and a capped response is a normal 200 with a
+      // short array — the truncation that used to leave this screen's coverage headline at 0%.
+      // See lib/supabaseRead. The order is the table's full primary key, which paging requires.
+      const modelOperations = await fetchAllChunked<{ operation_id: string; product_id: string }>(
+        productIds, READ_CHUNK,
+        (chunk) => supabase
           .from('model_operations').select('operation_id, product_id').in('product_id', chunk)
-        if (err) throw new Error(err.message)
-        modelOperations.push(...((data ?? []) as { operation_id: string; product_id: string }[]))
-      }
+          .order('operation_id').order('product_id'),
+        { table: 'model_operations' }
+      )
 
       // ── 3. Recorded times for those models, product-first ───────────────────────────
       // The same chain fetchModelTotal holds itself to: junction → times → operations, filtered
       // by product_id alone at the top and never re-narrowed by line.
-      const operationTimeModels: { operation_time_id: string; product_id: string }[] = []
-      for (const chunk of chunked(productIds, READ_CHUNK)) {
-        const { data, error: err } = await supabase
+      const operationTimeModels = await fetchAllChunked<{ operation_time_id: string; product_id: string }>(
+        productIds, READ_CHUNK,
+        (chunk) => supabase
           .from('operation_time_models').select('operation_time_id, product_id').in('product_id', chunk)
-        if (err) throw new Error(err.message)
-        operationTimeModels.push(...((data ?? []) as { operation_time_id: string; product_id: string }[]))
-      }
+          .order('operation_time_id').order('product_id'),
+        { table: 'operation_time_models' }
+      )
 
+      // FILTERED to the current records. This screen shows labour totals and nothing about the
+      // history behind them — no run counts, no archived counts — so the archived rows would be
+      // fetched only to be discarded by currentForOperation. superseded_by is still selected: the
+      // helper decides which row is the figure, and handing it rows without the column would have
+      // it guess.
       const timeIds = [...new Set(operationTimeModels.map((tm) => tm.operation_time_id))]
-      const operationTimes: { id: string; operation_id: string; total_minutes: number | null }[] = []
-      for (const chunk of chunked(timeIds, READ_CHUNK)) {
-        const { data, error: err } = await supabase
-          .from('operation_times').select('id, operation_id, total_minutes').in('id', chunk)
-        if (err) throw new Error(err.message)
-        operationTimes.push(...((data ?? []) as { id: string; operation_id: string; total_minutes: number | null }[]))
-      }
+      const operationTimes = await fetchAllChunked<{ id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null }>(
+        timeIds, READ_CHUNK,
+        (chunk) => supabase
+          .from('operation_times').select('id, operation_id, total_minutes, superseded_by')
+          .in('id', chunk).is('superseded_by', null)
+          .order('id'),
+        { table: 'operation_times' }
+      )
 
       // ── 4. Operations + jobs, purely to label the labour rows ───────────────────────
       const opIds = [...new Set([
@@ -290,6 +326,9 @@ export default function DashboardClient({ role, lines, initialLineId }: Props) {
       const jobIds = [...new Set(operations.map((o) => o.job_id).filter(Boolean))]
       const jobs: { id: string; name: string }[] = []
       for (const chunk of chunked(jobIds, READ_CHUNK)) {
+        // Identity lookup by id — deliberately NOT filtered to is_active. A retired job still
+        // labels the operations and times that point at it; filtering here would blank the name
+        // on real history rather than hide a row. See the note at the top of lib/jobs.
         const { data, error: err } = await supabase.from('jobs').select('id, name').in('id', chunk)
         if (err) throw new Error(err.message)
         jobs.push(...(data ?? []) as { id: string; name: string }[])
@@ -368,6 +407,7 @@ export default function DashboardClient({ role, lines, initialLineId }: Props) {
       ).length
 
       const byProductId = new Map(perModel.map((m) => [m.productId, m]))
+      if (!isCurrent()) return
       setCoverage({
         requiredCombos: aggregate.totalRequired,
         coveredCombos: aggregate.totalCovered,
@@ -386,6 +426,7 @@ export default function DashboardClient({ role, lines, initialLineId }: Props) {
       // back is only the builds still ahead — no client-side date parsing, and no 1,000-row
       // page of the oldest rows standing in for the whole table.
       const future = await fetchFutureBuilds(supabase, lineId ? productIds : null)
+      if (!isCurrent()) return
       setUnlinkedBuilds(future.unlinkedBuilds)
 
       // Every model on the line gets a row, including the ones with nothing booked. A model
@@ -395,8 +436,8 @@ export default function DashboardClient({ role, lines, initialLineId }: Props) {
       const rows: PriorityRow[] = products.map((product) => {
         const entry = future.byProductId.get(product.id)
         const cov = byProductId.get(product.id)
-        // The shared "average per operation, then sum" helper — never a raw SUM(total_minutes),
-        // which would multiply an operation's contribution by how many times it was timed.
+        // The shared "current record per operation, then sum" helper — never a raw
+        // SUM(total_minutes), which would count every superseded run as extra labour content.
         const total = modelTotalMinutes({
           productId: product.id,
           operations,
@@ -419,10 +460,19 @@ export default function DashboardClient({ role, lines, initialLineId }: Props) {
           totalMinutes: total.operations.length > 0 ? total.totalMinutes : null,
         }
       })
+      if (!isCurrent()) return
       setPriority(rows)
 
       // ── 7. Times collected: today / this week / last week ───────────────────────────
-      const { todayStart, thisWeekStart, lastWeekStart } = periodBounds()
+      // Boundaries and labels come from lib/periods, which is also what the "Who's collecting"
+      // panel below counts over — one Monday, one midnight, so the two sets of numbers
+      // reconcile by construction rather than by two copies of the arithmetic agreeing.
+      const bounds = periodBounds()
+      const { todayStart, thisWeekStart, lastWeekStart } = bounds
+      // NOT filtered to the current record: this counts COLLECTION ACTIVITY — how many times
+      // were recorded in a window — not labour content. A run that has since been superseded was
+      // still collected that day, and hiding it would make the week's work shrink retroactively
+      // every time somebody re-measured something.
       async function countTimes(fromDate: Date, toDate?: Date): Promise<number> {
         let q = supabase.from('operation_times').select('id', { count: 'exact', head: true })
           .gte('created_at', fromDate.toISOString())
@@ -437,22 +487,23 @@ export default function DashboardClient({ role, lines, initialLineId }: Props) {
         countTimes(thisWeekStart),
         countTimes(lastWeekStart, thisWeekStart),
       ])
-      const dayLabel = (d: Date) => d.toLocaleDateString('en-AU', { day: 'numeric', month: 'short' })
-      const lastWeekEnd = new Date(thisWeekStart)
-      lastWeekEnd.setDate(thisWeekStart.getDate() - 1)
+      if (!isCurrent()) return
       setCollected({
         today: todayCount,
         thisWeek: weekCount,
         lastWeek: lastWeekCount,
-        todayLabel: `since midnight, ${dayLabel(todayStart)}`,
-        thisWeekLabel: `${dayLabel(thisWeekStart)} — today`,
-        lastWeekLabel: `${dayLabel(lastWeekStart)} — ${dayLabel(lastWeekEnd)}`,
+        todayLabel: periodRangeLabel('today', bounds),
+        thisWeekLabel: periodRangeLabel('thisWeek', bounds),
+        lastWeekLabel: periodRangeLabel('lastWeek', bounds),
       })
     } catch (err) {
+      // A superseded load's failure is not this screen's problem — reporting it would put an
+      // error banner over figures that loaded perfectly well for the line actually selected.
+      if (!isCurrent()) return
       setError(err instanceof Error ? err.message : 'Could not load the dashboard')
       setCoverage(null); setPriority([]); setUnlinkedBuilds(0)
     } finally {
-      setLoading(false)
+      if (isCurrent()) setLoading(false)
     }
   }, [supabase, lineId])
 
@@ -637,7 +688,15 @@ export default function DashboardClient({ role, lines, initialLineId }: Props) {
             </div>
           </section>
 
-          {/* ── 4. Schedule priority ─────────────────────────────────────────────────── */}
+          {/* ── 4. Who's collecting ──────────────────────────────────────────────────── */}
+          {/* The same operation_times the cards above count, broken down by who recorded
+            * them. Loads independently of the coverage sweep and over the same line filter;
+            * see lib/collectors for the aggregation and lib/periods for the windows. */}
+          <div style={{ marginTop: 20 }}>
+            <CollectorsPanel lineId={lineId} lineName={lineName} />
+          </div>
+
+          {/* ── 5. Schedule priority ─────────────────────────────────────────────────── */}
           <section className="card" style={{ marginBottom: 20, overflow: 'hidden' }}>
             <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border)' }}>
               <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--text)' }}>Collect these next</div>

@@ -1,0 +1,19 @@
+/*
+ * Page setup for /reports — route-scoped, for the same reason as /pre-assembly-coverage's and
+ * /model-total's: `@page` cannot be scoped by selector, so an unnamed rule in globals.css would
+ * re-paper every other printable screen in the app.
+ *
+ * UNNAMED, and not the `@page reports-sheet {…}` + `.reports-page { page: reports-sheet }` pair
+ * this route used to carry. NAMED PAGES ARE NOT SUPPORTED IN SAFARI (nor Firefox), and where
+ * the rule is ignored so are the size AND the margins — the report then silently came out at
+ * whatever the user's print dialog happened to be set to, which is the difference between a
+ * sheet that always prints the same and one that depends on who pressed Print.
+ *
+ * Landscape because the table is nine columns wide and two of them — Models and Notes — are
+ * free text; in portrait they collapse to roughly a word per line and the report runs to three
+ * times the paper. 12mm is the margin every other printable screen in the app now uses.
+ */
+@page {
+  size: A4 landscape;
+  margin: 12mm;
+}

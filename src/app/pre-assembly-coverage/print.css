@@ -1,0 +1,21 @@
+/*
+ * Page setup for /pre-assembly-coverage — route-scoped on purpose.
+ *
+ * This file is imported by the route's page.tsx, so Next.js only ships it on this route. That
+ * matters because `@page` cannot be scoped by selector: an UNNAMED @page rule in globals.css
+ * would re-paper every other printable screen in the app (the Model Total collection sheet, the
+ * Reports table, the A3 Roadmap), each of which sets its own.
+ *
+ * Unnamed, and not the `@page pac-sheet {…}` + `.pac-page { page: pac-sheet }` pair the other
+ * print screens use. NAMED PAGES ARE NOT SUPPORTED IN SAFARI (nor in Firefox). Where they are
+ * ignored, so is everything in them — the paper size AND the margins — and the print silently
+ * falls back to whatever the user's print dialog happens to be set to. That is the difference
+ * between a report that always comes out the same and one that depends on who pressed Print.
+ *
+ * Landscape because the table is six columns wide and the widest of them is a comma-separated
+ * list of model codes; in portrait the numeric headers have to fight for room.
+ */
+@page {
+  size: A4 landscape;
+  margin: 12mm;
+}

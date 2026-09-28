@@ -1,0 +1,202 @@
+/*
+ * ── The shared print treatment for printable reports ────────────────────────────────────────
+ *
+ * Imported by the routes that print a report — /pre-assembly-coverage and /model-total today,
+ * and whatever comes third. It is NOT in globals.css: everything here is either inside
+ * `@media print` or a two-line display toggle, but `@media print` rules still apply on every
+ * screen that loads them, and the shell reset below would fight any future page that wants its
+ * own print layout. Route-imported CSS ships only on the routes that ask for it.
+ *
+ * What it deliberately does NOT set is the paper. `@page` cannot be scoped by selector, so each
+ * route keeps a three-line print.css of its own next to its page.tsx — /pre-assembly-coverage is
+ * landscape (a six-column table), /model-total is portrait (a name and a number). Those files
+ * carry a note about why the rule is unnamed.
+ *
+ * ── The class vocabulary ───────────────────────────────────────────────────────────────────
+ *   .rp-shell        the outermost page wrapper (the div holding <Nav/> and <main>)
+ *   .rp-page         the <main> element
+ *   .rp-doc          the document that actually prints
+ *   .rp-screen-only  controls, buttons, filters — on screen, never on paper
+ *   .rp-print-only   the reverse: rendered for print, invisible on screen
+ *   .rp-head / .rp-title / .rp-meta      the document header block
+ *   .rp-table + .rp-num                  a report table and its right-aligned figure column
+ *   tr.rp-group / tr.rp-subhead          a group header row, and any row that must not be the
+ *                                        last thing on a sheet
+ *   .rp-section / .rp-keep / .rp-foot    fragmentation helpers
+ *
+ * ── The rule about rules ───────────────────────────────────────────────────────────────────
+ * Hairlines, inside tables, and nowhere else. No box around the page header, no box around a
+ * section, no grid around cells. A full grid at 0.5pt reads as a form to be filled in; a report
+ * separates itself with type size and white space. The earlier version of the coverage report
+ * boxed everything in solid black and was unusable on paper, which is why this file exists.
+ */
+
+/* Both halves of the screen/print pair. Declared outside the media query so the element has a
+ * defined state in each. */
+.rp-print-only { display: none; }
+
+@media print {
+  /* ── The app shell, removed ───────────────────────────────────────────────────────────────
+     The report's first line has to sit on the top margin of sheet one. Every container between
+     <body> and the document contributes to that, so every one of them is zeroed here rather
+     than trusted to a rule somewhere else:
+
+       .nav          the sticky 56px bar (also hidden by the global print block — repeated so a
+                     report does not depend on that block continuing to exist)
+       .rp-shell     the page wrapper's `min-height: 100vh`. A vh unit in print is measured
+                     against the SCREEN viewport, not the sheet, so this is a container taller
+                     than the paper it is printed on — and it must be a class, because an inline
+                     style cannot be overridden from a stylesheet without !important everywhere.
+       .rp-page      .page / .page-wide's 24px of padding and its centring max-width. */
+  .nav,
+  .gaps-drawer,
+  .gaps-drawer-overlay { display: none !important; }
+
+  /* print-color-adjust: EXACT, set at the root and again on the document below.
+     Browsers default to `economy` for print, which is free to drop backgrounds and wash colour
+     out of text to save toner — so a report that uses colour to mean something has to say it
+     means it. Nothing here asks for a background; what it protects is the red on /model-total's
+     untimed rows. That red is still never the only cue (see globals.css), because `exact` is a
+     request the browser and the printer can both decline. */
+  html, body {
+    margin: 0 !important;
+    padding: 0 !important;
+    background: #fff !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  .rp-shell {
+    min-height: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    background: #fff !important;
+  }
+
+  .rp-page {
+    max-width: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+
+  .rp-screen-only { display: none !important; }
+  .rp-print-only { display: block !important; }
+
+  /* ── The document ─────────────────────────────────────────────────────────────────────── */
+  /* BLOCK, never flex. Chromium fragments flex containers badly: a flex column with a gap
+     pushes trailing content onto sheets of its own, which is how the coverage report's footnote
+     ended up alone on a near-blank page and read as "not rendering at all". */
+  .rp-doc {
+    display: block;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+    color: #000;
+    font-size: 9.5pt;
+    line-height: 1.32;
+    margin: 0 !important;
+  }
+  /* Flattened to black on white — including backgrounds, which a photocopier renders as grey
+     mud. Anything that carried meaning in colour on screen must carry it in weight or italics
+     here; see the per-report stylesheets. */
+  .rp-doc * {
+    color: #000 !important;
+    background: transparent !important;
+  }
+  .rp-doc > :first-child { margin-top: 0 !important; }
+
+  .rp-head {
+    border: 0 !important;
+    padding: 0 0 4px !important;
+    margin: 0 0 12px !important;
+  }
+  .rp-title { font-size: 15pt; font-weight: 700; margin: 0 0 3px !important; }
+  .rp-meta { font-size: 9pt; margin: 1px 0 0; }
+
+  /* ── Tables ───────────────────────────────────────────────────────────────────────────── */
+  /* table-layout: fixed, so the column widths a report declares are the widths it gets. With
+     `auto` the browser re-measures against content and the widest column grows until the table
+     runs off the right-hand margin. */
+  .rp-table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+    margin: 0;
+    font-size: 8.5pt;
+  }
+  /* The point of a multi-sheet table: the headings come back at the top of every one. */
+  .rp-table thead { display: table-header-group; }
+  /* A row is one line of evidence — split across a break it reads as two rows, each missing
+     half its columns. */
+  .rp-table tr { break-inside: avoid; page-break-inside: avoid; }
+
+  .rp-table th {
+    border: 0;
+    border-bottom: 0.5pt solid #666;
+    padding: 3px 8px;
+    font-size: 7.5pt;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    text-align: left;
+    vertical-align: bottom;
+    /* Two lines is fine; a word snapped in half is not. A heading that cannot wrap overflows
+       its fixed-width cell instead and collides with its neighbour — which is exactly how
+       "AVG MINS COVERED SCHEDULED" once printed as one word. */
+    white-space: normal;
+    overflow-wrap: normal;
+    word-break: keep-all;
+  }
+  .rp-table td {
+    border: 0;
+    border-bottom: 0.5pt solid #bbb;
+    padding: 3px 8px;
+    vertical-align: top;
+  }
+
+  /* Figures right, text left. Only DATA cells get nowrap: a number must not wrap, a heading
+     must be allowed to. */
+  .rp-table th.rp-num { text-align: right; }
+  .rp-table td.rp-num { text-align: right; white-space: nowrap; }
+
+  /* The outer edges lose their padding so the table spans the full measure between the page
+     margins — 8px is kept everywhere else, which is what stops columns touching. */
+  .rp-table th:first-child, .rp-table td:first-child { padding-left: 0; }
+  .rp-table th:last-child, .rp-table td:last-child { padding-right: 0; }
+
+  /* A group header row: a slightly stronger rule ABOVE it, to separate one group from the last
+     row of the previous one, and never the last thing on a sheet. */
+  .rp-table tr.rp-group > * {
+    border-top: 0.75pt solid #444;
+    border-bottom: 0.5pt solid #bbb;
+    padding-top: 7px;
+    font-weight: 700;
+  }
+  /* Only the very first group in the table loses the rule — it has nothing above it to be
+     separated from. Scoped to the first tbody because a report may give each group a tbody of
+     its own, in which case EVERY group row is its parent's :first-child and a bare
+     `tr.rp-group:first-child` silently strips the rule from all of them. */
+  .rp-table tbody:first-of-type > tr.rp-group:first-child > * { border-top: 0; padding-top: 3px; }
+  .rp-table > tr.rp-group:first-child > * { border-top: 0; padding-top: 3px; }
+  .rp-table tr.rp-group,
+  .rp-table tr.rp-subhead { break-after: avoid; page-break-after: avoid; }
+
+  /* ── Fragmentation ────────────────────────────────────────────────────────────────────── */
+  /* One section per sheet. :first-of-type / :last-of-type rather than modifier classes, so
+     adding, removing or filtering out a section can leave neither a blank leading sheet nor a
+     trailing one. */
+  .rp-section { display: block; break-before: page; page-break-before: always; }
+  .rp-section:first-of-type { break-before: auto; page-break-before: avoid; margin-top: 0; }
+  .rp-section:last-of-type { break-after: avoid; page-break-after: avoid; margin-bottom: 0; }
+
+  .rp-keep { break-inside: avoid; page-break-inside: avoid; }
+
+  /* Small print, kept with the figures it qualifies rather than orphaned onto the next sheet. */
+  .rp-foot {
+    font-size: 8pt;
+    line-height: 1.5;
+    margin: 9px 0 0;
+    break-before: avoid;
+    page-break-before: avoid;
+    break-inside: avoid;
+  }
+}
