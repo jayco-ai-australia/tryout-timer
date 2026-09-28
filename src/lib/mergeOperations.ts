@@ -1,6 +1,19 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
-import { READ_CHUNK, chunked } from './modelOperations'
-import type { Operation } from './types'
+import { READ_CHUNK, chunked, fetchLinksForOperations, linkOperationsToModels } from './modelOperations'
+import { fetchAllRows } from './supabaseRead'
+
+/**
+ * The least an operation has to be for this module to fold it away. Deliberately NOT the full
+ * `Operation` row: lib/jobs' job merge reaches this path holding rows it read itself (id, name
+ * and is_active off `operations`), and widening the parameter is what lets it call THIS merge
+ * rather than growing a second one of its own.
+ */
+export interface MergeableOperation {
+  id: string
+  name: string
+  /** Only read to record whether a reversal has to bring the duplicate back. */
+  is_active?: boolean
+}
 
 /**
  * The single operation-merge module — /setup, /tryouts and /collect all fold duplicate
@@ -10,9 +23,15 @@ import type { Operation } from './types'
  * A merge re-points every operation_time from each duplicate onto the keeper, then flips the
  * duplicate to is_active = false. Notes and time-model links ride along untouched — both hang
  * off operation_time_id, not operation_id — so no time or note is created, deleted or edited;
- * they only change which operation they belong to. Model links on the retired duplicate ARE
- * cleared, because a retired operation still carrying them keeps counting towards a model's
- * coverage while no screen shows it.
+ * they only change which operation they belong to.
+ *
+ * Applies-list rows (model_operations) are UNIONED onto the keeper and then cleared off the
+ * duplicate. Clearing them is required — a retired operation still carrying them keeps counting
+ * towards a model's coverage while no screen shows it — but clearing them WITHOUT first putting
+ * them on the keeper loses real applicability: the duplicate's times have just moved to the
+ * keeper carrying their own operation_time_models rows, so those minutes go on counting towards
+ * a model the keeper is no longer listed as doing. The upsert de-duplicates, so a model both
+ * operations already applied to is one row before and one row after.
  *
  * ── The guard ─────────────────────────────────────────────────────────────────────────────
  * A time collected by somebody else is not ours to move: an update touching one can come back
@@ -73,7 +92,7 @@ export interface MergePreflight {
  */
 export async function preflightMerge(
   supabase: SupabaseClient,
-  dups: Operation[],
+  dups: MergeableOperation[],
   userId: string
 ): Promise<MergePreflight> {
   const timesByOperation: Record<string, number> = {}
@@ -136,10 +155,36 @@ export function blockedMergeMessage(blockers: MergeBlocker[]): string {
   )
 }
 
+/**
+ * One duplicate folded away, and everything needed to put it back exactly as it was.
+ *
+ * Recorded as the merge runs and handed to the caller. A single operation merge does not need
+ * it — it is one operation and it either happened or it didn't — but lib/jobs' job merge runs a
+ * whole sequence of these alongside its own reparents, and a failure half way through has to be
+ * undone rather than reported as a mess. See reverseOperationMerge.
+ */
+export interface OperationMergeReversal {
+  dupId: string
+  dupName: string
+  keeperId: string
+  /** The operation_times ids that moved, read BEFORE the move — afterwards they are
+   * indistinguishable from times the keeper already had, so this is the only chance to know. */
+  movedTimeIds: string[]
+  /** The applies-list rows the duplicate carried, all of which were deleted from it. */
+  dupProductIds: string[]
+  /** Of those, the ones the keeper did NOT already have — precisely the rows the union added,
+   * so a reversal removes what it created and nothing the keeper owned in its own right. */
+  addedToKeeperProductIds: string[]
+  /** Whether the duplicate was active before it was retired. */
+  dupWasActive: boolean
+}
+
 export interface MergeResult {
   /** Duplicates left ACTIVE because times were still on them after the move. Empty on a clean
    * merge. Never silently dropped — a caller is expected to report these. */
   stranded: string[]
+  /** One per duplicate actually folded away, in the order it happened. */
+  reversals: OperationMergeReversal[]
 }
 
 /**
@@ -149,15 +194,25 @@ export interface MergeResult {
  */
 export async function mergeOperations(
   supabase: SupabaseClient,
-  { keeper, dups, userId }: { keeper: Operation; dups: Operation[]; userId: string }
+  { keeper, dups, userId }: { keeper: MergeableOperation; dups: MergeableOperation[]; userId: string }
 ): Promise<MergeResult> {
-  if (dups.length === 0) return { stranded: [] }
+  if (dups.length === 0) return { stranded: [], reversals: [] }
 
   const preflight = await preflightMerge(supabase, dups, userId)
   if (preflight.blockers.length > 0) throw new Error(blockedMergeMessage(preflight.blockers))
 
   const stranded: string[] = []
+  const reversals: OperationMergeReversal[] = []
   for (const dup of dups) {
+    // Read the ids of what is about to move BEFORE moving it. Two reasons: after the update
+    // these rows are indistinguishable from the keeper's own, and a reversal has to move back
+    // exactly the rows this merge moved and not one row more.
+    const timeRows = await fetchAllRows<{ id: string }>(
+      () => supabase.from('operation_times').select('id').eq('operation_id', dup.id).order('id'),
+      { table: 'operation_times' }
+    )
+    const movedTimeIds = timeRows.map((t) => t.id)
+
     const { error: moveError } = await supabase
       .from('operation_times').update({ operation_id: keeper.id }).eq('operation_id', dup.id)
     if (moveError) throw new Error(`Moving times off "${dup.name}": ${moveError.message}`)
@@ -173,6 +228,31 @@ export async function mergeOperations(
       continue
     }
 
+    // ── Model links: UNIONED onto the keeper, then cleared off the duplicate ──────────────
+    // Clearing alone (which is all this did) loses applicability the merge had no business
+    // losing: the duplicate's times have just landed on the keeper, and each of those times
+    // carries its own operation_time_models rows. Drop the duplicate's applies-list row without
+    // putting it on the keeper and that model's minutes still count towards its total while the
+    // keeper is missing from its coverage — exactly the disagreement lib/modelOperations' guard
+    // exists to prevent, arrived at from the other direction.
+    //
+    // The upsert in linkOperationsToModels is what de-duplicates: a model both operations
+    // already applied to is one row before and one row after.
+    const [dupLinks, keeperLinks] = await Promise.all([
+      fetchLinksForOperations(supabase, [dup.id]),
+      fetchLinksForOperations(supabase, [keeper.id]),
+    ])
+    const dupProductIds = [...new Set(dupLinks.map((l) => l.product_id))]
+    const keeperProductIds = new Set(keeperLinks.map((l) => l.product_id))
+    const addedToKeeperProductIds = dupProductIds.filter((id) => !keeperProductIds.has(id))
+    if (addedToKeeperProductIds.length > 0) {
+      const linked = await linkOperationsToModels(
+        supabase,
+        addedToKeeperProductIds.map((product_id) => ({ operation_id: keeper.id, product_id }))
+      )
+      if (linked.error) throw new Error(`Moving model links onto "${keeper.name}": ${linked.error}`)
+    }
+
     // Stale model links on a retired operation would keep it counting towards a model's
     // coverage, so clear them. Times are never touched.
     const { error: linkError } = await supabase.from('model_operations').delete().eq('operation_id', dup.id)
@@ -182,9 +262,79 @@ export async function mergeOperations(
       .from('operations').update({ is_active: false }).eq('id', dup.id).select('id')
     if (retireError) throw new Error(`Retiring "${dup.name}": ${retireError.message}`)
     if (!retired || retired.length === 0) throw new Error(`"${dup.name}" could not be retired — the update was rejected.`)
+
+    reversals.push({
+      dupId: dup.id,
+      dupName: dup.name,
+      keeperId: keeper.id,
+      movedTimeIds,
+      dupProductIds,
+      addedToKeeperProductIds,
+      dupWasActive: dup.is_active !== false,
+    })
   }
 
-  return { stranded }
+  return { stranded, reversals }
+}
+
+/**
+ * Put one folded-away duplicate back — the inverse of the loop above, step for step.
+ *
+ * This exists for lib/jobs' job merge and nothing else. A job merge is a SEQUENCE of writes
+ * (reparent, fold, reparent, retire the emptied job…) and PostgREST gives a browser no
+ * transaction to wrap it in, so the only way to keep "all or nothing" honest is to undo what
+ * already happened when a later step fails. That is a compensating reversal, not a rollback:
+ * it is itself a set of writes that can fail, which is why it returns its failures instead of
+ * throwing. A caller reports them — silence here would be the one outcome worse than the
+ * partial state it is trying to clear up.
+ *
+ * Un-retiring comes FIRST: everything after it re-points rows back at this operation, and doing
+ * that while the row is still retired would hide them on a screen mid-reversal.
+ */
+export async function reverseOperationMerge(
+  supabase: SupabaseClient,
+  reversal: OperationMergeReversal
+): Promise<string[]> {
+  const failures: string[] = []
+
+  if (reversal.dupWasActive) {
+    const { data, error } = await supabase
+      .from('operations').update({ is_active: true }).eq('id', reversal.dupId).select('id')
+    if (error) failures.push(`"${reversal.dupName}" could not be un-retired: ${error.message}`)
+    else if (!data || data.length === 0) failures.push(`"${reversal.dupName}" could not be un-retired — the update was rejected.`)
+  }
+
+  // Only the rows the union created come off the keeper. A model the keeper already applied to
+  // was never this merge's doing and must survive the reversal untouched.
+  for (const chunk of chunked(reversal.addedToKeeperProductIds, READ_CHUNK)) {
+    const { error } = await supabase
+      .from('model_operations').delete().eq('operation_id', reversal.keeperId).in('product_id', chunk)
+    if (error) failures.push(`model links added to the keeper by "${reversal.dupName}" could not be removed: ${error.message}`)
+  }
+
+  if (reversal.dupProductIds.length > 0) {
+    const restored = await linkOperationsToModels(
+      supabase,
+      reversal.dupProductIds.map((product_id) => ({ operation_id: reversal.dupId, product_id }))
+    )
+    if (restored.error) failures.push(`model links on "${reversal.dupName}" could not be restored: ${restored.error}`)
+  }
+
+  // By id, never by operation_id: the keeper's own times are sitting under the same operation_id
+  // now, and a filtered-by-operation update would drag them across too.
+  for (const chunk of chunked(reversal.movedTimeIds, READ_CHUNK)) {
+    const { data, error } = await supabase
+      .from('operation_times').update({ operation_id: reversal.dupId }).in('id', chunk).select('id')
+    if (error) failures.push(`${chunk.length} recorded time${chunk.length === 1 ? '' : 's'} could not be moved back onto "${reversal.dupName}": ${error.message}`)
+    else if ((data ?? []).length < chunk.length) {
+      failures.push(
+        `${chunk.length - (data ?? []).length} recorded time${chunk.length - (data ?? []).length === 1 ? '' : 's'} ` +
+        `could not be moved back onto "${reversal.dupName}" — the update was rejected.`
+      )
+    }
+  }
+
+  return failures
 }
 
 /**
