@@ -425,7 +425,7 @@ export default function CopyToModelsPanel({
         //    `done` past `total`.
         for (const run of copyableRuns) {
           try {
-            const created = await recordOperationTime(supabase, {
+            const { created } = await recordOperationTime(supabase, {
               operationId: run.operationId,
               productIds: [target.id],
               operatorId: run.operatorId,

@@ -562,6 +562,63 @@ export interface RecordOperationTimeInput {
   provenance?: TimeProvenance
 }
 
+/**
+ * What recordOperationTime wrote. `savedProductIds` is what the run was actually linked to, and
+ * can be SHORTER than what was asked for: models the operation does not apply to are refused,
+ * not written (see the guard in recordOperationTime). A caller that recorded against more than
+ * one model must report `refusedProductIds` — a partial save reported as a whole one is exactly
+ * how the orphaned times this guard exists for went unnoticed.
+ */
+export interface RecordedOperationTime {
+  created: OperationTime
+  savedProductIds: string[]
+  refusedProductIds: string[]
+}
+
+/**
+ * recordOperationTime refused EVERY model it was handed, so nothing was written. A distinct type
+ * so a caller can tell "this operation doesn't apply to that model" from a database failure and
+ * say so in its own words — it knows the model names; the guard only knows ids.
+ */
+export class UnlinkedOperationError extends Error {
+  constructor(public readonly operationId: string, public readonly productIds: string[]) {
+    super(
+      productIds.length === 1
+        ? 'This operation doesn’t apply to this model, so the time was not saved. Apply the ' +
+          'operation to the model first, then record the time.'
+        : `This operation doesn’t apply to any of the ${productIds.length} models it was recorded ` +
+          'against, so nothing was saved. Apply it to those models first, then record the time.'
+    )
+    this.name = 'UnlinkedOperationError'
+  }
+}
+
+/**
+ * Which of `productIds` the operation applies to — its model_operations rows. The read
+ * recordOperationTime's guard is built on, exported so a screen can ask the same question before
+ * it offers a save and get the same answer the guard will.
+ *
+ * Read inline rather than through lib/modelOperations, which imports from this module. Chunked
+ * AND paged, with a total order over the junction's key — a short read here would refuse a model
+ * that does apply, which fails closed but is still wrong.
+ */
+export async function fetchLinkedProductIds(
+  supabase: SupabaseClient,
+  operationId: string,
+  productIds: string[]
+): Promise<Set<string>> {
+  if (productIds.length === 0) return new Set()
+  const rows = await fetchAllChunked<{ product_id: string }>(
+    [...new Set(productIds)], READ_CHUNK,
+    (chunk) => supabase
+      .from('model_operations').select('product_id')
+      .eq('operation_id', operationId).in('product_id', chunk)
+      .order('product_id'),
+    { table: 'model_operations' }
+  )
+  return new Set(rows.map((r) => r.product_id))
+}
+
 /** The team/line a recorded time is filed under. Both columns are nullable on the table, so
  * this can carry nulls — but only after every source below has come up empty. */
 export interface TimeProvenance { teamId: string | null; productionLineId: string | null }
@@ -727,7 +784,7 @@ async function resolveTimeProvenance(
 export async function recordOperationTime(
   supabase: SupabaseClient,
   input: RecordOperationTimeInput
-): Promise<OperationTime> {
+): Promise<RecordedOperationTime> {
   const {
     operationId, productIds, operatorId, collectedBy, totalMinutes,
     startedAt = null, completedAt = null, pausedDurationSeconds = 0,
@@ -739,6 +796,33 @@ export async function recordOperationTime(
   }
   if (productIds.length === 0) {
     throw new Error('At least one model must be selected')
+  }
+
+  /**
+   * ── THE APPLICABILITY GUARD ─────────────────────────────────────────────────────────────
+   *
+   * A time is only ever recorded against a model the operation APPLIES to (a model_operations
+   * row). Every screen that records a time funnels through here, and until this guard none of
+   * them was checked: a time for an unlinked pair counts towards the model's total while the
+   * operation is missing from its coverage — the state behind 554 orphaned records and 18,211
+   * minutes of inflated totals. Checked here once rather than trusted from seven callers.
+   *
+   * Unlinked models are REFUSED and the rest are written: one model of five that the operation
+   * doesn't apply to is no reason to lose the other four and invite a duplicate re-entry. The
+   * refused ids come back on the result for the caller to report. Every model refused → nothing
+   * is written and UnlinkedOperationError is thrown.
+   *
+   * A failed read throws before anything is written — this fails closed.
+   *
+   * This is a browser-side check, so it still races with a concurrent unlink landing between the
+   * read and the insert. Only a database constraint closes that completely. The window is one
+   * round trip, and it also covers the case where a pair was unlinked while a stopwatch ran.
+   */
+  const linkedIds = await fetchLinkedProductIds(supabase, operationId, productIds)
+  const savedProductIds = [...new Set(productIds)].filter((id) => linkedIds.has(id))
+  const refusedProductIds = [...new Set(productIds)].filter((id) => !linkedIds.has(id))
+  if (savedProductIds.length === 0) {
+    throw new UnlinkedOperationError(operationId, refusedProductIds)
   }
 
   // Resolved BEFORE provenance so the degraded "fall back to the operator's team/line" path
@@ -770,7 +854,7 @@ export async function recordOperationTime(
     throw new Error(insertError?.message ?? 'Could not save time')
   }
 
-  await linkOperationTimeToModels(supabase, created.id, productIds)
+  await linkOperationTimeToModels(supabase, created.id, savedProductIds)
 
   /**
    * A NEW time is the current one for every model it was recorded against, and whatever was
@@ -789,7 +873,7 @@ export async function recordOperationTime(
    * which is this one — so the figure is right even in the failure case; the warning is what says
    * the history behind it is not.
    */
-  for (const productId of productIds) {
+  for (const productId of savedProductIds) {
     try {
       const pairTimes = await fetchOperationTimesForModel(supabase, operationId, productId)
       const previousCurrent = pairTimes
@@ -807,7 +891,7 @@ export async function recordOperationTime(
     }
   }
 
-  return created as OperationTime
+  return { created: created as OperationTime, savedProductIds, refusedProductIds }
 }
 
 // ── operation_time_models: the junction, and the only three functions that touch it ────────
@@ -1259,13 +1343,27 @@ export async function splitOperationTimeForModel(
   if (!(totalMinutes > 0)) throw new Error('Minutes must be greater than 0')
   if (!productId) throw new Error('A split needs the model it is being split for')
 
+  // 0. The applicability guard, asked BEFORE anything moves. recordOperationTime would refuse an
+  //    unlinked pair anyway, but only after step 1 had taken the model off the original — and
+  //    the re-link in step 3 is best effort. An already-orphaned pair (a run against a model the
+  //    operation doesn't apply to) is refused here, cleanly: splitting it would only mint a
+  //    second orphan. Apply the operation to the model first, then split.
+  const linked = await fetchLinkedProductIds(supabase, original.operation_id, [productId])
+  if (!linked.has(productId)) {
+    throw new Error(
+      'This run can’t be split for this model: the operation doesn’t apply to the model (it has ' +
+      'no applies-list row), so a new record for it would not count towards coverage. Apply the ' +
+      'operation to the model first, then split. Nothing was changed.'
+    )
+  }
+
   // 1. Nothing has been created yet, so a refusal here is a clean no-op.
   await unlinkOperationTimeFromModel(supabase, original.id, productId)
 
   // 2. Through recordOperationTime like every other time insert in the app.
   let created: OperationTime
   try {
-    created = await recordOperationTime(supabase, {
+    ;({ created } = await recordOperationTime(supabase, {
       operationId: original.operation_id,
       productIds: [productId],
       operatorId,
@@ -1279,7 +1377,7 @@ export async function splitOperationTimeForModel(
       provenance: original.team_id !== null || original.production_line_id !== null
         ? { teamId: original.team_id, productionLineId: original.production_line_id }
         : undefined,
-    })
+    }))
   } catch (err) {
     // 3. Put the model back on the original rather than leaving it short a run.
     try {

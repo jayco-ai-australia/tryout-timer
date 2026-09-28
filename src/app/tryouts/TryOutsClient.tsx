@@ -2018,7 +2018,10 @@ export default function TryOutsClient({ userId, role }: Props) {
                 role={role}
                 onChanged={async () => { await loadVan(van) }}
                 onEmpty={closeTimeDetail}
-                onAddTime={() => openCapture(timeDetail)}
+                // Only offered while the operation applies: this drawer also opens on a run
+                // recorded before the operation was unapplied, and a new time there would be
+                // refused. The tick box on the row is the way back.
+                onAddTime={modelOpIds.has(timeDetail.operationId) ? () => openCapture(timeDetail) : undefined}
               />
             </div>
           </div>
@@ -2247,7 +2250,7 @@ function VanOperationsPane({
                       Complete
                     </button>
                   </>
-                ) : (
+                ) : applies ? (
                   <>
                     <button
                       type="button"
@@ -2264,6 +2267,41 @@ function VanOperationsPane({
                       style={{ marginLeft: 'auto' }}
                       title="Type the minutes in instead of running a stopwatch"
                       onClick={() => job && onAddManualTime(op, job)}
+                    >
+                      Enter manually
+                    </button>
+                  </>
+                ) : (
+                  // Doesn't apply → can't be timed on this van. A time here would count towards
+                  // the model's total while the operation is missing from its coverage (and
+                  // recordOperationTime now refuses it). Both actions stay visible but disabled,
+                  // with the way out beside them: apply it first — the same write as the tick box.
+                  <>
+                    <button
+                      type="button"
+                      className="btn-primary"
+                      style={{ padding: '4px 10px', fontSize: 12 }}
+                      disabled
+                      title={`Doesn’t apply to ${van.model ?? 'this model'} — apply it first to time it`}
+                    >
+                      ▶ Start
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-ghost"
+                      style={{ padding: '4px 10px', fontSize: 12 }}
+                      disabled={allocBusy}
+                      title={`Make this operation apply to ${van.model ?? 'this model'}, then time it`}
+                      onClick={() => onAllocate(op)}
+                    >
+                      {allocBusy ? 'Applying…' : 'Apply to model first'}
+                    </button>
+                    <button
+                      type="button"
+                      className="finder-row-action"
+                      style={{ marginLeft: 'auto' }}
+                      disabled
+                      title={`Doesn’t apply to ${van.model ?? 'this model'} — apply it first to enter a time`}
                     >
                       Enter manually
                     </button>
@@ -2298,7 +2336,8 @@ function TimeDetailPanel({
   role: UserRole | null
   onChanged: () => Promise<void>
   onEmpty: () => void
-  onAddTime: () => void
+  /** Absent when the operation doesn't apply to this model — no new time can be recorded. */
+  onAddTime?: () => void
 }) {
   const [notesByTime, setNotesByTime] = useState<Record<string, OperationTimeNote[]>>({})
   const [drafts, setDrafts] = useState<Record<string, string>>({})
@@ -2456,7 +2495,14 @@ function TimeDetailPanel({
         })
       )}
 
-      <button className="btn-ghost" onClick={onAddTime}>+ Add another time</button>
+      {onAddTime
+        ? <button className="btn-ghost" onClick={onAddTime}>+ Add another time</button>
+        : (
+          <p style={{ margin: 0, fontSize: 12, color: 'var(--text-muted)' }}>
+            This operation doesn’t apply to this model, so no further time can be added here —
+            tick “Applies” on its row first.
+          </p>
+        )}
 
       {confirmDelete && (
         <ConfirmDialog
@@ -2943,7 +2989,7 @@ function CapturePanel({
     if (!canSave || !van.productId) return
     setSaving(true); setError(null)
     try {
-      const created = await recordOperationTime(supabase, {
+      const { created } = await recordOperationTime(supabase, {
         operationId: target.operationId,
         productIds: [van.productId],
         // Blank → null → recorded against the placeholder operator, since

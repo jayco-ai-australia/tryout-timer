@@ -1028,7 +1028,7 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
     setAddTimeSaving(true)
     setAddTimeError(null)
     try {
-      const created = await recordOperationTime(supabase, {
+      const { created } = await recordOperationTime(supabase, {
         operationId: addTimeOperationId,
         productIds: [productId],
         operatorId: addTimeOperatorId,

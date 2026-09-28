@@ -2,8 +2,7 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import type { SupabaseClient } from '@supabase/supabase-js'
-import { addOperationTimeNote, recordOperationTime } from './operationTimes'
-import type { OperationTime } from './types'
+import { addOperationTimeNote, recordOperationTime, type RecordedOperationTime } from './operationTimes'
 import { usePersistedState } from './useLocalStorage'
 
 /**
@@ -215,10 +214,13 @@ export async function saveTimerRun(
     notes?: string[]
     atMs?: number
   }
-): Promise<OperationTime> {
+): Promise<RecordedOperationTime> {
   const { totalMinutes, pausedDurationSeconds, startedAt, completedAt } = completeTimer(timer, opts.atMs ?? Date.now())
 
-  const created = await recordOperationTime(supabase, {
+  // The models were snapshotted at Start. recordOperationTime re-checks them against the
+  // applies-list NOW, so a pair unlinked while the clock ran is refused here rather than banked;
+  // the result says which, and the caller reports it.
+  const recorded = await recordOperationTime(supabase, {
     operationId: timer.operationId,
     productIds: timer.productIds,
     operatorId: opts.operatorId !== undefined ? opts.operatorId : timer.operatorId,
@@ -236,13 +238,13 @@ export async function saveTimerRun(
 
   for (const note of notes) {
     try {
-      await addOperationTimeNote(supabase, created.id, note, opts.userId)
+      await addOperationTimeNote(supabase, recorded.created.id, note, opts.userId)
     } catch (err) {
       console.error('[saveTimerRun] the time saved but a note did not:', note, err)
     }
   }
 
-  return created
+  return recorded
 }
 
 /**

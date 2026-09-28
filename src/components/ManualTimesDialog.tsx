@@ -36,6 +36,13 @@ import { plural } from '@/lib/format'
  * "I didn't measure this one", but "2o" means "I measured this one and it is about to be
  * thrown away". Those rows are named rather than silently dropped.
  *
+ * ── Each row is saved against the models ITS operation applies to ─────────────────────────
+ * The ticked models come from whichever operation was drilled into, and the ticked operations
+ * need not all apply to them. Every row therefore states what it will be saved against, and a
+ * row whose operation applies to NONE of the ticked models says so and can't be filled in —
+ * rather than banking a time against models it doesn't apply to (the guard in
+ * recordOperationTime would refuse it anyway; this stops anyone typing a number that can't land).
+ *
  * ── Layout ────────────────────────────────────────────────────────────────────────────────
  * The three-region Modal — header fixed, rows scroll, footer PINNED. This is the same screen
  * where an unbounded list once pushed its own Save button off a tablet viewport (see the
@@ -76,13 +83,16 @@ function readMinutes(raw: string): { state: 'blank' } | { state: 'ok'; value: nu
 }
 
 export default function ManualTimesDialog({
-  operations, modelCount, operators, saving, error, onSave, onCancel,
+  operations, modelCount, modelsByOperation, operators, saving, error, onSave, onCancel,
 }: {
   /** Every operation the collector selected, in the order the pane shows them. */
   operations: { id: string; name: string }[]
   /** How many models each recorded time will be banked against — the context that makes a
    * coverage time mean something, so it is named in the subtitle rather than assumed. */
   modelCount: number
+  /** Per operation id, the ticked models that operation applies to — what its row will be saved
+   * against. Empty → the row is locked and says why. */
+  modelsByOperation: Record<string, { id: string; model: string }[]>
   /** Already scoped to the walked production line by the caller. */
   operators: OperatorSelectOption[]
   saving: boolean
@@ -110,7 +120,19 @@ export default function ManualTimesDialog({
     setRows((prev) => prev.map((r) => (r.operationId === operationId ? { ...r, ...patch } : r)))
   }
 
-  const parsed = useMemo(() => rows.map((r) => ({ row: r, minutes: readMinutes(r.minutes) })), [rows])
+  const appliesToNone = (operationId: string) => (modelsByOperation[operationId] ?? []).length === 0
+  const lockedCount = operations.filter((op) => appliesToNone(op.id)).length
+
+  // A locked row's minutes are ignored even if something was typed before it locked.
+  const parsed = useMemo(
+    () => rows.map((r) => ({
+      row: r,
+      minutes: (modelsByOperation[r.operationId] ?? []).length === 0
+        ? { state: 'blank' as const }
+        : readMinutes(r.minutes),
+    })),
+    [rows, modelsByOperation]
+  )
   const readyCount = parsed.filter((p) => p.minutes.state === 'ok').length
   const badRows = parsed.filter((p) => p.minutes.state === 'bad').map((p) => p.row.operationName)
 
@@ -171,10 +193,26 @@ export default function ManualTimesDialog({
       }
     >
       <p style={{ margin: '0 0 16px', fontSize: 13, color: 'var(--text-mid)', lineHeight: 1.55 }}>
-        Recording {plural(operations.length, 'operation')} against {plural(modelCount, 'model')},
-        without running a stopwatch. Minutes is the only thing needed — operator and note are
-        optional, and an operation left blank simply isn&apos;t recorded.
+        Recording {plural(operations.length, 'operation')} against the {plural(modelCount, 'ticked model')},
+        without running a stopwatch. Each operation is saved only against the ticked models it
+        applies to — shown under its name. Minutes is the only thing needed — operator and note
+        are optional, and an operation left blank simply isn&apos;t recorded.
       </p>
+      {lockedCount > 0 && (
+        <p
+          style={{
+            margin: '0 0 16px', padding: '9px 12px', borderRadius: 8, fontSize: 12, lineHeight: 1.55,
+            background: 'var(--amber-bg)', border: '1px solid #fde68a', color: '#92400e',
+          }}
+        >
+          <strong>
+            {lockedCount === 1 ? '1 ticked operation applies' : `${lockedCount} ticked operations apply`} to
+            none of the ticked models
+          </strong>{' '}
+          and can&apos;t be recorded here. Link {lockedCount === 1 ? 'it' : 'them'} to the models first
+          (Link models), or untick {lockedCount === 1 ? 'it' : 'them'}.
+        </p>
+      )}
 
       {/* ── Apply to all: type once, fill down. A convenience only — see the note above. ── */}
       <div className="mt-apply">
@@ -230,14 +268,29 @@ export default function ManualTimesDialog({
         <tbody>
           {rows.map((row, i) => (
             <tr key={row.operationId}>
-              <td className="mt-cell-op">{row.operationName}</td>
+              <td className="mt-cell-op">
+                {row.operationName}
+                {/* What this row lands against — not the tick list, the part of it this
+                    operation applies to. */}
+                <div style={{ fontSize: 11, fontWeight: 400, marginTop: 3, lineHeight: 1.45, color: appliesToNone(row.operationId) ? '#92400e' : 'var(--text-muted)' }}>
+                  {appliesToNone(row.operationId)
+                    ? 'Applies to none of the ticked models — won’t be saved.'
+                    : (modelsByOperation[row.operationId].length === modelCount
+                        ? `Saves against all ${plural(modelCount, 'ticked model')}`
+                        : `Saves against ${modelsByOperation[row.operationId].length} of ${modelCount}: `
+                          + modelsByOperation[row.operationId].map((m) => m.model).join(', '))}
+                </div>
+              </td>
               <td>
                 <span className="mt-cell-label">Minutes *</span>
                 <input
                   type="number" min={0} step="0.01" inputMode="decimal"
                   className="input mt-minutes"
                   aria-label={`Minutes for ${row.operationName}`}
-                  value={row.minutes} disabled={saving} autoFocus={i === 0}
+                  value={appliesToNone(row.operationId) ? '' : row.minutes}
+                  disabled={saving || appliesToNone(row.operationId)}
+                  title={appliesToNone(row.operationId) ? 'This operation applies to none of the ticked models' : undefined}
+                  autoFocus={i === 0 && !appliesToNone(row.operationId)}
                   onChange={(e) => updateRow(row.operationId, { minutes: e.target.value })}
                 />
               </td>

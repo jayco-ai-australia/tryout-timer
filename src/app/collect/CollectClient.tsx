@@ -199,6 +199,14 @@ export default function CollectClient({ lines, userId }: Props) {
    * be one operation and the rest of the tick list was silently dropped.
    */
   const [manualTargets, setManualTargets] = useState<Operation[] | null>(null)
+  /**
+   * Per ticked operation, the ticked models IT applies to — what each row will actually be saved
+   * against. Read from model_operations when the dialog opens, because the ticked models came
+   * from the DRILLED-INTO operation's applies-list, not each ticked operation's: banking every
+   * row against that one list is how operation B got times against operation A's models.
+   */
+  const [manualModels, setManualModels] = useState<Record<string, Product[]> | null>(null)
+  const [openingManual, setOpeningManual] = useState(false)
   const [savingManual, setSavingManual] = useState(false)
   const [manualError, setManualError] = useState<string | null>(null)
 
@@ -495,6 +503,7 @@ export default function CollectClient({ lines, userId }: Props) {
     // The dialog banks against the models ticked when it opened; those have just been cleared,
     // so what it would write no longer exists. Closing it is the honest move.
     setManualTargets(null)
+    setManualModels(null)
     setManualError(null)
   }, [activeOperationId])
 
@@ -837,7 +846,7 @@ export default function CollectClient({ lines, userId }: Props) {
       // The shared save path: ONE operation_times row, linked to every model on the timer via
       // operation_time_models, then the run's notes in order. chassisId is null on the timer
       // and rides through untouched.
-      await saveTimerRun(supabase, timer, {
+      const recorded = await saveTimerRun(supabase, timer, {
         userId,
         operatorId: result.operatorId,
         notes: result.notes,
@@ -846,7 +855,18 @@ export default function CollectClient({ lines, userId }: Props) {
       })
       discardTimer(timer.timerId)
       setCompletingTimer(null)
-      setSavedNotice(`“${timer.operationName}” banked against ${plural(timer.productIds.length, 'model')}.`)
+      // The models were snapshotted at Start; one unlinked while the clock ran is refused at
+      // save and named here, rather than counted in "banked against N".
+      const refusedNames = recorded.refusedProductIds.map(
+        (id) => timer.models.find((m) => m.productId === id)?.model ?? 'a model'
+      )
+      setSavedNotice(
+        `“${timer.operationName}” banked against ${plural(recorded.savedProductIds.length, 'model')}.`
+        + (refusedNames.length > 0
+          ? ` Skipped, no time saved: ${refusedNames.join(', ')} — the operation no longer applies to `
+            + `${refusedNames.length === 1 ? 'it' : 'them'}.`
+          : '')
+      )
       // Flip the just-timed models green without a page reload.
       if (timer.operationId === activeOperationId) await loadModels(activeOperationId)
     } catch (err) {
@@ -868,14 +888,41 @@ export default function CollectClient({ lines, userId }: Props) {
    * drilled-down row — ticking four operations and pressing this used to write ONE time and
    * drop the other three without a word.
    */
-  function openManualEntry() {
-    if (noModelsReason) return
+  async function openManualEntry() {
+    if (noModelsReason || openingManual) return
     const targets = selectedOperations.length > 0
       ? selectedOperations
       : selectedOperation ? [selectedOperation] : []
     if (targets.length === 0) return
     setManualError(null)
-    setManualTargets(targets)
+    setOpeningManual(true)
+    try {
+      // Each ticked operation's OWN applies-list, intersected with the ticked models. The same
+      // question recordOperationTime's guard asks at save — asked here so the dialog can show the
+      // answer before anyone types, instead of refusing afterwards.
+      const links = await fetchLinksForOperations(supabase, targets.map((o) => o.id))
+      const appliesTo = new Map<string, Set<string>>()
+      for (const l of links) {
+        const set = appliesTo.get(l.operation_id)
+        if (set) set.add(l.product_id)
+        else appliesTo.set(l.operation_id, new Set([l.product_id]))
+      }
+      const chosen = opModels.filter((p) => selectedProductIds.has(p.id))
+      const perOp: Record<string, Product[]> = {}
+      for (const op of targets) {
+        const applies = appliesTo.get(op.id) ?? new Set<string>()
+        perOp[op.id] = chosen.filter((p) => applies.has(p.id))
+      }
+      setManualModels(perOp)
+      setManualTargets(targets)
+    } catch (err) {
+      setPageError(
+        `Could not check which models the ticked operations apply to, so manual entry wasn’t opened: `
+        + (err instanceof Error ? err.message : 'the read failed')
+      )
+    } finally {
+      setOpeningManual(false)
+    }
   }
 
   /**
@@ -891,17 +938,22 @@ export default function CollectClient({ lines, userId }: Props) {
    * times that are already in the database.
    */
   async function saveManualTimes(entries: ManualTimeEntry[]) {
-    if (!manualTargets || noModelsReason) return
-    const productIds = [...selectedProductIds]
+    if (!manualTargets || !manualModels || noModelsReason) return
     setSavingManual(true); setManualError(null)
 
     let recorded = 0
     let minutesRecorded = 0
+    const modelsBanked = new Set<string>()
+    const refusals: string[] = []
     try {
       for (const entry of entries) {
-        const created = await recordOperationTime(supabase, {
+        // Each row against the models ITS operation applies to — never the whole tick list. The
+        // dialog doesn't let a row with none be filled in, so an empty list here is skipped.
+        const models = manualModels[entry.operationId] ?? []
+        if (models.length === 0) continue
+        const { created, savedProductIds, refusedProductIds } = await recordOperationTime(supabase, {
           operationId: entry.operationId,
-          productIds,
+          productIds: models.map((p) => p.id),
           // Blank → null → recorded against the placeholder operator, since
           // operation_times.operator_id is NOT NULL.
           operatorId: entry.operatorId || null,
@@ -909,6 +961,12 @@ export default function CollectClient({ lines, userId }: Props) {
           totalMinutes: entry.minutes,
           chassisId: null,
         })
+        for (const id of savedProductIds) modelsBanked.add(id)
+        if (refusedProductIds.length > 0) {
+          refusals.push(
+            `${entry.operationName} (not ${refusedProductIds.map((id) => models.find((p) => p.id === id)?.model ?? 'a model').join(', ')})`
+          )
+        }
         if (entry.note) await addOperationTimeNote(supabase, created.id, entry.note, userId)
         recorded++
         minutesRecorded += entry.minutes
@@ -929,10 +987,14 @@ export default function CollectClient({ lines, userId }: Props) {
 
     setSavingManual(false)
     setManualTargets(null)
+    setManualModels(null)
     // Never a silent close — the whole point of the dialog is that more than one thing happened.
     setSavedNotice(
-      `Recorded ${plural(recorded, 'time')} across ${plural(productIds.length, 'model')} — ` +
-      `${Number(minutesRecorded.toFixed(2))} minutes.`
+      `Recorded ${plural(recorded, 'time')} across ${plural(modelsBanked.size, 'model')} — ` +
+      `${Number(minutesRecorded.toFixed(2))} minutes.` +
+      (refusals.length > 0
+        ? ` Some models were skipped because the operation stopped applying to them before the save: ${refusals.join('; ')}.`
+        : '')
     )
     if (activeOperationId) await loadModels(activeOperationId)
   }
@@ -1227,11 +1289,12 @@ export default function CollectClient({ lines, userId }: Props) {
         <ManualTimesDialog
           operations={manualTargets}
           modelCount={selectedCount}
+          modelsByOperation={manualModels ?? {}}
           operators={lineOperators}
           saving={savingManual}
           error={manualError}
           onSave={saveManualTimes}
-          onCancel={() => { setManualTargets(null); setManualError(null) }}
+          onCancel={() => { setManualTargets(null); setManualModels(null); setManualError(null) }}
         />
       )}
 

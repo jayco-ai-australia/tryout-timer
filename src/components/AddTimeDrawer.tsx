@@ -785,7 +785,7 @@ export default function AddTimeDrawer({
           // THE single insert path. Never a direct .insert() into operation_times: this is what
           // derives the team/line provenance from the operation's job and supersedes whatever
           // was the current record for each (operation, model) pair.
-          const created = await recordOperationTime(supabase, {
+          const { created, refusedProductIds } = await recordOperationTime(supabase, {
             operationId: operation.id,
             productIds: savedModels,
             operatorId: operatorId || null,
@@ -796,6 +796,16 @@ export default function AddTimeDrawer({
           })
           out.created += 1
           out.totalMinutes += minutes
+          // Step 1 linked every timed operation to every saved model, so the guard should pass
+          // them all. If it refused any — an unlink landing in between — say which, rather than
+          // letting "added" imply every model got it.
+          if (refusedProductIds.length > 0) {
+            const names = refusedProductIds.map((id) => products.find((p) => p.id === id)?.model ?? 'a model')
+            out.failures.push(
+              `${operation.name}: not saved against ${names.join(', ')} — it no longer applies to `
+              + `${refusedProductIds.length === 1 ? 'that model' : 'those models'}. Saved against the rest.`
+            )
+          }
           if (trimmedNote) {
             try {
               await addOperationTimeNote(supabase, created.id, trimmedNote, userId as string)
