@@ -7,9 +7,25 @@ interface ModalProps {
   onClose: () => void
   children: React.ReactNode
   maxWidth?: number
+  /** The dialog's actions — Cancel, Save — rendered in a region PINNED to the bottom of the
+   * card, outside the scrolling body.
+   *
+   * This exists because a confirm step whose content is unbounded used to take its own Save
+   * button off the screen with it. /collect's complete-timer dialog lists every model the run
+   * banks against — 89 on the Caravan line — and on a 768px-tall tablet that list grew the
+   * card past the bottom of the viewport, with the buttons below the list and therefore off
+   * it. There was nothing to scroll either: the card had no scroller, and the page behind is
+   * scroll-locked while a modal is open. The collector could not save the time they had just
+   * stood on the floor and measured.
+   *
+   * Buttons passed here can't be pushed anywhere: the footer is `flex: none`, the body takes
+   * the remaining height and scrolls itself. Leave it undefined and the card behaves as it
+   * always did, with everything in one region — fine for a short fixed form, wrong for
+   * anything that lists rows. */
+  footer?: React.ReactNode
 }
 
-export default function Modal({ title, onClose, children, maxWidth = 480 }: ModalProps) {
+export default function Modal({ title, onClose, children, maxWidth = 480, footer }: ModalProps) {
   const overlayRef = useRef<HTMLDivElement>(null)
 
   // onClose is read through a ref so the effect below can depend on NOTHING and therefore run
@@ -53,29 +69,19 @@ export default function Modal({ title, onClose, children, maxWidth = 480 }: Moda
         background: 'rgba(15, 23, 36, 0.45)',
       }}
     >
-      <div style={{
-        background: 'var(--surface)',
-        borderRadius: 14,
-        boxShadow: '0 8px 32px rgba(0,0,0,0.14)',
-        width: '100%',
-        maxWidth,
-        overflow: 'hidden',
-      }}>
-        {/* Header */}
-        <div style={{
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          padding: '18px 22px 16px',
-          borderBottom: '1px solid var(--border)',
-        }}>
+      {/* Three regions — see .modal-card in globals.css. Height is bounded there in dvh so the
+        * footer stays inside the visible viewport under a tablet's browser chrome. */}
+      <div className="modal-card" style={{ maxWidth }}>
+        {/* Header — flex: none */}
+        <div className="modal-card-header">
           <span style={{ fontSize: 16, fontWeight: 700, color: 'var(--text)' }}>{title}</span>
           <button
             onClick={onClose}
+            aria-label="Close"
             style={{
               background: 'none', border: 'none', cursor: 'pointer',
-              padding: 4, borderRadius: 6,
-              color: 'var(--text-muted)', lineHeight: 0,
+              padding: 10, margin: -10, borderRadius: 6,
+              color: 'var(--text-muted)', lineHeight: 0, flexShrink: 0,
             }}
           >
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
@@ -83,8 +89,10 @@ export default function Modal({ title, onClose, children, maxWidth = 480 }: Moda
             </svg>
           </button>
         </div>
-        {/* Body */}
-        <div style={{ padding: '22px 22px 22px' }}>{children}</div>
+        {/* Body — flex: 1, scrolls its own overflow */}
+        <div className="modal-card-body">{children}</div>
+        {/* Footer — flex: none, never scrolls away */}
+        {footer && <div className="modal-card-footer">{footer}</div>}
       </div>
     </div>
   )

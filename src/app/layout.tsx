@@ -20,10 +20,21 @@ const montserrat = Montserrat({
   display: 'swap',
 })
 
+/**
+ * next.config.mjs sets basePath: '/jmotion'. That prefix is applied automatically to next/link,
+ * next/image and static imports — but NOT to metadata URLs or to a hand-written <link href>,
+ * which are emitted verbatim. So `/manifest.json` was requested at the server root and 404'd,
+ * taking the PWA install prompt with it. Both references below carry the prefix explicitly.
+ *
+ * Kept as a constant rather than repeated, so the two can't drift from each other; it still has
+ * to be changed alongside next.config.mjs if the mount point ever moves.
+ */
+const BASE_PATH = '/jmotion'
+
 export const metadata: Metadata = {
   title: 'J-Motion',
   description: 'Production line operations time study',
-  manifest: '/manifest.json',
+  manifest: `${BASE_PATH}/manifest.json`,
   appleWebApp: {
     capable: true,
     statusBarStyle: 'default',
@@ -46,7 +57,7 @@ export default function RootLayout({
   return (
     <html lang="en" className={`${inter.variable} ${montserrat.variable}`}>
       <head>
-        <link rel="apple-touch-icon" href="/icons/icon-192.png" />
+        <link rel="apple-touch-icon" href={`${BASE_PATH}/icons/icon-192.png`} />
       </head>
       <body>
         <ServiceWorkerRegister />

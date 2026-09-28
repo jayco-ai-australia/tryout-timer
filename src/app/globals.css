@@ -35,6 +35,12 @@ table { text-indent: 0; border-color: inherit; border-collapse: collapse; }
   --text-muted: #8a8a8a;
   --green:      #22a35a;
   --green-bg:   #edfbf3;
+  /* A forest green for green TEXT, which --green is not: at #22a35a a 12px figure clears only
+     3.1:1 on white and reads as a highlight rather than as a number. This is 7.6:1, and it is
+     deliberately DARKER than --red (#dc2626) — the two sit in the same grid on /labour-matrix,
+     and under red/green colour blindness both hues collapse towards olive, leaving lightness as
+     the only thing separating them. Never the sole cue even so: see .lm-td-none. */
+  --green-deep: #166534;
   --amber:      #d97706;
   --amber-bg:   #fffbeb;
   --red:        #dc2626;
@@ -101,6 +107,11 @@ body {
   transition: background 0.15s, border-color 0.15s;
 }
 .btn-ghost:hover { background: var(--bg); border-color: #cdd0d6; }
+/* A disabled ghost button stays in place and stops responding — the pattern the Merge button
+   relies on to say "not right now" instead of vanishing. The hover rule is neutralised too, or a
+   dead button would still light up under the cursor. */
+.btn-ghost:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-ghost:disabled:hover { background: transparent; border-color: var(--border); }
 
 /* Danger button */
 .btn-danger {
@@ -273,6 +284,8 @@ body {
 .nav-logo {
   display: flex;
   align-items: center;
+  flex-shrink: 0;
+  white-space: nowrap;
   gap: 8px;
   text-decoration: none;
   color: var(--blue);
@@ -280,25 +293,48 @@ body {
   font-size: 17px;
   letter-spacing: -0.01em;
 }
-.nav-links { display: flex; align-items: center; gap: 4px; }
+/* min-width:0 + overflow-x lets the row SCROLL when it genuinely cannot fit, which is the only
+   honest option left once wrapping is off: the alternative to a second row is not a clipped
+   first row. Items keep flex-shrink:0 so nothing squashes on the way. */
+.nav-links {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.nav-links::-webkit-scrollbar { display: none; }
+/* THE NAV MUST NEVER GROW A SECOND ROW.
+   .nav-links is nowrap, so the items themselves can't wrap — but they CAN shrink, and a shrunk
+   link wraps its own label instead. That is what doubled the bar's height when a ninth link
+   arrived: "Line Structure", "Try Outs" and "Model Total" each folded onto two lines inside
+   their own box while the row stayed a row. `white-space: nowrap` makes a label indivisible and
+   `flex-shrink: 0` stops the squeeze that caused it, so the bar's height no longer depends on
+   how many links there are. Horizontal padding is 10px rather than 12px to buy back the width
+   that costs — see the fit measurements in the nav note above .nav-inner. */
 .nav-link {
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 600;
-  padding: 6px 12px;
+  padding: 6px 10px;
   border-radius: 7px;
   text-decoration: none;
   transition: background 0.12s, color 0.12s;
   background: transparent;
   color: var(--text-mid);
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 .nav-link:hover { background: var(--bg); }
 .nav-link-active { background: var(--blue-light); color: var(--blue); }
 .nav-link-active:hover { background: var(--blue-light); }
 .nav-logout {
   margin-left: 8px;
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 600;
-  padding: 6px 12px;
+  padding: 6px 10px;
+  white-space: nowrap;
+  flex-shrink: 0;
   border-radius: 7px;
   border: 1.5px solid var(--border);
   background: transparent;
@@ -307,6 +343,29 @@ body {
   transition: background 0.12s;
 }
 .nav-logout:hover { background: var(--bg); }
+
+/* The always-available "enter a time off a paper form" action. Deliberately the one FILLED
+   control in the nav: it is the only entry point to the add-time flow from most screens, and a
+   ghost button sitting between eight text links is not findable by somebody holding a clipboard. */
+.nav-add-time {
+  margin-left: 8px;
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  gap: 5px;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 6px 10px;
+  border-radius: 7px;
+  border: 1.5px solid var(--blue);
+  background: var(--blue);
+  color: #fff;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s;
+}
+.nav-add-time:hover { background: var(--blue-dark); border-color: var(--blue-dark); }
 
 /* ── Tabs ──────────────────────────────────────────────────── */
 .tabs {
@@ -421,14 +480,52 @@ body {
   max-height: 200px;
   overflow-y: auto;
 }
+/* Rows are tapped on a tablet, with gloves on — 44px is the minimum target that can be hit
+   reliably that way, and it is the height of the row, not of the 20px box inside it, that
+   decides whether the tap lands. The gap shrinks to compensate so a long list doesn't grow
+   more than it has to. */
 .checkbox-row {
   display: flex;
   align-items: center;
   gap: 10px;
   cursor: pointer;
   font-size: 14px;
+  min-height: 44px;
 }
-.checkbox-row input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--blue); cursor: pointer; }
+.checkbox-row input[type="checkbox"] { width: 20px; height: 20px; accent-color: var(--blue); cursor: pointer; flex-shrink: 0; }
+/* The whole row is the target, not just the words — a label stretched to fill it means a tap
+   anywhere on the line toggles the box. */
+.checkbox-row > label { min-height: 44px; }
+
+/* Series-grouped pickers get the same multi-column treatment as the confirm-step grid: on a
+   tablet a 60-model series is three columns of 20, not one column of 60. */
+.checkbox-list-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 4px 16px;
+}
+
+/* ── Long lists inside a bounded dialog ────────────────────
+   A confirm step that lists every model on a line (89 on Caravan) must not push its Save
+   button past the bottom of a tablet. The list is collapsed to a count by default and, when
+   expanded, lays itself out across the width instead of running down the page. */
+.model-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 6px;
+}
+.model-grid-item {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  font-size: 13px;
+  color: var(--text);
+  word-break: break-word;
+}
 
 /* ── Coverage bar ──────────────────────────────────────────── */
 .coverage-bar { width: 100%; height: 6px; border-radius: 4px; background: #eef0f3; overflow: hidden; }
@@ -463,6 +560,147 @@ body {
 .exception-item-button:last-child { border-bottom: none; }
 .exception-item-button:hover { background: var(--bg); }
 
+/* ── Modal card (three regions) ──────────────────────────────────────────────────────────
+   Header, scrolling body, pinned footer. The card is bounded so the footer — which is where
+   Cancel and Save live — is ALWAYS on screen; the body takes whatever height is left and
+   scrolls its own overflow. Before this, a dialog listing 89 models simply grew past the
+   bottom of a 768px-tall tablet and took Save with it, with nothing to scroll: the page
+   behind is locked while a modal is open, and the card had no scroller of its own.
+
+   dvh, not vh: on a tablet browser vh is the height WITHOUT the address/tab chrome, so a
+   90vh card is taller than the space actually visible and puts the footer back under the
+   chrome — exactly the bug, reintroduced. vh is kept only as the fallback for anything that
+   doesn't know dvh. */
+.modal-card {
+  background: var(--surface);
+  border-radius: 14px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.14);
+  width: 100%;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  max-height: 90vh;
+  max-height: 90dvh;
+}
+.modal-card-header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 18px 22px 16px;
+  border-bottom: 1px solid var(--border);
+}
+/* min-height:0 is what actually lets this shrink — a flex item defaults to min-height:auto,
+   which is its content height, so without it the body refuses to be smaller than its list and
+   pushes the footer out however bounded the card is. */
+.modal-card-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  padding: 22px;
+}
+.modal-card-footer {
+  flex: none;
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 14px 22px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+/* Dialog buttons are tapped with gloves too. */
+.modal-card-footer .btn-primary,
+.modal-card-footer .btn-ghost,
+.modal-card-footer .btn-danger { min-height: 44px; }
+
+/* ── Manual times dialog (/collect) ────────────────────────────
+   One row per selected operation. Two layouts, ONE markup: the table below becomes a card per
+   operation under 700px, so the wide and narrow views cannot drift apart the way a second
+   render would. See components/ManualTimesDialog. */
+.mt-apply {
+  border: 1.5px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 16px;
+  background: var(--bg);
+}
+.mt-apply-title {
+  display: block;
+  font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 10px;
+}
+.mt-apply-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 14px;
+}
+.mt-apply-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+/* Full width and 44px tall: this is tapped with gloves on, like every other control here. */
+.mt-apply-btn { width: 100%; min-height: 40px; font-size: 12px; padding: 6px 11px; }
+
+.mt-table { width: 100%; border-collapse: collapse; }
+.mt-table th {
+  text-align: left;
+  font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+  color: var(--text-muted);
+  padding: 0 8px 8px;
+  border-bottom: 1.5px solid var(--border);
+}
+.mt-table td {
+  padding: 12px 8px;
+  vertical-align: top;
+  border-bottom: 1px solid var(--border);
+}
+.mt-table td:first-child, .mt-table th:first-child { padding-left: 0; }
+.mt-table td:last-child, .mt-table th:last-child { padding-right: 0; }
+/* The operation name identifies the row, so it WRAPS rather than truncating — an ellipsis in
+   the middle of two similar names makes them indistinguishable. */
+.mt-cell-op {
+  font-size: 13px; font-weight: 600; color: var(--text);
+  overflow-wrap: anywhere;
+}
+.mt-col-minutes { width: 110px; }
+.mt-col-operator { width: 220px; }
+.mt-col-note { width: 30%; }
+.mt-minutes { width: 100%; }
+/* The per-cell heading only the card layout needs. */
+.mt-cell-label { display: none; }
+
+@media (max-width: 700px) {
+  .mt-apply-fields { grid-template-columns: minmax(0, 1fr); }
+  .mt-table, .mt-table tbody, .mt-table tr, .mt-table td { display: block; width: auto; }
+  .mt-table thead { display: none; }
+  .mt-table tr {
+    border: 1.5px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+    margin-bottom: 12px;
+    background: var(--surface);
+  }
+  .mt-table td { border-bottom: none; padding: 0 0 12px; }
+  .mt-table td:last-child { padding-bottom: 0; }
+  /* Operation name becomes the card heading. */
+  .mt-cell-op {
+    font-size: 14px;
+    padding-bottom: 10px;
+    margin-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .mt-cell-label {
+    display: block;
+    font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 5px;
+  }
+  .mt-minutes { max-width: 160px; }
+}
+
 /* ── Gaps drawer (dashboard) ───────────────────────────────── */
 .gaps-drawer-overlay {
   position: fixed; inset: 0; z-index: 200;
@@ -483,6 +721,19 @@ body {
   transition: transform 0.32s cubic-bezier(0.16, 1, 0.3, 1);
 }
 .gaps-drawer-visible { transform: translateX(0); }
+
+/* The same slide-over, hinged on the left edge — /tryouts' "Who have I timed?" log, which sits
+   opposite the right-hand timer rail so the two can be open at once without covering each
+   other. Only the side changes: width, chrome, overlay and timing are the drawer's own.
+   The visible rule is written compound (.gaps-drawer-left.gaps-drawer-visible) because it has
+   to outrank .gaps-drawer-visible above, which would otherwise slide this one back off. */
+.gaps-drawer-left {
+  right: auto;
+  left: 0;
+  box-shadow: 8px 0 32px rgba(0,0,0,0.14);
+  transform: translateX(-100%);
+}
+.gaps-drawer-left.gaps-drawer-visible { transform: translateX(0); }
 
 .gaps-drawer-header {
   display: flex; align-items: flex-start; justify-content: space-between;
@@ -516,6 +767,241 @@ body {
   transition: background 0.12s;
 }
 .gaps-drawer-edit-btn:hover { background: rgba(0,0,0,0.12); }
+
+/* ── Line Structure (/line-config) ────────────────────────────────────────────────────────
+   Two columns, full width: a narrow section list and a wide job area. The width is the point —
+   job names on this line read "12V/240V Rough In - Offside", and the whole reason this screen
+   exists as a sibling of /setup's four-pane Finder is that those names have to sit side by side
+   without truncation while somebody decides whether two of them are the same job. Nothing here
+   ever ellipsises a name. */
+.lc-columns {
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+/* One column on a tablet held portrait — 280px + a readable job column doesn't fit in 800px,
+   and squeezing it is what would start truncating names. */
+@media (max-width: 900px) {
+  .lc-columns { grid-template-columns: minmax(0, 1fr); }
+}
+
+.lc-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.lc-panel-header {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+.lc-panel-title {
+  font-size: 11px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.06em; color: var(--text-muted);
+}
+.lc-panel-body { padding: 8px; }
+
+/* ── The Line + Team filter bar ──
+   One baseline for both controls. Each field is label-above-control and nothing else, so the
+   two columns are the same height by construction; the row's helper sentence lives OUTSIDE
+   them, under the whole row, because it describes the row rather than the Team select it used
+   to hang off (which made that column taller and knocked the two selects onto different
+   baselines).
+
+   Widths come from the content: `width: auto` lets a native select size to its longest option,
+   with a floor so "Cab" and "Caravan" don't render as two very different-sized controls. */
+.lc-filters {
+  padding: 14px 20px;
+  margin-bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.lc-filter-row {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  align-items: flex-end;
+}
+.lc-filter-field { display: flex; flex-direction: column; }
+.lc-filter-field .label { margin-bottom: 6px; white-space: nowrap; }
+/* Identical height for both: .select's own padding plus one shared line-height, rather than
+   whatever each select's longest option happened to produce. */
+.lc-filter-field .select {
+  width: auto;
+  min-width: 190px;
+  height: 38px;
+  line-height: 1.2;
+}
+.lc-filter-note { font-size: 12px; color: var(--text-muted); margin: 0; line-height: 1.5; }
+
+/* ── Section rows ── */
+/* A COLUMN, not a row: the main line (checkbox, name+count, tools) plus, when the row is ticked
+   for a merge, a "Keep this name" line beneath it. This column is 280px and already carries a
+   checkbox and four tools, so anything else competing for the same line squeezed the name to
+   about 55px and broke it one letter per line. */
+.lc-section {
+  display: flex; flex-direction: column; align-items: stretch; gap: 2px;
+  width: 100%; text-align: left;
+  padding: 6px 10px; border-radius: 8px;
+  border: 1px solid transparent; background: none;
+  cursor: pointer; font-family: inherit;
+  min-height: 44px;
+  justify-content: center;
+}
+.lc-section-main { display: flex; align-items: center; gap: 8px; min-height: 32px; }
+/* Name over count rather than beside it — buys the name the full width left by the tools. */
+.lc-section-label { display: flex; flex-direction: column; gap: 1px; flex: 1; min-width: 0; }
+.lc-section:hover { background: var(--bg); }
+.lc-section-active { background: var(--blue-light); border-color: #bcdff2; }
+/* `overflow-wrap: break-word` only breaks a word that cannot fit on a line of its own, unlike
+   `word-break: break-word`, which was happy to break "Flooring" after the F. */
+.lc-section-name {
+  font-size: 13px; font-weight: 600; color: var(--text);
+  overflow-wrap: break-word; word-break: normal; line-height: 1.3;
+}
+.lc-section-active .lc-section-name { color: var(--blue); }
+.lc-section-count { font-size: 11px; color: var(--text-muted); }
+.lc-section-tools { display: flex; gap: 0; flex-shrink: 0; align-self: flex-start; }
+.lc-icon-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 24px; height: 26px; padding: 0;
+  background: none; border: none; border-radius: 6px;
+  color: var(--text-muted); cursor: pointer; font-family: inherit; font-size: 12px;
+}
+.lc-icon-btn:hover:not(:disabled) { background: rgba(0,0,0,0.07); color: var(--text); }
+.lc-icon-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+/* Ticked for a merge, and the one whose name survives. */
+.lc-section-ticked { background: var(--blue-light); }
+.lc-section-keeper { box-shadow: inset 0 0 0 1.5px #15803d; }
+
+/* ── Drop targets ──
+   Every section is a candidate the moment a drag starts, and the one under the pointer is
+   unmistakable. Both states are needed: the first says "these are the places this can go", the
+   second says "this is where it will land". A dashed outline rather than a fill so the row's
+   own selected/ticked colouring still reads underneath. */
+.lc-section-droppable {
+  outline: 1.5px dashed #bcdff2;
+  outline-offset: -2px;
+}
+.lc-section-dropover {
+  outline: 2px solid var(--blue);
+  outline-offset: -2px;
+  background: var(--blue-light);
+}
+/* The row's own children must not swallow the drag events the row is listening for. */
+.lc-section-droppable * { pointer-events: none; }
+
+/* ── The drag grip ──
+   Only this handle is draggable, so a click on the card still expands it. Wide enough to hit
+   with a mouse; the ⇄ button remains the path for touch, where HTML5 drag never fires. */
+.lc-grip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  min-height: 44px;
+  flex-shrink: 0;
+  color: var(--text-muted);
+  cursor: grab;
+  opacity: 0.5;
+  transition: opacity 0.12s;
+}
+.lc-grip:hover { opacity: 1; }
+.lc-grip:active { cursor: grabbing; }
+
+/* What the drag is carrying. Fixed, so it stays legible however far the list has scrolled. */
+.lc-drag-pill {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  z-index: 400;
+  padding: 10px 16px;
+  border-radius: 999px;
+  background: var(--text);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.25);
+  pointer-events: none;
+}
+
+/* ── Job cards ── */
+.lc-job {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  margin-bottom: 8px;
+}
+.lc-job-ticked { border-color: var(--blue); box-shadow: 0 0 0 1px var(--blue); }
+.lc-job-keeper { border-color: #15803d; box-shadow: 0 0 0 1px #15803d; }
+.lc-job-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 12px; min-height: 52px;
+}
+/* Grows to fill, wraps rather than truncates — see the note on .lc-columns. */
+.lc-job-name {
+  flex: 1; min-width: 0;
+  font-size: 15px; font-weight: 700; color: var(--text);
+  word-break: break-word; line-height: 1.35;
+  background: none; border: none; padding: 0; text-align: left;
+  font-family: inherit; cursor: pointer;
+}
+.lc-job-meta { display: flex; align-items: center; gap: 8px; flex-shrink: 0; flex-wrap: wrap; }
+.lc-job-body { border-top: 1px solid var(--border); padding: 10px 12px 12px; }
+
+/* ── Operation rows inside an expanded card ── */
+.lc-op {
+  display: flex; align-items: center; gap: 10px;
+  padding: 4px 6px; border-radius: 6px;
+  min-height: 44px;
+}
+.lc-op:hover { background: var(--bg); }
+.lc-op-ticked { background: var(--blue-light); }
+.lc-op-name { flex: 1; min-width: 0; font-size: 13px; color: var(--text); word-break: break-word; }
+.lc-op-tools { display: flex; gap: 4px; flex-shrink: 0; }
+
+/* Checkboxes here are tapped on the floor like everything else in this app. */
+.lc-check { width: 20px; height: 20px; accent-color: var(--blue); cursor: pointer; flex-shrink: 0; }
+
+/* The has-times signal. Deliberately a DOT and not a count: this page shows no times anywhere,
+   and a number here would be the first one — it only has to say "deleting or merging this
+   touches collected data". */
+.lc-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--text-muted); opacity: 0.55;
+  flex-shrink: 0; display: inline-block;
+}
+
+/* The merge bar — sticky at the bottom of the viewport so the action stays reachable while you
+   scroll a long job list ticking things, the same rule the dialogs follow. */
+.lc-mergebar {
+  position: sticky; bottom: 12px; z-index: 5;
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin-top: 12px; padding: 12px 14px;
+  border: 1px solid var(--blue); border-radius: 10px;
+  background: var(--surface);
+  box-shadow: 0 4px 16px rgba(0,0,0,0.12);
+}
+.lc-mergebar .btn-primary, .lc-mergebar .btn-ghost, .lc-mergebar .btn-danger { min-height: 44px; }
+
+/* "Keep this name" — the one irreversible choice in a merge, so it is a full-width row on the
+   ticked card rather than a control tucked beside the name. */
+.lc-keeper {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 8px; border-radius: 6px;
+  font-size: 12px; font-weight: 700; color: var(--text-muted);
+  cursor: pointer; min-height: 44px;
+}
+.lc-keeper-on { color: #15803d; }
+/* The section column is narrow — the same control, smaller, so it fits beside the row's tools. */
+.lc-keeper-sm { min-height: 30px; padding: 0 0 2px 24px; font-size: 11px; gap: 5px; align-self: flex-start; }
+.lc-check-sm { width: 16px; height: 16px; }
 
 /* ── Validate matrix ───────────────────────────────────────── */
 .validate-job-title {
@@ -675,7 +1161,7 @@ body {
 }
 
 /* ── Finder panes (/setup) ───────────────────────────────────────────────────────────────
-   Four columns that drill left → right: Stages → Jobs → Operations → Models. Each pane is its
+   Four columns that drill left → right: Sections → Jobs → Operations → Models. Each pane is its
    own scroll container so a long list never pushes the others off screen, and the row/footer
    styling deliberately mirrors .exception-item so a pane row looks like every other list row
    in the app. */
@@ -722,6 +1208,19 @@ body {
 }
 
 .finder-pane-body { flex: 1; min-height: 0; overflow-y: auto; }
+
+/* The filter box above a pane's rows. Sticky inside the scrolling body rather than part of the
+   header, so it stays put while a long list is scrolled — typing to narrow a list and then
+   losing the box off the top is exactly the case it exists for. */
+.finder-pane-search {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 8px 12px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.finder-pane-search .input { width: 100%; font-size: 12px; padding: 5px 8px; }
 
 .finder-pane-footer {
   flex-shrink: 0;
@@ -905,7 +1404,7 @@ body {
   align-items: start;
 }
 
-/* The marker on a stage/job/operation row with a stopwatch under it. Sized and coloured to read
+/* The marker on a section/job/operation row with a stopwatch under it. Sized and coloured to read
    at a glance without competing with the row's own text. */
 .finder-running-dot {
   display: inline-block;
@@ -1148,6 +1647,8 @@ body {
   .page > *:not(.print-sheet) { display: none !important; }
 
   .print-sheet {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
     display: block !important;
     color: #000;
     font-size: 10.5pt;
@@ -1583,3 +2084,984 @@ body {
   .roadmap-print-task-desc { font-size: 8.5pt; margin: 2px 0 0; }
   .roadmap-print-task-meta { font-size: 8.5pt; margin: 2px 0 0; }
 }
+
+/* The /reports page wrapper's screen half. The print half — zeroing this min-height, which is
+   measured against the screen viewport and would otherwise print a wrapper taller than the
+   sheet — is .rp-shell in app/report-print.css. */
+.reports-shell { min-height: 100vh; background: var(--bg); }
+
+/* ── /reports: the printed time-records sheet ─────────────────────────────────────────────
+   Structure, rules, the shell reset and the fragmentation behaviour all come from
+   app/report-print.css via the .rp-* classes; the paper comes from app/reports/print.css. What
+   is left here is what is particular to a nine-column list of individual records.
+
+   The widths are not a refinement. NOTES is free text and a single note runs to several lines,
+   so a table left to measure its own content hands Notes the slack it asks for and pushes the
+   right-hand columns off the sheet — which is what "the Notes column blows the table out" was.
+   .rp-table is already table-layout: fixed, so every column below gets exactly the share it is
+   given here, whatever the longest note happens to be. They sum to 100%. */
+@media print {
+  .reports-table th.rep-col-date      { width: 8%; }
+  .reports-table th.rep-col-team      { width: 6%; }
+  .reports-table th.rep-col-section   { width: 7%; }
+  .reports-table th.rep-col-job       { width: 11%; }
+  .reports-table th.rep-col-operation { width: 13%; }
+  .reports-table th.rep-col-operator  { width: 10%; }
+  .reports-table th.rep-col-minutes   { width: 6%; }
+  .reports-table th.rep-col-models    { width: 11%; }
+  .reports-table th.rep-col-notes     { width: 28%; }
+
+  /* Mid-word breaks are off everywhere by default: a wrapped job name reads as two half-names,
+     and at a fixed width the alternative — a column that quietly widens — is not available
+     anyway. */
+  .reports-table td { overflow-wrap: normal; word-break: keep-all; }
+  /* The two free-text columns are the exception, and have to be. A note is prose that must fit
+     its 28% rather than widen it, and a model list is comma-separated with no spaces in it to
+     break at, so anywhere is the only value that keeps "MH2401,MH2402,MH2403" inside 11%. */
+  .reports-table td.rep-notes,
+  .reports-table td.rep-models { overflow-wrap: anywhere; word-break: break-word; }
+
+  /* A date is a unit; wrapped after the day it reads as two fields. */
+  .reports-table td.rep-date { white-space: nowrap; }
+
+  /* Closes the table with the same weight as the rule under the heading row, so the last record
+     is bounded rather than trailing off — matching the coverage and recorded-times sheets. */
+  .reports-table tr:last-child td { border-bottom: 0.5pt solid #666; }
+
+  /* The four summary cards, carried over as ONE line under the filter summary. Boxed, they cost
+     a third of the first sheet to say what a line of type says; bold, because the record count
+     is the figure a reader checks the sheet against first. */
+  .reports-totals { font-weight: 700; margin-top: 3px; }
+
+  /* Italic rather than grey: what the screen greys out — an unattached run, a record with no
+     note — has to stay distinguishable on a mono photocopy. */
+  .reports-none { font-style: italic; }
+  .reports-empty { font-size: 9.5pt; font-style: italic; margin: 4px 0 0; }
+}
+
+/* ── /model-total labour-source filter ──────────────────────────────────────────────────
+   The segmented control (All / Line labour / Pre-assembly) and the pre-assembly area chips
+   below it. Both are real filters over the breakdown — unlike the line/series/model selects
+   above them, which only choose WHICH model is on screen — so they are styled as controls
+   that own the section they sit on rather than as another row of page chrome. */
+.labour-seg {
+  display: inline-flex;
+  border: 1.5px solid var(--border);
+  border-radius: 9px;
+  overflow: hidden;
+  background: var(--surface);
+  flex-shrink: 0;
+}
+.labour-seg-btn {
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 6px 14px;
+  border: 0;
+  border-left: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-mid);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.labour-seg-btn:first-child { border-left: 0; }
+.labour-seg-btn:hover:not(.labour-seg-btn-on) { background: var(--surface-alt, rgba(0, 0, 0, 0.04)); color: var(--text); }
+.labour-seg-btn-on { background: var(--blue); color: #fff; }
+
+/* The area chips. Only rendered for Pre-assembly, and only for lines this model actually has
+   work on — an empty chip row would be a filter that cannot narrow anything. */
+.labour-chip,
+.pac-chip {
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 11px;
+  border: 1.5px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-mid);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.labour-chip:hover:not(.labour-chip-on),
+.pac-chip:hover:not(.pac-chip-on) { border-color: var(--blue); color: var(--text); }
+.labour-chip-on,
+.pac-chip-on { background: var(--blue); border-color: var(--blue); color: #fff; }
+
+/* A per-line subtotal header inside the breakdown. Sits between job cards, so it is deliberately
+   not a card itself — a rule with a name on the left and the line's minutes on the right. */
+.labour-line-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 14px 4px;
+  border-bottom: 1px solid var(--border);
+  margin-top: 4px;
+}
+
+/* ── /pre-assembly-coverage ──────────────────────────────────────────────────────────────
+   ONE document, styled for both media — deliberately NOT the hidden-duplicate-block pattern
+   the Model Total collection sheet uses.
+
+   That pattern renders the report twice: an on-screen view and a separate print-only block. It
+   works, and it has exactly one failure mode, which has bitten this app before: the print copy
+   is built from different state than the screen copy, so the scope line — the filters, the
+   dates, the window the numbers were drawn from — silently stops describing the rows printed
+   underneath it. Here the header IS the on-screen header, and the area filter narrows the one
+   document both media read.
+
+   The PRINT treatment — shell reset, hairline tables, fragmentation — is app/report-print.css,
+   shared with /model-total. The paper is app/pre-assembly-coverage/print.css. What is left here
+   is the screen styling, plus the handful of print rules that are specific to this report. */
+
+/* The whole-page shell. A class rather than an inline style so print can switch off the
+   100vh floor; see report-print.css. */
+.pac-shell { min-height: 100vh; background: var(--bg); }
+
+.pac-doc { display: flex; flex-direction: column; gap: 26px; }
+
+/* The area filter. Screen only — what it selects is what prints. */
+.pac-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 18px; }
+.pac-controls-label {
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-muted); margin-right: 2px;
+}
+
+.pac-head { padding-bottom: 12px; border-bottom: 1.5px solid var(--border); }
+.pac-head-title { font-size: 24px; font-weight: 700; color: var(--text); margin: 0; }
+.pac-head-meta { font-size: 13px; color: var(--text-mid); margin: 5px 0 0; }
+.pac-head-meta strong { color: var(--text); }
+/* The excluded-chassis line. Stated in the document header rather than only in the per-area
+   footnote — it qualifies the denominator of every figure on the page, and at the foot of a
+   sheet it was being read as small print, or not read at all. */
+.pac-head-exclusion { font-weight: 700; }
+
+.pac-area { display: flex; flex-direction: column; gap: 12px; }
+.pac-area-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 14px; flex-wrap: wrap;
+  border-bottom: 1.5px solid var(--border); padding-bottom: 6px;
+}
+.pac-area-name { font-size: 18px; font-weight: 700; color: var(--text); margin: 0; }
+.pac-area-coverage { font-size: 13px; font-weight: 600; color: var(--text-mid); }
+.pac-area-note {
+  font-size: 12px; margin: 0; padding: 8px 12px; border-radius: 8px;
+  background: var(--amber-bg, #fffbeb); border: 1px solid var(--border); color: var(--text-mid);
+}
+.pac-line-name {
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-muted); margin: 6px 0 0;
+}
+
+/* ── The table (screen) ───────────────────────────────────────────────────────────────────
+   table-layout: fixed with an explicit width per column, in both media — the print half of
+   this lives in report-print.css. Fixed layout means the first row's widths are the whole
+   table's widths, so the percentages below are the answer; the browser never re-measures
+   against the content, and the Missing models column cannot grow until it pushes the table off
+   the right edge of the sheet. The percentages total exactly 100. */
+.pac-table { width: 100%; border-collapse: collapse; font-size: 13px; table-layout: fixed; }
+.pac-table th {
+  text-align: left; font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.06em; color: var(--text-muted);
+  border-bottom: 1.5px solid var(--border); padding: 6px 8px;
+  white-space: normal; overflow-wrap: normal; word-break: keep-all; vertical-align: bottom;
+}
+.pac-table td {
+  padding: 7px 8px; border-bottom: 1px solid var(--border);
+  color: var(--text-mid); vertical-align: top;
+}
+
+/* Column widths — declared on the header cells, which is what fixed layout reads. */
+.pac-table th.pac-col-series    { width: 22%; }
+.pac-table th.pac-col-avg       { width: 10%; }
+.pac-table th.pac-col-covered   { width: 9%; }
+.pac-table th.pac-col-scheduled { width: 10%; }
+.pac-table th.pac-col-partial   { width: 8%; }
+.pac-table th.pac-col-missing   { width: 41%; }
+
+/* Model codes are long, unspaced and full of dots ("24.75-4.48V.OB.4T.SL-MY26"), so the widest
+   column is also the one with no natural break opportunities. */
+.pac-table td.pac-series { font-weight: 700; color: var(--text); overflow-wrap: anywhere; }
+.pac-table td.pac-missing { font-size: 12px; color: var(--text-muted); overflow-wrap: anywhere; }
+/* Italic as well as coloured: the colour is gone in mono print, the italic is not. */
+.pac-table td.pac-missing-none { color: var(--green, #15803d); font-style: italic; }
+
+.pac-foot { font-size: 11px; color: var(--text-muted); margin: 2px 0 0; line-height: 1.6; }
+/* The per-page running head — print only, so each area's sheet carries the report title and the
+   schedule window even though it is page 4 of the document. */
+.pac-runhead { display: none; }
+
+/* ── Print: only what is specific to this report ─────────────────────────────────────────
+   The shell reset, the hairline tables, thead repetition, row/section fragmentation and the
+   black-on-white flattening all come from report-print.css via .rp-* classes on the markup. */
+@media print {
+  .pac-head-title { font-size: 15pt; }
+  .pac-head-meta { font-size: 9pt; }
+
+  .pac-runhead {
+    display: block !important;
+    font-size: 8pt;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    border: 0;
+    margin: 0 0 10px;
+  }
+  /* …except on the first area, which shares its sheet with the document header — the title and
+     the window are already an inch above it, and repeating them there reads as a mistake. Every
+     later area gets its own sheet and needs the label. */
+  .pac-area:first-of-type .pac-runhead { display: none !important; }
+
+  .pac-area-head { border: 0; padding: 0; margin: 0 0 8px; }
+  .pac-area-name { font-size: 13pt; }
+  .pac-area-coverage { font-size: 10pt; font-weight: 700; }
+  /* No box, no fill — italic carries what the amber panel carried on screen. */
+  .pac-area-note {
+    border: 0; border-radius: 0; padding: 0; margin: 0 0 8px;
+    font-size: 9pt; font-style: italic;
+  }
+  .pac-line-name { font-size: 9pt; margin: 10px 0 3px; }
+  .pac-table td.pac-missing { font-size: 8.5pt; }
+  .pac-table tr:last-child td { border-bottom: 0.5pt solid #666; }
+}
+
+/* ── /model-total: the print controls ────────────────────────────────────────────────────
+   The page prints three sheets from two controls. "Print blank sheet" stands on its own with a
+   hairline divider after it, because it is a different errand: an empty sheet that goes OUT to
+   the line to be written on. What comes back — the recorded times — is one document at two
+   depths, so it is one labelled group with two segments.
+
+   A segmented pair, not a dropdown on a single button: two options do not earn a menu, and a
+   menu would hide the fact that the job-summary sheet exists at all. Both segments are ordinary
+   .btn-ghost buttons; everything here only joins them and hangs the label above. */
+.mt-print-divider {
+  width: 1px;
+  align-self: stretch;
+  min-height: 34px;
+  background: var(--border);
+  flex-shrink: 0;
+}
+.mt-print-group { display: flex; flex-direction: column; gap: 4px; }
+.mt-print-group-label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+.mt-print-seg { display: flex; }
+/* The seam between the segments is ONE hairline, not two borders butted together — hence the
+   -1px pull. z-index on hover so the hovered segment owns the line it shares with its neighbour
+   instead of having half of it painted over. */
+.mt-print-seg-btn { border-radius: 0; position: relative; }
+.mt-print-seg-btn:first-child { border-radius: 8px 0 0 8px; }
+.mt-print-seg-btn:last-child { border-radius: 0 8px 8px 0; margin-left: -1px; }
+.mt-print-seg-btn:hover:not(:disabled) { z-index: 1; }
+
+/* ── /model-total: the recorded-times sheets ─────────────────────────────────────────────
+   The DETAILED and JOB SUMMARY printouts, beside the blank "Print collection sheet". Both use
+   everything here; everything structural comes from report-print.css, and these are the few
+   things particular to a job/operation breakdown.
+
+   Colour carries meaning on screen here (blue minutes, a red 0m on an untimed job) and none of
+   it survives a mono printer, so the printed sheet re-states it in weight and italics. */
+.mt-times-job    { font-weight: 700; }
+.mt-times-op     { padding-left: 14px; }
+.mt-times-untimed{ font-style: italic; }
+.mt-times-total  { font-weight: 700; }
+/* "· not yet timed" / "· partly timed — 3 of 5 operations", beside a job's name. Explicitly
+   un-bolded: it sits inside .mt-times-job on the detailed sheet's job headings, and a bold
+   qualifier competes with the name it qualifies. Italic is what carries it — on a mono printer
+   there is no colour and no grey to say "this figure is not the whole job". */
+.mt-times-note   { font-weight: 400; font-style: italic; }
+
+@media print {
+  /* Name takes the measure; the figure column is fixed and right-aligned, wide enough that a
+     four-figure total and the "MINS" heading can never meet. */
+  .mt-times-table th.mt-col-name { width: 78%; }
+  .mt-times-table th.mt-col-mins { width: 22%; }
+
+  .mt-times-heading {
+    font-size: 10.5pt; font-weight: 700; margin: 14px 0 4px;
+    break-after: avoid; page-break-after: avoid;
+  }
+  /* The grand total closes the sheet: a heavier rule above it, nothing below. */
+  .mt-times-table tr.mt-times-grand > * {
+    border-top: 0.75pt solid #444; border-bottom: 0 !important;
+    padding-top: 7px; font-weight: 700; font-size: 9.5pt;
+  }
+  /* The closing rule belongs to the END OF THE TABLE, and `tr:last-child` alone doesn't say
+     that — it matches the last row of every tbody, and the detailed sheet now gives each JOB a
+     tbody of its own (below), which would put a heavy rule under all of them. Scoped to the
+     final tbody, it lands where the comment always claimed it did. */
+  .mt-times-table tbody:last-of-type > tr:last-child > td { border-bottom: 0.5pt solid #666; }
+  .mt-times-table tr.mt-times-grand:last-child td { border-bottom: 0 !important; }
+
+  /* ── Untimed rows, and rows that are only partly timed ────────────────────────────────
+     THREE cues on a fully untimed row, deliberately, because only two of them survive the
+     journey to a mono office printer:
+
+       colour  #dc2626 — literally --red, the same colour the screen puts on a "Not yet timed"
+               job's 0m (see minutesStyle in ModelTotalClient's breakdown). Matched rather than
+               re-invented, so the screen and the sheet mark the same thing the same way.
+       weight  bold — and this is the cue that does the actual work on paper. #dc2626 prints on
+               a mono device as a mid-grey LIGHTER than the black around it, so on those sheets
+               the red is not merely lost, it is a legibility regression. Bold reverses that: the
+               row is the heaviest thing on the page whether or not any colour came through.
+       words   "· not yet timed (4 operations)", from JobStatusNote — the only one of the three
+               that cannot be lost to a printer, a photocopier or a reader who doesn't see red.
+
+     The !important and the doubled class are to beat report-print.css's
+     `.rp-doc * { color: #000 !important }`, which flattens the whole document to black on
+     purpose; this is the one thing on these sheets that is allowed out of it. */
+  .mt-times-table .mt-times-untimed,
+  .mt-times-table .mt-times-untimed * {
+    color: #dc2626 !important;
+    font-weight: 700;
+  }
+
+  /* A PARTLY timed job is not an untimed one and must not read as one: its figure is a real
+     measurement that merely stops short of the whole job, and the same red would say the number
+     means nothing. So it gets neither the red nor the bold — it keeps the black of a real
+     figure, and is marked instead by its words, by the underline under them, and by the asterisk
+     on its total. The underline is under the WORDS and never the figure, so a number read off
+     the sheet or scanned back in can't pick it up. */
+  .mt-times-table .mt-times-partial .mt-times-note {
+    text-decoration: underline;
+  }
+
+  /* A job's block — its heading, its operations, its untimed gaps — is one thing to read, so it
+     is not torn across two sheets. tbody is the only element inside a table that can carry this,
+     which is why the detailed sheet wraps each job in one. A job taller than a sheet still
+     splits: the browser falls back rather than emitting a blank page, which is the right
+     failure. The job-summary sheet needs none of this — a job is a single row there, and rows
+     are already unbreakable. */
+  .mt-times-table tbody.mt-times-jobblock {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+}
+
+/* ── /labour-matrix: models × jobs ───────────────────────────────────────────────────────────
+   A grid up to ~101 models deep and ~90 jobs wide. Everything below exists to make that many
+   cells readable: the labels stay put while the grid scrolls, the columns are sized by the
+   FIGURE rather than by the job name, and the three states a cell can be in are told apart by
+   more than colour. */
+
+.lm-toggle { display: flex; align-items: center; gap: 6px; }
+.lm-toggle-label {
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-muted); margin-right: 2px;
+}
+.lm-toggle-btn {
+  font-family: inherit; font-size: 13px; font-weight: 500;
+  padding: 7px 12px; border: 1.5px solid var(--border); background: var(--surface);
+  color: var(--text-mid); cursor: pointer; border-radius: 0;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+.lm-toggle-btn:first-of-type { border-radius: 8px 0 0 8px; }
+.lm-toggle-btn:last-of-type { border-radius: 0 8px 8px 0; }
+/* The seam between segments is ONE hairline, not two butted together. */
+.lm-toggle-btn + .lm-toggle-btn { margin-left: -1.5px; }
+.lm-toggle-btn:hover { background: var(--bg); }
+.lm-toggle-btn-on {
+  background: var(--blue); border-color: var(--blue); color: #fff; position: relative; z-index: 1;
+}
+.lm-toggle-btn-on:hover { background: var(--blue); }
+
+.lm-summary {
+  display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: baseline;
+  font-size: 12.5px; color: var(--text-muted); margin-bottom: 10px;
+}
+.lm-summary strong { color: var(--text); }
+
+/* The key to the grid. On screen it sits above the table; the printed sheet carries the same
+   wording in its header, because a legend that only exists on screen is a legend the person
+   holding the paper doesn't have. */
+.lm-legend {
+  display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: center;
+  font-size: 11.5px; color: var(--text-muted); margin-bottom: 12px;
+}
+.lm-legend-item { display: inline-flex; align-items: center; gap: 7px; }
+.lm-legend-swatch {
+  width: 22px; height: 15px; border: 1px solid var(--border); border-radius: 3px; display: inline-block;
+}
+.lm-legend-na { background: repeating-linear-gradient(135deg, #f6f7f8 0 4px, #eceef0 4px 8px); }
+.lm-legend-fig {
+  font-variant-numeric: tabular-nums; font-size: 12px; color: var(--text);
+  border: 1px solid var(--border); border-radius: 3px; padding: 1px 6px; background: var(--surface);
+}
+
+/* position: sticky resolves against the nearest SCROLLING ancestor, so both axes have to scroll
+   here rather than on the window — otherwise the model column scrolls away with the grid. */
+.lm-scroll {
+  overflow: auto;
+  max-height: calc(100vh - 320px);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+/* separate, NOT collapse: a collapsed border belongs to the table, and a sticky cell carries its
+   own borders out from under it as it moves — the column ends up with no rules at all down one
+   side. Every rule below is on the cell. */
+.lm-table {
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.lm-table th, .lm-table td { border-right: 1px solid #f0f1f2; border-bottom: 1px solid #f0f1f2; }
+
+.lm-table thead th {
+  position: sticky; top: 0; z-index: 2;
+  background: var(--surface);
+  border-bottom: 1.5px solid var(--border);
+  font-size: 11px; font-weight: 700; color: var(--text-mid);
+  text-align: left; vertical-align: bottom;
+}
+/* Rotated, so a column is as wide as "1234.5" instead of as wide as "Fit Water Tanks And Pump".
+   At ~58px a 90-job grid is 5,200px across; horizontal headings would make it 12,000px. */
+/* ── Centring a rotated header over its column ─────────────────────────────────────────
+   `text-align: center` on the cell is only half of it, and on its own does nothing at all.
+
+   The label was `display: block`, which makes it a BLOCK box in the cell's horizontal
+   formatting context — so it stretched to the full 58px of the column, and `text-align` (which
+   only moves inline-level boxes) had nothing to move. Inside that full-width box the label's own
+   `writing-mode: vertical-rl` puts the first line box against its RIGHT edge, and the
+   `rotate(180deg)` then carries it to the LEFT — which is exactly where the headers were sitting.
+
+   `inline-block` makes the box shrink-to-fit the rotated strip, about one line-box thick, and
+   being inline-level it is then what `text-align: center` centres on the column's midpoint. The
+   rotation needs no transform-origin of its own: `writing-mode` turns the LAYOUT BOX, so the box
+   is genuinely tall and narrow, and a 180° turn about its default centre leaves it where it is.
+
+   Width is untouched — the column is still sized by .lm-td/.lm-th-job below. */
+.lm-th-job {
+  height: 156px;
+  padding: 6px 0 8px;
+  text-align: center;
+}
+.lm-th-job-text {
+  display: inline-block;
+  /* Flush to the bottom of the cell. On an inline-level box the default `baseline` would leave
+     the line box's descender space beneath it, floating every header a few pixels high. */
+  vertical-align: bottom;
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  white-space: nowrap;
+  max-height: 140px;
+  overflow: hidden;
+  font-weight: 600;
+}
+.lm-th-corner, .lm-th-total { z-index: 3; }
+.lm-th-corner { left: 0; }
+.lm-th-total { right: 0; text-align: center; }
+.lm-th-corner, .lm-td-model { position: sticky; left: 0; width: 210px; min-width: 210px; }
+.lm-th-total, .lm-td-total { position: sticky; right: 0; width: 82px; min-width: 82px; }
+.lm-th-corner, .lm-th-total { padding: 6px 12px 8px; }
+
+.lm-td-model {
+  z-index: 1;
+  background: var(--surface);
+  border-right: 1.5px solid var(--border);
+  padding: 5px 12px;
+  text-align: left; font-weight: 600; font-size: 12px; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 210px;
+}
+.lm-td-total {
+  z-index: 1;
+  background: var(--surface);
+  border-left: 1.5px solid var(--border);
+  padding: 5px 12px;
+  /* The row total follows the same rule as the cells feeding it — see .lm-td. */
+  text-align: center; font-weight: 700; color: var(--blue);
+}
+
+.lm-td, .lm-th-job { width: 58px; min-width: 58px; max-width: 58px; }
+/* CENTRED, following the headers. A figure column normally right-aligns so the decimal points
+   stack — but here the heading is a narrow rotated strip pinned to the column's midpoint, and a
+   right-aligned figure under a centred header reads as belonging to the column on its right.
+   Every figure is fmtMinutes' one decimal place and the digits are tabular, so a centred column
+   still stacks cleanly; the alignment cue that matters on this grid is "which column is this
+   under", not "where is the decimal point". */
+.lm-td { padding: 5px 6px; text-align: center; color: var(--text); }
+.lm-table tbody tr:hover .lm-td, .lm-table tbody tr:hover .lm-td-model { background: #fbfcfd; }
+
+/* ── The three marked states ─────────────────────────────────────────────────────────────
+   BLANK is the job not applying to this model — genuinely empty, never 0, because 0 is a claim
+   that the work is done in no time and this is the absence of the question. The hatch says
+   "nothing goes here" rather than leaving the reader to wonder whether the grid failed. */
+.lm-td-na { background: repeating-linear-gradient(135deg, #f8f9fa 0 5px, #eef0f2 5px 10px); }
+/* Applies, nothing timed. --red at 700, the same pair /model-total puts on a not-yet-timed 0 —
+   matched rather than re-invented, so one gap looks the same wherever it is met.
+
+   The BOLD is what carries this state, not the red. Beside the green below it the pair is the
+   classic red/green confusion, and under deuteranopia or protanopia — the most common deficiency
+   by a wide margin — both hues land in the same olive band. What separates them there is what
+   separates them on a mono printer: weight, and the fact that a red cell is always the literal
+   figure 0.0 while a green one never is. The colour is the third cue, not the first. */
+.lm-td-none { color: var(--red); font-weight: 700; }
+/* Every operation of the job has a current record for this model — the figure IS the job.
+   Forest green (see --green-deep), normal weight, no underline: this is the only state of the
+   four that is unqualified, so it is the only one with no non-colour mark on it. Losing the
+   green loses nothing but reassurance; losing the red or the underline would lose a warning,
+   which is why those two do not depend on colour and this one may. */
+.lm-td-timed { color: var(--green-deep); }
+/* Partly timed: a real measurement that stops short of the whole column. NOT the untimed red —
+   that would say the number means nothing — and never a plain figure either, which is the
+   reading to avoid. Black, underlined, with the asterisk the cell itself renders.
+
+   The underline is thickened and tinted amber because of what happens at TEAM and SECTION grain:
+   a team of twenty jobs with three timed is partial, so partial stops being the exception and
+   becomes most of the grid, and it has to be tellable from green across a whole screen rather
+   than one cell at a time. The figure's own colour is untouched — black is still what says "this
+   is a real measurement" — so this only makes an existing cue carry further, and the cue itself
+   still survives a mono printer, where the tint renders as grey and the underline does not. */
+.lm-td-partial {
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-decoration-thickness: 1.5px;
+  text-decoration-color: var(--amber);
+  text-underline-offset: 2px;
+}
+/* A row total is incomplete whenever anything on its row is. Same treatment as a partial cell,
+   so the mark means one thing across the grid. */
+.lm-incomplete {
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-decoration-thickness: 1.5px;
+  text-decoration-color: var(--amber);
+  text-underline-offset: 2px;
+}
+
+/* ── Print: the A3 matrix ────────────────────────────────────────────────────────────────
+   The paper is in app/labour-matrix/print.css — @page cannot be scoped by selector, so it has
+   to live on the route. The shell reset, .rp-screen-only and .rp-print-only come from
+   app/report-print.css.
+
+   This is NOT an .rp-doc. That class flattens everything inside it to black on purpose, which is
+   right for a two-column report and wrong here: the red zeros are what the sheet is read for.
+   /roadmap sets the same precedent — it scopes its forced black to the prose and lets the chart
+   keep its colour. */
+@media print {
+  .lm-print {
+    /* Browsers default to `economy` for print and are free to drop backgrounds and wash colour
+       out of text to save toner. Colour is still never the only cue below — `exact` is a request
+       that the browser and the printer can both decline. */
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+    color: #000;
+    font-size: 8pt;
+    line-height: 1.3;
+  }
+
+  .lm-print-head { margin: 0 0 8px; }
+  .lm-print-title { font-size: 15pt; font-weight: 700; margin: 0 0 3px; }
+  .lm-print-meta { font-size: 9pt; margin: 1px 0 0; }
+  /* The legend, on the paper. Small, and kept with the first band. */
+  .lm-print-key {
+    font-size: 7.5pt; line-height: 1.45; margin: 6px 0 0;
+    border-top: 0.5pt solid #bbb; padding-top: 4px;
+  }
+  .lm-print-key-none { color: #dc2626; font-weight: 700; }
+  .lm-print-key-partial { text-decoration: underline; }
+  .lm-print-key-timed { color: #166534; font-weight: 700; }
+
+  /* ── Bands ─────────────────────────────────────────────────────────────────────────────
+     A grid wider than the sheet is cut into bands of columns, each starting a new sheet, with
+     the model names and the model totals repeated down the left of every one. :first-of-type
+     rather than a modifier class, so a filter that empties a band can leave neither a blank
+     leading sheet nor a trailing one. */
+  .lm-print-band { break-before: page; page-break-before: always; }
+  .lm-print-band:first-of-type { break-before: auto; page-break-before: avoid; }
+  .lm-print-band-head {
+    font-size: 8.5pt; font-weight: 700; margin: 0 0 4px;
+    break-after: avoid; page-break-after: avoid;
+  }
+
+  /* table-layout: fixed, so the widths declared below are the widths given. With `auto` the
+     browser re-measures against content and the widest job name drags the table off the right
+     margin. The job columns carry no width and share what is left equally. */
+  .lm-print-table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+    font-size: 7pt;
+    font-variant-numeric: tabular-nums;
+  }
+  /* A band 101 models deep runs down several sheets — the job names come back at the top of
+     each one, or sheet two is a field of unlabelled numbers. */
+  .lm-print-table thead { display: table-header-group; }
+  /* A row is one model. Split across a break it reads as two rows, each missing half its
+     columns. */
+  .lm-print-table tr { break-inside: avoid; page-break-inside: avoid; }
+
+  .lm-print-table th, .lm-print-table td {
+    border: 0;
+    border-bottom: 0.5pt solid #ccc;
+    padding: 1.6pt 3pt;
+    vertical-align: top;
+  }
+  .lm-print-table thead th {
+    border-bottom: 0.75pt solid #444;
+    font-weight: 700;
+    vertical-align: bottom;
+  }
+
+  .lm-print-th-model, .lm-print-td-model {
+    width: 48mm;
+    text-align: left;
+    font-weight: 700;
+    border-right: 0.75pt solid #444;
+    overflow: hidden;
+  }
+  .lm-print-td-model { font-size: 7pt; }
+  .lm-print-th-total, .lm-print-td-total {
+    width: 17mm;
+    /* Centred, matching the cells and the rotated headings — see .lm-td. */
+    text-align: center;
+    font-weight: 700;
+    border-left: 0.75pt solid #444;
+  }
+  /* Rotated for the same reason as on screen: 22 columns of "1234.5" fit across A3 landscape,
+     22 columns of job name do not. 34mm of height buys about 45 characters at 6.5pt. */
+  /* Same fix as the screen's .lm-th-job — see the note there for why `inline-block` is the
+     part that matters and `text-align` alone does nothing. Repeated rather than shared because
+     the printed sheet is styled separately throughout (different sizes, different units), and a
+     rule that only got fixed on one of the two would be a header aligned on screen and adrift on
+     paper. */
+  .lm-print-th-job {
+    height: 34mm;
+    padding-bottom: 2pt;
+    text-align: center;
+  }
+  .lm-print-th-job-text {
+    display: inline-block;
+    vertical-align: bottom;
+    writing-mode: vertical-rl;
+    transform: rotate(180deg);
+    white-space: nowrap;
+    max-height: 33mm;
+    overflow: hidden;
+    font-size: 6.5pt;
+    font-weight: 700;
+  }
+
+  .lm-print-td { text-align: center; }
+  /* A blank cell gets NO rule of its own, deliberately: blank on paper means blank. The key in
+     the header is what says an empty cell is a job that doesn't apply, and any printed tint
+     would only come out of a mono device as grey mud. */
+  /* THREE cues, because only two survive a mono office printer: #dc2626 (--red, matched to the
+     screen and to /model-total's sheets), BOLD, and the key in the header. On a mono device that
+     red lands as a mid-grey LIGHTER than the black around it, so without the weight the marking
+     is not merely lost — it is a legibility regression. */
+  .lm-print-td-none { color: #dc2626 !important; font-weight: 700; }
+  /* Fully timed. !important for the same reason the red needs it: globals.css's print block sets
+     `html, body { color: #000 !important }`, and while an inherited value always loses to a
+     specified one, the two rules are read side by side and an asymmetry here would look like an
+     oversight. The colour reaches the paper because .lm-print sets print-color-adjust: exact —
+     without it the browser's `economy` default is free to wash it out. It is still only
+     reassurance: nothing on the sheet is lost if a mono printer renders it as grey. */
+  .lm-print-td-timed { color: #166534 !important; }
+  /* Partly timed is not untimed: the figure is a real measurement that stops short of the whole
+     job, and the same red would say the number means nothing. Underline plus the asterisk the
+     cell renders, and no colour at all. */
+  .lm-print-td-partial { text-decoration: underline; }
+  .lm-print-table .lm-incomplete { text-decoration: underline; }
+}
+
+/* ── /labour-matrix: the model filter ────────────────────────────────────────────────────────
+   A 101-model checkbox list can't live inside a filter bar, so the bar carries a button that
+   STATES the selection ("Models: 12 of 29") and opens the list in a panel beneath the card. The
+   list itself is ModelSeriesPicker — the app's one series-grouped multi-select model picker,
+   shared with /collect, /setup's bulk-link drawer and the Add Time drawer — so nothing about
+   the rows, the columns or the per-series select-all is restyled here. */
+.lm-models-btn { gap: 8px; }
+/* An active subset is stated on the button itself, not only inside the panel: the grid, the
+   coverage figure and the totals are all narrowed by it, and the one place someone looks to find
+   out why is the control that did it. */
+.lm-models-btn-on {
+  border-color: var(--blue);
+  color: var(--blue);
+  font-weight: 600;
+  background: #f5f9ff;
+}
+.lm-models-btn-on:hover { background: #eaf3ff; border-color: var(--blue); }
+
+.lm-models-panel { padding: 14px 18px 16px; margin-bottom: 16px; }
+.lm-models-panel-bar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 8px;
+}
+.lm-models-search {
+  flex: 1 1 240px; min-width: 200px;
+  font-family: inherit; font-size: 13px;
+  border: 1.5px solid var(--border); border-radius: 8px; padding: 8px 11px;
+  background: var(--surface); color: var(--text); outline: none;
+}
+.lm-models-search:focus { border-color: var(--blue); }
+.lm-models-action {
+  font-family: inherit; font-size: 12px; font-weight: 600;
+  color: var(--blue); background: none; border: none; padding: 4px 2px; cursor: pointer;
+}
+.lm-models-action:disabled { color: var(--text-muted); cursor: not-allowed; }
+.lm-models-count { font-size: 12px; color: var(--text-muted); margin-left: auto; }
+.lm-models-hint { font-size: 11.5px; color: var(--text-muted); margin: 0 0 10px; line-height: 1.5; }
+
+@media print {
+  /* The subset line is the one piece of the printed header that changes what every figure below
+     it means, so it is the one piece set apart from the rest of the meta block. */
+  .lm-print-subset { font-weight: 700; }
+}
+
+/* ── /labour-matrix: the future-builds filter ────────────────────────────────────────────────
+   A checkbox rather than a fourth segmented control — it is one binary with a sensible default,
+   and the filter bar already carries three pickers and a three-way toggle. */
+.lm-future {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 13px; font-weight: 500; color: var(--text-mid);
+  border: 1.5px solid var(--border); border-radius: 8px; padding: 7px 12px;
+  background: var(--surface); cursor: pointer; user-select: none;
+  min-height: 40px;
+}
+.lm-future:hover { background: var(--bg); }
+.lm-future input[type="checkbox"] { width: 17px; height: 17px; accent-color: var(--blue); cursor: pointer; }
+.lm-future:has(input:disabled) { opacity: 0.5; cursor: not-allowed; }
+/* What the filter costs, before it is pressed: "76 of 101". A toggle whose effect is invisible
+   until it is used is a toggle people use twice and then distrust. */
+.lm-future-count {
+  font-size: 11px; font-weight: 700; color: var(--text-muted);
+  background: var(--bg); border-radius: 20px; padding: 2px 8px; white-space: nowrap;
+}
+
+/* The explicit-pick override, named rather than left to be noticed. Amber, not red: nothing has
+   gone wrong — a choice is being honoured over a default, and the reader needs to know which
+   rows it put there. */
+.lm-override {
+  margin: 0 0 12px; padding: 9px 13px; border-radius: 8px;
+  background: var(--amber-bg); border: 1px solid #fde68a; color: #92400e;
+  font-size: 12px; line-height: 1.55;
+}
+
+/* Per-model schedule state inside the picker, via ModelSeriesPicker's renderRowStatus — so the
+   one thing that makes a model unusual is visible at the moment of choosing it rather than
+   after the grid comes back a row short. */
+.lm-models-badge {
+  font-size: 11px; color: var(--text-muted); white-space: nowrap; flex-shrink: 0;
+}
+.lm-models-badge-none { color: var(--amber); font-weight: 600; }
+
+/* ── /labour-matrix: the model label and its build count ─────────────────────────────────────
+   "17.54-1.OB.DY-MY26 (12)" — the model code, and how many builds it has still ahead.
+
+   An inner flex row rather than letting the cell's own ellipsis handle it: a cell-level ellipsis
+   eats whatever is LAST, which is the count. Here the name truncates and the count never does,
+   because the code is what people scan a 101-row column for but the annotation is what can
+   afford to be lost — and it is the annotation that would go otherwise. */
+.lm-model-label { display: flex; align-items: baseline; gap: 5px; min-width: 0; }
+.lm-model-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* Subordinate on every axis — smaller, lighter, muted — so it reads as a note about the row
+   rather than as a second figure competing with the model code. */
+.lm-model-builds {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+@media print {
+  .lm-print-model-label { display: flex; align-items: baseline; gap: 3pt; min-width: 0; }
+  .lm-print-model-name { min-width: 0; overflow: hidden; }
+  /* Same subordination as on screen, and it holds on paper: 6pt against the cell's 7pt, normal
+     weight against its bold, and a grey that a mono printer renders as grey rather than as
+     another black number. The key in the sheet's header says what the bracket means. */
+  .lm-print-model-builds {
+    flex-shrink: 0;
+    font-size: 6pt;
+    font-weight: 400;
+    color: #4a4a4a;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* ── Duplicate jobs drawer (/setup) ──────────────────────────────────────────────────────────
+   Slide-over shell, close button and overlay all come from .gaps-drawer; only the width is
+   overridden (the convention this app already uses for a half-page drawer). Everything below is
+   the list itself — dense, because a line can carry fifty groups, and every row has to state two
+   counts a person is about to make a decision on. */
+.dj-body { padding: 14px 18px 40px; }
+.dj-summary { font-size: 12.5px; color: var(--text-mid); margin: 10px 0 0; line-height: 1.55; }
+.dj-empty { font-size: 13px; color: var(--text-muted); text-align: center; padding: 30px 0; }
+.dj-error {
+  margin: 0 0 12px; padding: 9px 13px; border-radius: 8px;
+  background: var(--red-bg); border: 1px solid #fecaca; color: var(--red); font-size: 12.5px;
+}
+.dj-notice {
+  margin: 0 0 12px; padding: 9px 13px; border-radius: 8px; position: relative;
+  background: var(--green-bg); border: 1px solid #bbf7d0; color: #15803d;
+  font-size: 12.5px; padding-right: 32px;
+}
+.dj-notice button {
+  position: absolute; top: 6px; right: 9px;
+  background: none; border: none; cursor: pointer; font-family: inherit;
+  font-size: 15px; line-height: 1; color: inherit;
+}
+/* The one paragraph that has to be read before the list. Amber rather than grey because the
+   assumption it corrects — "the tray copy is the stale one" — is the assumption that would
+   otherwise be acted on without checking. */
+.dj-preamble {
+  margin: 0 0 16px; padding: 10px 13px; border-radius: 8px;
+  background: var(--amber-bg); border: 1px solid #fde68a; color: #92400e;
+  font-size: 12px; line-height: 1.6;
+}
+
+.dj-group {
+  border: 1px solid var(--border); border-radius: 10px;
+  padding: 12px 14px; margin-bottom: 12px; background: var(--surface);
+}
+.dj-group-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.dj-group-name { font-size: 14px; font-weight: 700; color: var(--text); word-break: break-word; }
+.dj-group-stats { font-size: 11.5px; color: var(--text-muted); margin: 4px 0 0; }
+.dj-group-stats strong { color: var(--text-mid); }
+/* What to do about this group, in a sentence, on every group — the classification badge alone is
+   a label, and the thing a person needs is the order of operations. */
+.dj-group-note { font-size: 11.5px; color: var(--text-muted); margin: 6px 0 10px; line-height: 1.55; }
+
+.dj-badge {
+  font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+  padding: 3px 9px; border-radius: 20px; white-space: nowrap; flex-shrink: 0;
+}
+.dj-badge-green { background: var(--green-bg); color: #15803d; }
+.dj-badge-blue  { background: var(--blue-light); color: #00629c; }
+.dj-badge-amber { background: var(--amber-bg); color: #92400e; }
+
+.dj-copy {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 9px 0; border-top: 1px solid #f2f2f2;
+}
+.dj-copy-where { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 200px; }
+.dj-copy-section { font-size: 12.5px; font-weight: 600; color: var(--text); display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.dj-copy-team { font-size: 11.5px; color: var(--text-muted); }
+.dj-tray {
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+  background: var(--bg); color: var(--text-mid); border-radius: 20px; padding: 2px 7px;
+}
+/* The two figures the whole decision turns on — given their own block, tabular, and never
+   folded into the sentence beside them. */
+.dj-copy-counts {
+  display: flex; gap: 14px; font-size: 12px; color: var(--text-muted);
+  font-variant-numeric: tabular-nums; flex-shrink: 0;
+}
+.dj-copy-counts strong { color: var(--text); font-size: 13px; }
+/* A copy carrying real collection is the one that must not be discarded by reflex. */
+.dj-count-hot strong { color: var(--blue); }
+
+.dj-copy-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; flex-shrink: 0; }
+.dj-action {
+  font-family: inherit; font-size: 11.5px; font-weight: 600;
+  padding: 5px 10px; border-radius: 7px; border: 1px solid var(--border);
+  background: var(--surface); color: var(--text-mid); cursor: pointer;
+}
+.dj-action:hover { background: var(--bg); }
+.dj-action:disabled { opacity: 0.5; cursor: not-allowed; }
+.dj-action-merge { border-color: var(--blue); color: var(--blue); }
+.dj-action-go { border-color: var(--blue); background: var(--blue); color: #fff; }
+.dj-action-none { font-size: 11px; color: var(--text-muted); font-style: italic; }
+.dj-move-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.dj-move-select {
+  font-family: inherit; font-size: 11.5px; padding: 5px 8px;
+  border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: var(--text);
+  max-width: 220px;
+}
+
+/* ── Near misses ─────────────────────────────────────────────────────────────────────────
+   Set apart on purpose and carrying NO controls. These names are different from each other;
+   the list exists so a person can spot a typo, not so the tool can offer to fuse them. */
+.dj-similar { margin-top: 24px; border-top: 2px solid var(--border); padding-top: 16px; }
+.dj-similar-head { font-size: 13px; font-weight: 700; color: var(--text-mid); margin: 0 0 6px; }
+.dj-similar-note { font-size: 11.5px; color: var(--text-muted); line-height: 1.6; margin: 0 0 12px; }
+.dj-similar-row {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  padding: 7px 0; border-top: 1px solid #f2f2f2; font-size: 12px; color: var(--text);
+}
+.dj-similar-variant { background: var(--bg); border-radius: 6px; padding: 3px 9px; }
+.dj-similar-count { color: var(--text-muted); font-size: 11px; }
+
+/* Merge mode, inside a duplicate group. The rows themselves are components/MergeMode's shared
+   .finder-row markup — restyling them here would be this screen quietly forking the affordance,
+   so these rules only give that block somewhere to sit inside the card. */
+.dj-merge-rows {
+  border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+  margin-bottom: 10px;
+}
+.dj-merge-rows .finder-row { padding: 8px 10px; }
+.dj-merge-footer { border-top: 1px solid #f2f2f2; padding-top: 10px; margin-top: 4px; }
+
+/* ── /labour-matrix: the cell drawer ────────────────────────────────────────────────────────
+   Clicking a cell opens (column × model) in a slide-over. The drawer's chrome is the shared
+   .gaps-drawer markup every other drawer in the app uses; what follows is only the rows inside
+   it, which have no counterpart elsewhere — one model fixed, operations down the page. */
+
+/* The cell as a control. The affordance has to be nearly free: 9,000 of these render at once, so
+   it is a cursor and a hover tint rather than a border or a shadow that would reflow the grid. */
+.lm-td-open { cursor: pointer; }
+.lm-td-open:hover { outline: 2px solid var(--blue); outline-offset: -2px; }
+.lm-td-open:focus-visible { outline: 2px solid var(--blue); outline-offset: -2px; }
+
+/* A job row at coarse grain — the drill-down list under a Section or Team cell. */
+.lm-cell-job {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  width: 100%; min-height: 44px; padding: 8px 10px;
+  border: 1.5px solid var(--border); border-radius: 8px;
+  background: var(--surface); color: var(--text);
+  font-family: inherit; font-size: 13px; text-align: left; cursor: pointer;
+}
+.lm-cell-job:hover { border-color: var(--blue); background: #f5f9ff; }
+.lm-cell-job-name { min-width: 0; font-weight: 600; word-break: break-word; }
+.lm-cell-job-meta { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+
+.lm-cell-back {
+  align-self: flex-start;
+  font-family: inherit; font-size: 12px; font-weight: 600; color: var(--blue);
+  background: none; border: none; padding: 0; cursor: pointer;
+}
+
+/* The job-level applies state and its one action. */
+.lm-cell-applies {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  padding: 10px 12px; border-radius: 8px;
+  background: var(--bg); border: 1px solid var(--border);
+  font-size: 13px; line-height: 1.5;
+}
+
+.lm-cell-sect {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+  margin-bottom: 8px;
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+
+/* One operation: its applies tick on the left, its current figure and the way into its runs on
+   the right. 44px minimum, like every other touch row in the app. */
+.lm-cell-op {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  min-height: 44px; padding: 4px 2px; border-bottom: 1px solid #f2f2f2;
+}
+.lm-cell-op-tick {
+  display: flex; align-items: center; gap: 8px; min-width: 0; cursor: pointer;
+}
+.lm-cell-op-tick input[type="checkbox"] {
+  width: 17px; height: 17px; accent-color: var(--blue); cursor: pointer; flex-shrink: 0;
+}
+.lm-cell-op-name { font-size: 13px; color: var(--text); min-width: 0; word-break: break-word; }
+.lm-cell-op-time { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+
+/* The figure and the "not yet timed" tag carry the SAME three states the grid's cells do, and for
+   the same reason: a partly-timed figure is real and incomplete, which is the state most easily
+   misread as finished. */
+.lm-cell-fig { font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.lm-cell-fig-none { color: var(--red); }
+.lm-cell-fig-partial { color: var(--text); text-decoration: underline; }
+.lm-cell-fig-timed { color: #166534; }
+.lm-cell-tag { font-size: 11px; color: var(--text-muted); white-space: nowrap; }
+.lm-cell-tag-none { color: var(--amber); font-weight: 600; }

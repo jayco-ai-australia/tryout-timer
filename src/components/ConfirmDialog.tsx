@@ -31,19 +31,30 @@ export default function ConfirmDialog({
   onCancel,
 }: ConfirmDialogProps) {
   return (
-    <Modal title={title} onClose={onCancel} maxWidth={maxWidth}>
-      <p style={{ fontSize: 14, color: 'var(--text-mid)', lineHeight: 1.6, marginBottom: children ? 12 : 20 }}>
+    <Modal
+      title={title}
+      onClose={onCancel}
+      maxWidth={maxWidth}
+      // Confirm and Cancel go in the modal's PINNED footer rather than at the end of the body.
+      // Every confirmation in this app now gets that for free, which matters most for the ones
+      // that carry a list: /collect's complete-timer step banks against every model on the line
+      // (89 on Caravan) and used to push Save off the bottom of a tablet with no way to scroll
+      // to it. The message and children scroll; these two do not move.
+      footer={(
+        <>
+          <button onClick={onCancel} className="btn-ghost">{cancelLabel}</button>
+          {danger ? (
+            <button onClick={onConfirm} className="btn-danger">{confirmLabel}</button>
+          ) : (
+            <button onClick={onConfirm} className="btn-primary">{confirmLabel}</button>
+          )}
+        </>
+      )}
+    >
+      <p style={{ fontSize: 14, color: 'var(--text-mid)', lineHeight: 1.6, margin: children ? '0 0 12px' : 0 }}>
         {message}
       </p>
-      {children && <div style={{ marginBottom: 20 }}>{children}</div>}
-      <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
-        <button onClick={onCancel} className="btn-ghost">{cancelLabel}</button>
-        {danger ? (
-          <button onClick={onConfirm} className="btn-danger">{confirmLabel}</button>
-        ) : (
-          <button onClick={onConfirm} className="btn-primary">{confirmLabel}</button>
-        )}
-      </div>
+      {children}
     </Modal>
   )
 }
