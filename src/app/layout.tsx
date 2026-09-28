@@ -55,9 +55,17 @@ export default function RootLayout({
   children: React.ReactNode
 }) {
   return (
-    <html lang="en" className={`${inter.variable} ${montserrat.variable}`}>
+    <html lang="en" className={`${inter.variable} ${montserrat.variable}`} suppressHydrationWarning>
       <head>
         <link rel="apple-touch-icon" href={`${BASE_PATH}/icons/icon-192.png`} />
+        {/* The sidebar's rail/expanded state, applied BEFORE first paint so a page load never
+            renders expanded and then snaps to the rail on hydration. components/Nav owns the
+            attribute from then on; the key and the /labour-matrix default must match it. */}
+        <script
+          dangerouslySetInnerHTML={{
+            __html: "try{if(localStorage.getItem('jmotion.nav.rail')==='1'||/\\/labour-matrix(\\/|$)/.test(location.pathname))document.documentElement.setAttribute('data-nav','rail')}catch(e){}",
+          }}
+        />
       </head>
       <body>
         <ServiceWorkerRegister />
