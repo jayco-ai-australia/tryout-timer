@@ -1,0 +1,17 @@
+/*
+ * Page setup for /model-total's printouts — route-scoped, for the same reason as
+ * /pre-assembly-coverage's: `@page` cannot be scoped by selector, so an unnamed rule in
+ * globals.css would re-paper every other printable screen in the app.
+ *
+ * UNNAMED, not the `@page name {…}` + `page: name` pair. NAMED PAGES ARE NOT SUPPORTED IN
+ * SAFARI (nor Firefox), and where the rule is ignored so are the size AND the margins — the
+ * print then silently takes whatever the user's print dialog happens to be set to.
+ *
+ * Portrait: both sheets on this page are a name and a number. (The coverage report is landscape
+ * because it is six columns wide.) This also governs the older blank collection sheet, whose
+ * margin was 14mm from a global rule and is now 12mm with everything else.
+ */
+@page {
+  size: A4 portrait;
+  margin: 12mm;
+}
