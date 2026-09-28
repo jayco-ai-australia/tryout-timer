@@ -100,6 +100,91 @@ export async function createOperations(
 }
 
 /**
+ * The only function anywhere that writes operations.job_id — /setup's "Move to job" modal and
+ * lib/jobs' mergeJobs both go through it, so re-filing an operation means the same thing however
+ * it is reached.
+ *
+ * An operation's recorded times, notes and model links ride along untouched: they hang off
+ * operation_id, not job_id, so nothing has to be migrated when the operation changes job.
+ *
+ * The row is read back because an update filtered out by RLS succeeds having changed nothing —
+ * the failure mode that would let a merge retire a job with operations still pointing at it.
+ */
+export async function setOperationJob(
+  supabase: SupabaseClient,
+  operationId: string,
+  jobId: string
+): Promise<void> {
+  if (!jobId) throw new Error('An operation needs a job')
+  const { data, error } = await supabase
+    .from('operations').update({ job_id: jobId }).eq('id', operationId).select('id')
+  if (error) throw new Error(error.message)
+  if (!data || data.length === 0) {
+    throw new Error("That operation's job could not be changed — the change was rejected by the database (check your permissions).")
+  }
+}
+
+/**
+ * Retire an operation — the soft delete. `is_active = false`, and nothing else is touched.
+ *
+ * What mergeOperations does to the duplicates it folds away, exposed on its own for a structural
+ * screen that wants to hide an operation with no keeper to merge it into.
+ *
+ * Deliberately NOT a `.delete()`. /setup deletes the row outright and can only offer it when the
+ * operation has no recorded times, because `operation_times.operation_id` and
+ * `model_operations.operation_id` both cascade — a hard delete destroys the collected history and
+ * the applies-list with it. Retiring keeps every one of those rows: the times still exist, the
+ * model links still exist, and reactivating the row in the database brings the whole thing back.
+ * That is what makes this offerable on an operation that HAS been timed, which is the common
+ * case on a line somebody is tidying.
+ *
+ * Read back for the same reason every other writer here reads back: an update filtered out by
+ * RLS succeeds having changed nothing.
+ */
+export async function retireOperation(supabase: SupabaseClient, operationId: string): Promise<void> {
+  const { data, error } = await supabase
+    .from('operations').update({ is_active: false }).eq('id', operationId).select('id')
+  if (error) throw new Error(error.message)
+  if (!data || data.length === 0) {
+    throw new Error('That operation could not be retired — the change was rejected by the database (check your permissions).')
+  }
+}
+
+/**
+ * Bring a retired operation back — the inverse of retireOperation.
+ *
+ * Exists for one caller: lib/jobs' job merge. `operations_name_job_id_key` is a plain
+ * UNIQUE (name, job_id) and takes no notice of is_active, so a RETIRED operation on the keeper
+ * still owns its name there. An arriving active operation of that name therefore has to fold
+ * into it — and the combined row then holds live, current work, so leaving it retired would
+ * hide real history behind a merge the user asked for. See the collision walk in lib/jobs.
+ *
+ * Read back for the same reason every other writer here reads back: an update filtered out by
+ * RLS succeeds having changed nothing.
+ */
+export async function reactivateOperation(supabase: SupabaseClient, operationId: string): Promise<void> {
+  const { data, error } = await supabase
+    .from('operations').update({ is_active: true }).eq('id', operationId).select('id')
+  if (error) throw new Error(error.message)
+  if (!data || data.length === 0) {
+    throw new Error('That operation could not be brought back — the change was rejected by the database (check your permissions).')
+  }
+}
+
+/**
+ * THE definition of "these two operations have the same name", and the only one anywhere.
+ *
+ * Trimmed and case-folded, which is deliberately WIDER than the database's own idea of a
+ * duplicate: `operations_name_job_id_key` compares names byte for byte, so "PSCL" and "pscl"
+ * are two legal rows under one job. Every pair the constraint would reject is caught by this,
+ * plus the handful it would wave through — and those are duplicates by any human reading, which
+ * is what the job merge's collision walk is for.
+ */
+export function operationNameKey(name: string): string {
+  return name.trim().toLowerCase()
+}
+
+/**
  * The only function anywhere that updates operations.name. Reads the row back so a rename
  * rejected by RLS surfaces as an error rather than a list that quietly refreshes unchanged.
  */

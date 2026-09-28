@@ -2,21 +2,30 @@
 
 import { useMemo, useState } from 'react'
 import ConfirmDialog from '@/components/ConfirmDialog'
-import type { Job, Stage, Team } from '@/lib/types'
+import { teamForJob } from '@/lib/sections'
+import type { Job, Section, Team } from '@/lib/types'
 
 /**
- * The shared job editor — /setup and /collect both open this from the ✎ on a job row, so the
- * rename + re-stage rules can't drift between them.
+ * The shared job editor — /setup, /collect and /tryouts all open this from the ✎ on a job row,
+ * so the rename + re-section rules can't drift between them.
  *
  * It edits the two things that belong together: the job's name, and where it sits in the walk.
  * Moving it between LINES is a different question with different consequences (a line change
- * unstages the job, because stages belong to one line) and lives in the separate JobFormModal
- * behind "Team / Line".
+ * unsections the job, because sections belong to one line) and lives in the separate JobFormModal
+ * behind "Line".
  *
- * The re-stage itself is not written here. The caller's onSave routes it through stages.ts'
- * setJobStage, which syncs the job's team and line FROM the target stage — a job under a Team 2
- * stage that still reports Team 1 is a walk contradicting itself. That is why a stage change
- * always asks first and a plain rename doesn't: picking a stage can move the job between teams.
+ * The re-section itself is not written here. The caller's onSave routes it through sections.ts'
+ * setJobSection, which syncs the job's team and line FROM the target section — a job under a Team 2
+ * section that still reports Team 1 is a walk contradicting itself. That is why a section change
+ * always asks first and a plain rename doesn't: picking a section can move the job between teams.
+ *
+ * ── nameOnly ──────────────────────────────────────────────────────────────────────────────
+ * /tryouts opens this with `nameOnly`, which leaves the Section control off and nothing else.
+ * The reason is the screen, not the drawer: /tryouts is somebody walking one van, and a
+ * re-section can move a job to another team, at which point it drops out of the pane they are
+ * mid-walk through. Renaming a badly-named job is a five-second fix that shouldn't be able to
+ * turn into that. It stays the same component and the same write path — the alternative was a
+ * fourth inline rename, which is exactly the divergence this drawer exists to end.
  */
 
 const ERR_BOX: React.CSSProperties = {
@@ -29,24 +38,27 @@ function plural(n: number, word: string) {
 }
 
 export default function JobEditDrawer({
-  job, stages, teams, operationCount, onSave, onSaved, onClose,
+  job, sections, teams, operationCount, nameOnly = false, onSave, onSaved, onClose,
 }: {
   job: Job
-  /** Every stage on the job's line, all teams — pre-sorted into walk order. */
-  stages: Stage[]
+  /** Every section on the job's line, all teams — pre-sorted into walk order. */
+  sections: Section[]
   teams: Team[]
   /** The job's active operation count, so the confirm can say how much moves with it. */
   operationCount: number
-  onSave: (job: Job, name: string, stage: Stage | null) => Promise<void>
+  /** Rename only — the Section control is left off entirely. See the note above; this is a
+   * property of the SCREEN opening the drawer, not of the job. */
+  nameOnly?: boolean
+  onSave: (job: Job, name: string, section: Section | null) => Promise<void>
   /** Called after a successful write with the line to show on the page behind the drawer. */
   onSaved: (summary: string) => void
   onClose: () => void
 }) {
   const [name, setName] = useState(job.name)
-  // A stage_id pointing outside this line's stages reads as Unstaged, the same way pane 1
+  // A section_id pointing outside this line's sections reads as Unsectioned, the same way pane 1
   // buckets it — never as a blank select.
-  const [stageId, setStageId] = useState(
-    job.stage_id && stages.some((s) => s.id === job.stage_id) ? job.stage_id : ''
+  const [sectionId, setSectionId] = useState(
+    job.section_id && sections.some((s) => s.id === job.section_id) ? job.section_id : ''
   )
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -54,41 +66,49 @@ export default function JobEditDrawer({
 
   const teamNameById = useMemo(() => new Map(teams.map((t) => [t.id, t.name])), [teams])
 
-  /** Stages grouped under their team, teams in name order, stages left in walk order within
+  /** Sections grouped under their team, teams in name order, sections left in walk order within
    * each — the grouping is the only thing that makes a cross-team target legible. */
-  const stageGroups = useMemo(() => {
-    const byTeam = new Map<string, Stage[]>()
-    for (const stage of stages) {
-      const key = stage.team_id ?? ''
+  const sectionGroups = useMemo(() => {
+    const byTeam = new Map<string, Section[]>()
+    for (const section of sections) {
+      const key = section.team_id ?? ''
       const list = byTeam.get(key)
-      if (list) list.push(stage)
-      else byTeam.set(key, [stage])
+      if (list) list.push(section)
+      else byTeam.set(key, [section])
     }
     return [...byTeam.entries()]
-      .map(([teamId, group]) => ({ teamId, teamName: teamNameById.get(teamId) ?? 'No team', stages: group }))
+      .map(([teamId, group]) => ({ teamId, teamName: teamNameById.get(teamId) ?? 'No team', sections: group }))
       .sort((a, b) => a.teamName.localeCompare(b.teamName))
-  }, [stages, teamNameById])
+  }, [sections, teamNameById])
 
-  const targetStage = stages.find((s) => s.id === stageId) ?? null
-  const targetTeamName = targetStage ? teamNameById.get(targetStage.team_id ?? '') ?? 'No team' : null
-  const currentTeamName = job.teams?.name ?? 'No team'
+  // In nameOnly mode the section is never offered, so it is never a change: the target is the
+  // job's own section, whatever that is. Without this, a caller passing a `sections` list that
+  // doesn't contain the job's section would silently save a re-section to null.
+  const targetSection = nameOnly
+    ? sections.find((s) => s.id === job.section_id) ?? null
+    : sections.find((s) => s.id === sectionId) ?? null
+  const targetTeamName = targetSection ? teamNameById.get(targetSection.team_id ?? '') ?? 'No team' : null
+  /** Derived from the job's SECTION, not from jobs.team_id — the section owns the team (see
+   * teamForJob), and the joined jobs.teams is only the fallback for a job with no section. */
+  const currentTeamId = teamForJob(job, new Map(sections.map((sec) => [sec.id, sec])))
+  const currentTeamName = currentTeamId ? teamNameById.get(currentTeamId) ?? 'No team' : 'Unsorted'
 
   const trimmedName = name.trim()
   const nameChanged = Boolean(trimmedName) && trimmedName !== job.name
-  const stageChanged = (targetStage?.id ?? null) !== (job.stage_id ?? null)
-  const dirty = nameChanged || stageChanged
-  const movingTeam = Boolean(targetStage) && targetTeamName !== currentTeamName
+  const sectionChanged = !nameOnly && (targetSection?.id ?? null) !== (job.section_id ?? null)
+  const dirty = nameChanged || sectionChanged
+  const movingTeam = Boolean(targetSection) && targetTeamName !== currentTeamName
 
   async function commit() {
     setConfirming(false)
     setSaving(true); setError(null)
     try {
-      await onSave(job, trimmedName || job.name, targetStage)
+      await onSave(job, trimmedName || job.name, targetSection)
       const finalName = trimmedName || job.name
-      const summary = stageChanged
-        ? targetStage
-          ? `Moved "${finalName}" to ${targetStage.name} · ${targetTeamName}`
-          : `"${finalName}" is now Unstaged — it stays in ${currentTeamName}`
+      const summary = sectionChanged
+        ? targetSection
+          ? `Moved "${finalName}" to ${targetSection.name} · ${targetTeamName}`
+          : `"${finalName}" now has no section — it stays in ${currentTeamName}`
         : `Renamed to "${finalName}"`
       onSaved(summary)
     } catch (err) {
@@ -101,7 +121,7 @@ export default function JobEditDrawer({
     <>
       <div className="gaps-drawer-header">
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div className="gaps-drawer-title">Edit job</div>
+          <div className="gaps-drawer-title">{nameOnly ? 'Rename job' : 'Edit job'}</div>
           <div className="gaps-drawer-jobname">
             {job.name} · {currentTeamName} · {plural(operationCount, 'operation')}
           </div>
@@ -125,42 +145,58 @@ export default function JobEditDrawer({
             value={name}
             disabled={saving}
             onChange={(e) => setName(e.target.value)}
+            // Only where there is nothing else to fill in. With the Section select present,
+            // Enter in the name field would commit before the user reached it.
+            onKeyDown={(e) => {
+              if (nameOnly && e.key === 'Enter') {
+                e.preventDefault()
+                if (!saving && nameChanged) commit()
+              }
+            }}
           />
+          {nameOnly && (
+            <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '8px 0 0', lineHeight: 1.5 }}>
+              The name only. Recorded times, model links and this try-out are untouched — they
+              hang off the job, not what it is called.
+            </p>
+          )}
         </div>
 
+        {!nameOnly && (
         <div>
-          <label className="label">Stage</label>
-          {stages.length === 0 ? (
+          <label className="label">Section</label>
+          {sections.length === 0 ? (
             <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '4px 0 0' }}>
-              This job&apos;s production line has no stages, so there is nothing to reassign it to.
-              Add stages on the left, or use Team / Line to move the job to another line.
+              This job&apos;s production line has no sections, so there is nothing to reassign it to.
+              Add sections on the left, or use Line to move the job to another line.
             </p>
           ) : (
             <>
               <select
                 className="select"
                 style={{ width: '100%' }}
-                value={stageId}
+                value={sectionId}
                 disabled={saving}
-                onChange={(e) => setStageId(e.target.value)}
+                onChange={(e) => setSectionId(e.target.value)}
               >
-                <option value="">— Unstaged —</option>
-                {stageGroups.map((group) => (
+                <option value="">— No section —</option>
+                {sectionGroups.map((group) => (
                   <optgroup key={group.teamId || 'no-team'} label={group.teamName}>
-                    {group.stages.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+                    {group.sections.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
                   </optgroup>
                 ))}
               </select>
               <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '8px 0 0', lineHeight: 1.5 }}>
-                {targetStage
+                {targetSection
                   ? movingTeam
-                    ? `Moves this job from ${currentTeamName} to ${targetTeamName} — a job belongs to the team that owns its stage.`
+                    ? `Moves this job from ${currentTeamName} to ${targetTeamName} — a job belongs to the team that owns its section.`
                     : `Stays in ${currentTeamName}.`
-                  : `Clears the stage only. The job stays in ${currentTeamName}.`}
+                  : `Clears the section only. The job stays in ${currentTeamName}.`}
               </p>
             </>
           )}
         </div>
+        )}
       </div>
 
       <div style={{ borderTop: '1px solid var(--border)', padding: '12px 20px', display: 'flex', gap: 10, justifyContent: 'flex-end', alignItems: 'center', flexShrink: 0, background: 'var(--surface)' }}>
@@ -169,9 +205,9 @@ export default function JobEditDrawer({
           type="button"
           className="btn-primary"
           disabled={saving || !dirty || !trimmedName}
-          // A stage change moves the job (and its whole operation list) between teams, so it
+          // A section change moves the job (and its whole operation list) between teams, so it
           // always asks first. A plain rename doesn't need a gate.
-          onClick={() => (stageChanged ? setConfirming(true) : commit())}
+          onClick={() => (sectionChanged ? setConfirming(true) : commit())}
         >
           {saving ? 'Saving…' : 'Save'}
         </button>
@@ -179,16 +215,16 @@ export default function JobEditDrawer({
 
       {confirming && (
         <ConfirmDialog
-          title={targetStage ? `Move to ${targetStage.name}` : 'Unstage this job'}
-          message={targetStage
-            ? `"${job.name}" and all ${plural(operationCount, 'operation')} under it move to ${targetStage.name} (${targetTeamName}). ` +
+          title={targetSection ? `Move to ${targetSection.name}` : 'Unsection this job'}
+          message={targetSection
+            ? `"${job.name}" and all ${plural(operationCount, 'operation')} under it move to ${targetSection.name} (${targetTeamName}). ` +
               'Their recorded times move with them — nothing is re-collected or lost. ' +
               (movingTeam
                 ? `The job leaves ${currentTeamName}, so it will drop out of the list behind this drawer if your current filter doesn't cover ${targetTeamName}.`
                 : 'It stays in the same team.')
-            : `"${job.name}" leaves the walk and becomes Unstaged, along with all ${plural(operationCount, 'operation')} under it. ` +
-              `It stays in ${currentTeamName} — only its stage is cleared.`}
-          confirmLabel={targetStage ? 'Move job' : 'Unstage'}
+            : `"${job.name}" leaves the walk and ends up with no section, along with all ${plural(operationCount, 'operation')} under it. ` +
+              `It stays in ${currentTeamName} — only its section is cleared.`}
+          confirmLabel={targetSection ? 'Move job' : 'Unsection'}
           onConfirm={commit}
           onCancel={() => setConfirming(false)}
         />

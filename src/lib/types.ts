@@ -1,4 +1,14 @@
-export type UserRole = 'user' | 'admin'
+/**
+ * profiles.role. Three tiers, and the middle one is NOT a junior admin:
+ *   user    — edits their own recorded times (and ownerless ones). Cannot delete times.
+ *   manager — edits and deletes ANY recorded time. No /admin, no /config.
+ *   admin   — everything a manager can do, plus /admin and /config.
+ *
+ * "manager" is about recorded work, "admin" is about the app. Widening an admin check to
+ * managers because it looks like a permissions check is the mistake this comment exists to
+ * prevent — see lib/permissions, which is where every one of these questions is answered.
+ */
+export type UserRole = 'user' | 'manager' | 'admin'
 
 export interface Profile {
   id: string
@@ -12,6 +22,14 @@ export interface Profile {
 export interface ProductionLine {
   id: string
   name: string
+  /**
+   * A line that owns no products of its own and inherits the model list of the lines it feeds —
+   * Chassis, Lamination, Saws, Sew, Filling, Training. Which lines it feeds lives in
+   * `production_line_feeds`. Nothing should branch on this directly: ask lib/lines'
+   * modelsForLine, which is the one place the two shapes are resolved into a model list.
+   * Optional here because most selects predate the column.
+   */
+  is_pre_assembly?: boolean | null
   created_at: string
 }
 
@@ -79,14 +97,19 @@ export interface Chassis {
   products?: Pick<Product, 'id' | 'product_code' | 'model' | 'production_line_id'> | null
 }
 
-/** A step of the line's walk order — Production Line → Team → Stage → Job → Operation.
- * Jobs point at a stage via jobs.stage_id (nullable: an unstaged job still exists). */
-export interface Stage {
+/** A step of the line's walk order — Production Line → Team → Section → Job → Operation.
+ * Jobs point at a section via jobs.section_id (nullable: an unsectioned job still exists). */
+export interface Section {
   id: string
   name: string
   team_id: string | null
   production_line_id: string | null
   sort_order: number | null
+  /** Soft-delete flag, the same shape operations use. false = merged away into another section
+   * (see lib/sections' mergeSections) — every screen that lists sections filters to is_active =
+   * true, so a merged-away section stops appearing across the app without its row being
+   * destroyed. Optional here because most selects predate the column. */
+  is_active?: boolean
   created_at: string
 }
 
@@ -96,9 +119,15 @@ export interface Job {
   primary_operator_id: string | null
   team_id: string | null
   production_line_id: string | null
-  /** Optional here because most screens select jobs without it — the Stage-grouped walk on
+  /** Optional here because most screens select jobs without it — the Section-grouped walk on
    * /tryouts is the one that reads it. */
-  stage_id?: string | null
+  section_id?: string | null
+  /** Soft-delete flag, the same shape sections.is_active and operations.is_active carry. false =
+   * merged away into another job (see lib/jobs' mergeJobs) — every read that feeds a list, a
+   * pane or a picker filters to is_active = true, so a merged-away job stops appearing across the
+   * app without its row, or any operation pointing at it, being destroyed. Optional here because
+   * the identity lookups that deliberately don't filter it also don't select it. */
+  is_active?: boolean
   created_at: string
   teams?: Pick<Team, 'id' | 'name'> | null
   primary_operator?: Pick<Operator, 'id' | 'full_name'> | null
@@ -136,6 +165,17 @@ export interface OperationTime {
    * most rows in prod are false. Reads must not filter on it; see the is_active note at the top
    * of lib/operationTimes.ts. */
   is_active: boolean
+  /**
+   * THE labour-content pointer. null = this is the CURRENT record for its operation+model, and
+   * there is exactly one. Non-null = archived: this run was replaced by the record with that id,
+   * and it survives as history only.
+   *
+   * Labour content for an operation+model is the CURRENT record's total_minutes — not an average
+   * across runs, which is what it used to be. Every figure goes through lib/operationTimes'
+   * currentForOperation/currentByOperation; nothing reads this column to compute a number on its
+   * own, and nothing but that module writes it.
+   */
+  superseded_by: string | null
   team_id: string | null
   production_line_id: string | null
   created_at: string
