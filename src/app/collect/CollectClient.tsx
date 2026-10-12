@@ -1,5 +1,7 @@
 'use client'
 
+import SelectAllControl from '@/components/SelectAllControl'
+import { TIME_FLAG_COLUMNS, type TimeRow } from '@/lib/operationTimes'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { selectIn } from '@/lib/chunkedIn'
@@ -10,7 +12,6 @@ import { ModelSeriesPicker } from '@/components/ModelLinker'
 import BankingAgainstList from '@/components/BankingAgainstList'
 import BulkModelLinkDrawer, { DRAWER_WIDTH, useSlideOverDrawer } from '@/components/BulkModelLinkDrawer'
 import JobEditDrawer from '@/components/JobEditDrawer'
-import JobFormModal from '@/components/JobFormModal'
 import OperationEditDrawer from '@/components/OperationEditDrawer'
 import {
   JobsPane, Pane, RenameButton, SectionsPane, UNSECTIONED_KEY, plural, type SectionEntry,
@@ -222,7 +223,6 @@ export default function CollectClient({ lines, userId }: Props) {
   const [jobDrawer, setJobDrawer] = useState<Job | null>(null)
   /** The job open in the shared Line form, or null. Separate from the drawer above
    * because a line change unsections the job, which is a different question. */
-  const [jobFormJob, setJobFormJob] = useState<Job | null>(null)
   /** Where a just-edited job went — the same line /setup shows behind its drawer. */
   const [jobNotice, setJobNotice] = useState<string | null>(null)
   /** The operation open in the shared editor (name + operators), or null. */
@@ -456,11 +456,12 @@ export default function CollectClient({ lines, userId }: Props) {
         // behind the figure, and currentForOperation counts that from the rows it is handed. It
         // picks the current record itself — the query's job is to select the column, not to
         // pre-decide the answer.
-        supabase.from('operation_times').select('id, operation_id, total_minutes, superseded_by, created_at').eq('operation_id', opId),
+        supabase.from('operation_times').select(`id, operation_id, total_minutes, superseded_by, ${TIME_FLAG_COLUMNS}, created_at`).eq('operation_id', opId),
       ])
       if (timesError) throw new Error(timesError.message)
 
-      const times = timeRows ?? []
+      // The row shape is stated here, not inferred — see lib/operationTimes' TIME_PARENT_JOIN.
+      const times = (timeRows ?? []) as unknown as TimeRow[]
       // Chunked (lib/chunkedIn): one operation accumulates a run per model per re-measure, so
       // this id list grows with history rather than being bounded by anything.
       const timeModels = await selectIn<{ operation_time_id: string; product_id: string }>(
@@ -1118,7 +1119,6 @@ export default function CollectClient({ lines, userId }: Props) {
           // Row ✎ and the footer's Line — the same two entry points /setup offers, into
           // the same two shared components. The row's own click still selects the job.
           onEdit={openJobDrawer}
-          onEditLine={setJobFormJob}
         />
 
         <CollectOperationsPane
@@ -1336,19 +1336,6 @@ export default function CollectClient({ lines, userId }: Props) {
         </>
       )}
 
-      {/* ── Line: the shared job form, the one edit that can change the line ───── */}
-      {jobFormJob && (
-        <JobFormModal
-          mode="edit"
-          job={jobFormJob}
-          defaultLineId={scopeLineId}
-          lines={lines}
-          sections={sections}
-          supabase={supabase}
-          onClose={() => setJobFormJob(null)}
-          onSaved={loadStructure}
-        />
-      )}
 
       {/* The operation-merge confirmation — the same component the Sections and Jobs panes use,
         * fed by a preflight that has already run. See components/MergeMode. */}
@@ -1467,7 +1454,6 @@ function CollectOperationsPane({
   const [pasteResult, setPasteResult] = useState<string | null>(null)
 
   const selectedCount = selectedIds.size
-  const allSelected = operations.length > 0 && operations.every((o) => selectedIds.has(o.id))
 
   async function submitQuickAdd(e: React.FormEvent) {
     e.preventDefault()
@@ -1531,26 +1517,26 @@ function CollectOperationsPane({
 
             {merge.active ? <MergeFooter merge={merge} /> : selectMode ? (
               <>
+                <SelectAllControl
+                  noun="operation" total={operations.length}
+                  selected={operations.filter((o) => selectedIds.has(o.id)).length}
+                  onSetAll={onSetAllSelected}
+                />
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                   <button
                     type="button" className="btn-primary" style={{ padding: '6px 11px', fontSize: 12 }}
                     disabled={selectedCount === 0} onClick={onOpenBulkLink}
+                    title={selectedCount === 0 ? 'Tick at least one operation first' : undefined}
                   >
                     Link models to selected ({selectedCount})
                   </button>
                   <button
                     type="button" className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12 }}
                     disabled={selectedCount === 0 || Boolean(manualBlockedReason)}
-                    title={manualBlockedReason ?? 'One row per ticked operation — minutes, operator and note'}
+                    title={manualBlockedReason ?? (selectedCount === 0 ? 'Tick at least one operation first' : 'One row per ticked operation — minutes, operator and note')}
                     onClick={onOpenManualTimes}
                   >
                     Enter times manually ({selectedCount})
-                  </button>
-                  <button
-                    type="button" className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12 }}
-                    disabled={operations.length === 0} onClick={() => onSetAllSelected(!allSelected)}
-                  >
-                    {allSelected ? 'Clear all' : 'Select all'}
                   </button>
                   <button
                     type="button" className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12 }}
@@ -1560,11 +1546,11 @@ function CollectOperationsPane({
                   </button>
                 </div>
 
-                <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                  {selectedCount === 0
-                    ? 'Tick operations to link models to all of them at once.'
-                    : `${plural(selectedCount, 'operation')} selected.`}
-                </span>
+                {selectedCount === 0 && (
+                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                    Tick operations to link models to all of them at once.
+                  </span>
+                )}
               </>
             ) : (
               <>
@@ -1779,9 +1765,12 @@ function ModelsCoveragePane({
               <button type="button" className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12 }} disabled={gapCount === 0} onClick={onSelectGaps}>
                 Select {gapCount} gap{gapCount === 1 ? '' : 's'}
               </button>
-              <button type="button" className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12 }} onClick={onSelectAll}>Select all</button>
-              <button type="button" className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12 }} disabled={selectedIds.size === 0} onClick={onClear}>Clear</button>
             </div>
+            <SelectAllControl
+              noun="model" total={products.length}
+              selected={products.filter((p) => selectedIds.has(p.id)).length}
+              onSetAll={(select) => (select ? onSelectAll() : onClear())}
+            />
             <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
               {selectedIds.size === 0
                 ? 'Nothing ticked — this timing can\u2019t be saved until at least one model is.'

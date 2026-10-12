@@ -1,5 +1,8 @@
 'use client'
 
+import InfoPopover from '@/components/InfoPopover'
+import SelectAllControl from '@/components/SelectAllControl'
+import { type TimeParentFlags } from '@/lib/operationTimes'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import Link from 'next/link'
 import Modal from './Modal'
@@ -7,12 +10,15 @@ import OperatorSelect from './OperatorSelect'
 import { ModelSeriesPicker } from './ModelLinker'
 import { createClient } from '@/lib/supabase/client'
 import { fetchAllChunked, READ_CHUNK, type RangeableQuery } from '@/lib/supabaseRead'
-import { createSection, fetchSectionsForLine } from '@/lib/sections'
+import { fetchSectionsForLine } from '@/lib/sections'
 import { createJob } from '@/lib/jobs'
 import { createOperations, parseOperationNames } from '@/lib/operations'
 import { modelsForLine } from '@/lib/lines'
 import { fetchLinksForOperations, linkOperationsToModels } from '@/lib/modelOperations'
-import { addOperationTimeNote, currentForOperation, operationProductKey, recordOperationTime } from '@/lib/operationTimes'
+import {
+  TIME_FLAG_COLUMNS, addOperationTimeNote, countsTowardLabour, currentForOperation, onlyCountedTimes,
+  operationProductKey, recordOperationTime,
+} from '@/lib/operationTimes'
 import { fetchOperators, operatorsForLine, type OperatorOption } from '@/lib/operators'
 import { buildReportHref } from '@/lib/reports'
 import { plural } from '@/lib/format'
@@ -34,7 +40,7 @@ import type { Operation, Product, ProductionLine, Section } from '@/lib/types'
  * different flow.
  *
  * ── The shape mirrors the paper form ──────────────────────────────────────────────────────
- * Step 3 is the reason for the whole design: a job's operations listed down the page with a
+ * Step 4 is the reason for the whole design: a job's operations listed down the page with a
  * minutes box beside each one, which is what the time-study sheet looks like. A blank box means
  * "not collected" and writes nothing. That is why this is a four-step wizard rather than a
  * single form — the batch is per JOB, and the job has to be settled before the list exists.
@@ -42,7 +48,7 @@ import type { Operation, Product, ProductionLine, Section } from '@/lib/types'
  * ── Every write goes through the existing single-writer helpers ───────────────────────────
  * recordOperationTime for the times (never a direct insert into operation_times — it is what
  * derives team/line provenance from the job and supersedes the previous current record),
- * addOperationTimeNote for notes, createSection / createJob / createOperations for the structure
+ * addOperationTimeNote for notes, createJob / createOperations for the structure
  * created along the way. Nothing here writes a table directly.
  */
 
@@ -105,8 +111,8 @@ type Step = 1 | 2 | 3 | 4
 const STEP_TITLES: Record<Step, string> = {
   1: 'Where was this collected?',
   2: 'Which job?',
-  3: 'Operations and minutes',
-  4: 'Models, operator and note',
+  3: 'Which models?',
+  4: 'Operations and minutes',
 }
 
 /** Which pre-filled fields the user has explicitly unlocked with "change". */
@@ -124,6 +130,10 @@ const LABEL: React.CSSProperties = {
 const ERR_BOX: React.CSSProperties = {
   padding: '9px 12px', borderRadius: 8, background: 'var(--red-bg)',
   border: '1px solid #fecaca', color: 'var(--red)', fontSize: 12, margin: 0,
+}
+const WARN_BOX: React.CSSProperties = {
+  padding: '9px 12px', borderRadius: 8, background: 'var(--amber-bg)',
+  border: '1px solid #fcd34d', color: '#92400e', fontSize: 12, lineHeight: 1.55,
 }
 const OK_BOX: React.CSSProperties = {
   padding: '12px 14px', borderRadius: 8, background: 'var(--green-bg)',
@@ -257,21 +267,28 @@ export default function AddTimeDrawer({
    * is the same rule /model-total's total uses rather than a second definition of "recorded". */
   const [recordedMinutes, setRecordedMinutes] = useState<Map<string, number>>(new Map())
 
-  // ── Step 3/4 entry ──
+  // ── Time entry (step 4) ──
   const [minutesByOperation, setMinutesByOperation] = useState<Record<string, string>>({})
   /**
-   * The "Applies" tick per operation. Absent = ticked: every operation on a job applies to the
-   * models being collected unless somebody says otherwise, which is the common case and the one
-   * that should need no clicks.
+   * Operations ticked FOR TIME ENTRY — which ones a duration is being recorded against right now.
+   * Opens empty. It is not applicability and never becomes it: an operation can apply and have
+   * no time (that is what a gap is), so ticking one here links nothing and unticking unlinks
+   * nothing.
    *
-   * This exists because the drawer writes TWO tables that mean different things. A time writes
-   * operation_time_models ("this run counts for these models"); applicability is
-   * model_operations ("this operation is required for this model") and it is what coverage and
-   * the gap report read. Linking only the operations that got a time would make the gap report
-   * incapable of ever containing work that hasn't been done — which is the only thing a gap
-   * report is for.
+   * The drawer deals with two tables that mean different things, and keeps them apart:
+   *   model_operations       "this operation is required for this model" — what coverage and the
+   *                          gap report read. Written ONLY by the apply prompt (applyJob) and by
+   *                          the explicit "link and save" answer to the unlinked-time warning.
+   *   operation_time_models  "this run counts for these models" — written by recordOperationTime.
    */
-  const [appliesByOperation, setAppliesByOperation] = useState<Record<string, boolean>>({})
+  const [timeTicks, setTimeTicks] = useState<Set<string>>(new Set())
+  /** The apply prompt: open when set. `choosing` is the "Choose which apply" list, `picked` its ticks. */
+  const [applyPrompt, setApplyPrompt] = useState<{ choosing: boolean; picked: Set<string> } | null>(null)
+  const [applying, setApplying] = useState(false)
+  /** The Save-time warning that a timed operation doesn't apply to a selected model. */
+  const [unlinkedConfirm, setUnlinkedConfirm] = useState(false)
+  /** Bumped to re-read the applies-list after a write that may have landed only partly. */
+  const [linksVersion, setLinksVersion] = useState(0)
   /** Existing model_operations rows for this job's operations, keyed product → operation ids.
    * Read before the write so case (b) below can leave deliberate exclusions alone. */
   const [existingLinks, setExistingLinks] = useState<Map<string, Set<string>>>(new Map())
@@ -360,12 +377,14 @@ export default function AddTimeDrawer({
       try {
         // superseded_by and total_minutes ride along so currentForOperation can pick the current
         // record per pair — the badge shows labour content, not the sum of every run ever taken.
-        type RawTime = { id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null; created_at: string }
+        // Retired and hidden records are filtered at the query (onlyCountedTimes): this read only
+        // feeds a badge, and a model whose only records are excluded has to keep reading as a gap.
+        type RawTime = { id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null; created_at: string }
         const times = await fetchAllChunked<RawTime>(
           opIds, READ_CHUNK,
-          (chunk) => supabase.from('operation_times')
-            .select('id, operation_id, total_minutes, superseded_by, created_at')
-            .in('operation_id', chunk).order('id') as unknown as RangeableQuery<RawTime>,
+          (chunk) => onlyCountedTimes(supabase.from('operation_times')
+            .select(`id, operation_id, total_minutes, superseded_by, ${TIME_FLAG_COLUMNS}, created_at`)
+            .in('operation_id', chunk)).order('id') as unknown as RangeableQuery<RawTime>,
           { table: 'operation_times' }
         )
         const timeIds = times.map((t) => t.id)
@@ -382,7 +401,8 @@ export default function AddTimeDrawer({
         )
         if (cancelled) return
 
-        const productsWithTimes = new Set(links.map((l) => l.product_id))
+        const hiddenTimeIds = new Set(times.filter((t) => !countsTowardLabour(t)).map((t) => t.id))
+        const productsWithTimes = new Set(links.filter((l) => !hiddenTimeIds.has(l.operation_time_id)).map((l) => l.product_id))
         // The shared per-pair rule. Summed across this job's operations only, which is what the
         // badge claims — not the model's whole labour content.
         const pairStats = currentForOperation(times, links)
@@ -430,13 +450,12 @@ export default function AddTimeDrawer({
       })
       .catch(() => {
         // FAILS CLOSED, deliberately. An empty map reads as "this job applies to nothing yet",
-        // which sends every model down case (a) and links every ticked operation — exactly the
-        // silent restoration of deliberate exclusions this whole read exists to prevent. So the
-        // step is blocked instead (see blockingReason) rather than guessed at.
+        // which would offer to apply the whole job to models that already carry a deliberate
+        // partial list. So the step is blocked instead (see stepReason) rather than guessed at.
         if (!cancelled) { setExistingLinks(new Map()); setLinksError(true) }
       })
     return () => { cancelled = true }
-  }, [supabase, operations])
+  }, [supabase, operations, linksVersion])
 
   // ── Derived ───────────────────────────────────────────────────────────────────────────────
   const lineName = lines.find((l) => l.id === lineId)?.name ?? ''
@@ -452,96 +471,58 @@ export default function AddTimeDrawer({
     [sections, team]
   )
 
-  /** Only operations with a real, positive number are written. A blank box is "not collected"
-   * and is skipped in silence; a box with something unparseable in it is a typo and is named. */
+  // ── Applicability, read-only ──────────────────────────────────────────────────────────────
+  const selectedModels = useMemo(
+    () => products.filter((p) => selectedProductIds.has(p.id)),
+    [products, selectedProductIds]
+  )
+  /** What model_operations says about one (model, operation) pair. */
+  const linkedTo = useCallback(
+    (productId: string, operationId: string) => existingLinks.get(productId)?.has(operationId) ?? false,
+    [existingLinks]
+  )
+  /** Selected models this job isn't on at all — the derived rule from lib/modelOperations'
+   * jobsApplying: a job applies to a model iff at least one of its operations does. These are
+   * the models the apply prompt is about; a model that already has the job never sees it. */
+  const modelsToApply = useMemo(
+    () => selectedModels.filter((m) => !operations.some((o) => linkedTo(m.id, o.id))),
+    [selectedModels, operations, linkedTo]
+  )
+  const pickedToApply = useMemo(
+    () => operations.filter((o) => applyPrompt?.picked.has(o.id)).map((o) => o.id),
+    [operations, applyPrompt]
+  )
+
+  // ── Time entry ────────────────────────────────────────────────────────────────────────────
+  const tickedCount = useMemo(() => operations.filter((o) => timeTicks.has(o.id)).length, [operations, timeTicks])
+
+  /** Only TICKED operations are considered, and only one with a real, positive number is
+   * written. A ticked box left blank is named so it can be filled or unticked; something
+   * unparseable is a typo and is named too. */
   const entered = useMemo(() => {
     const ok: { operation: Operation; minutes: number }[] = []
     const bad: string[] = []
+    const blank: string[] = []
     for (const op of operations) {
+      if (!timeTicks.has(op.id)) continue
       const raw = (minutesByOperation[op.id] ?? '').trim()
-      if (!raw) continue
+      if (!raw) { blank.push(op.name); continue }
       const n = Number(raw)
       if (Number.isNaN(n) || n <= 0) { bad.push(op.name); continue }
       ok.push({ operation: op, minutes: n })
     }
-    return { ok, bad }
-  }, [operations, minutesByOperation])
+    return { ok, bad, blank }
+  }, [operations, minutesByOperation, timeTicks])
 
   const runningTotal = entered.ok.reduce((sum, e) => sum + e.minutes, 0)
 
-  /** Operations with real minutes — their applicability tick is forced on and disabled. */
-  const timedOperationIds = useMemo(
-    () => new Set(entered.ok.map((e) => e.operation.id)),
-    [entered.ok]
-  )
-
-  /**
-   * Whether an operation will be treated as applying. Timed operations are forced true and
-   * cannot be unticked: a recorded time for an operation that doesn't apply is a contradiction,
-   * and the way to untick it is to clear the minutes.
-   */
-  const appliesTo = useCallback(
-    (operationId: string) => timedOperationIds.has(operationId) || (appliesByOperation[operationId] ?? true),
-    [timedOperationIds, appliesByOperation]
-  )
-
-  /**
-   * ── What this submit will do to each selected model's applies-list ────────────────────
-   *
-   * TWO CASES, and they are not variations of each other:
-   *
-   * (a) The job does NOT yet apply to the model — no operation of it is linked. Nothing has been
-   *     decided about this model yet, so every TICKED operation is linked. This is the case that
-   *     makes untimed work appear as a gap.
-   *
-   * (b) The job ALREADY applies — at least one operation is linked. Somebody has already said
-   *     what this model does, and a partial list is a DECISION, not an incomplete one. Nothing is
-   *     touched. The single exception is an operation you entered minutes for that isn't linked
-   *     yet: a time for a non-applicable operation is a contradiction, so that one is linked and
-   *     the confirmation says so by name.
-   *
-   * Applicability is only ever ADDED here. This drawer never deletes a model_operations row —
-   * removing applicability is /model-total's unlink (lib/modelLinks), which is a separate,
-   * confirmed, times-aware action.
-   */
-  const applicabilityPlan = useMemo(() => {
-    const operationById = new Map(operations.map((o) => [o.id, o]))
-    const tickedIds = operations.filter((o) => appliesTo(o.id)).map((o) => o.id)
-
-    return [...selectedProductIds].map((productId) => {
-      const product = products.find((p) => p.id === productId)
-      const existing = existingLinks.get(productId) ?? new Set<string>()
-      // "A job applies to a model iff at least one of its operations does" — the derived rule
-      // from lib/modelOperations' jobsApplying. There is no job→model row to consult.
-      const existingOnJob = operations.filter((o) => existing.has(o.id)).map((o) => o.id)
-      const alreadyApplies = existingOnJob.length > 0
-
-      const toLink = alreadyApplies
-        // Case (b): ONLY the timed operations that aren't linked yet. Ticked-but-untimed
-        // operations are deliberately left alone — that is the exclusion being preserved.
-        ? [...timedOperationIds].filter((id) => !existing.has(id))
-        // Case (a): every ticked operation. Timed ones are forced ticked, so they are included.
-        : tickedIds
-
-      return {
-        productId,
-        model: product?.model ?? '(unknown model)',
-        alreadyApplies,
-        existingCount: existingOnJob.length,
-        totalOperations: operations.length,
-        toLink,
-        // Named in the confirmation, because this is the one thing case (b) changes.
-        timedAdditions: alreadyApplies
-          ? toLink.map((id) => operationById.get(id)?.name ?? '—')
-          : [],
-      }
-    })
-  }, [selectedProductIds, products, operations, existingLinks, timedOperationIds, appliesTo])
-
-  /** How many operations the tick boxes currently say apply — what case (a) would link. */
-  const tickedCount = useMemo(
-    () => operations.filter((o) => appliesTo(o.id)).length,
-    [operations, appliesTo]
+  /** Timed operations that don't apply to one or more selected models — each with the models it
+   * is missing from. Warned about on the row and named again at Save; never linked silently. */
+  const unlinkedTimed = useMemo(
+    () => entered.ok
+      .map(({ operation }) => ({ operation, models: selectedModels.filter((m) => !linkedTo(m.id, operation.id)) }))
+      .filter((u) => u.models.length > 0),
+    [entered.ok, selectedModels, linkedTo]
   )
 
   /**
@@ -589,42 +570,41 @@ export default function AddTimeDrawer({
   }, [modelStateFor])
 
   /**
-   * The badge. Combined rather than one fact per badge, because the partial case is exactly the
-   * one that is currently invisible: four models in production carry 1 of 8 operations on a job,
-   * and under a "no time yet" badge alone they were indistinguishable from a model that simply
-   * hasn't been walked yet.
+   * A model tile's info icon. The tile is the model and its checkbox; everything the long text
+   * badge used to say is one click, hover or focus away, and the icon's tone says which of the
+   * three states this is before it is opened:
    *
-   * Colour follows the most actionable fact rather than the tier: blue where ticking would add
-   * structure, amber for anything still to be filled in (a gap, or a partial applies-list),
-   * muted grey for a model that is complete and recorded.
+   *   blue   (info)     the job doesn't apply to this model yet
+   *   amber  (warning)  it applies and nothing is recorded — a gap
+   *   green  (success)  it applies and time is recorded
+   *
+   * Every count is "of this job's N operations" — what model_operations holds for this job on
+   * this model. Nothing here counts the operations being timed; they aren't chosen until the
+   * next step.
    */
-  function modelBadge(productId: string): React.ReactNode {
+  function modelInfo(productId: string): React.ReactNode {
     const st = modelStateFor(productId)
+    const ofJob = `of this job’s ${plural(st.totalOps, 'operation')}`
     if (!st.applies) {
       return (
-        <span className="badge badge-blue" style={{ fontSize: 10 }} title="This job doesn’t apply to this model yet — ticking it will link the job’s operations to it as well as recording the times.">
-          will link job · {plural(tickedCount, 'operation')}
-        </span>
+        <InfoPopover tone="info" label="Job doesn’t apply yet">
+          This job doesn’t apply to this model yet. Picking it asks, once, which {ofJob} to
+          link — before any time is entered.
+        </InfoPopover>
       )
     }
-    const parts: string[] = []
-    // "1 of 8 operations", spelled exactly as /setup's job model panel spells it. One phrase
-    // for one concept: a reader who learns what it means in one screen should not have to
-    // re-learn an abbreviation of it in another.
-    if (st.partial) parts.push(`applies · ${st.appliedOps} of ${st.totalOps} operations`)
-    if (!st.timed) parts.push('no time yet')
-    else parts.push(st.minutes > 0 ? `${fmtTotal(st.minutes)}m recorded` : 'time recorded')
-    const cls = st.partial || !st.timed ? 'badge-amber' : 'badge-grey'
+    const linked = `${st.appliedOps} ${ofJob} ${st.appliedOps === 1 ? 'is' : 'are'} linked`
+    if (!st.timed) {
+      return (
+        <InfoPopover tone="warning" label="Applies, nothing recorded">
+          This job applies to this model. {linked}. Nothing recorded yet.
+        </InfoPopover>
+      )
+    }
     return (
-      <span
-        className={`badge ${cls}`}
-        style={{ fontSize: 10 }}
-        title={st.partial
-          ? `This job applies to ${st.appliedOps} of its ${st.totalOps} operations on this model — the rest are deliberately excluded and this drawer will not restore them.`
-          : undefined}
-      >
-        {parts.join(' · ')}
-      </span>
+      <InfoPopover tone="success" label="Applies, time recorded">
+        This job applies to this model. {linked}, {st.minutes > 0 ? `${fmtTotal(st.minutes)}m recorded` : 'time recorded'}.
+      </InfoPopover>
     )
   }
 
@@ -645,26 +625,10 @@ export default function AddTimeDrawer({
   }
 
   // ── Inline creation ───────────────────────────────────────────────────────────────────────
-  const [newSectionName, setNewSectionName] = useState('')
   const [newJobName, setNewJobName] = useState('')
   const [newOperationName, setNewOperationName] = useState('')
   const [pasteText, setPasteText] = useState('')
   const [busy, setBusy] = useState(false)
-
-  async function handleCreateSection() {
-    if (!newSectionName.trim() || !lineId || !team) return
-    setBusy(true); setError(null)
-    try {
-      const created = await createSection(supabase, {
-        name: newSectionName.trim(), productionLineId: lineId, teamId: team,
-      })
-      setSections((prev) => [...prev, created])
-      setSection(created.id)
-      setNewSectionName('')
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not create that section')
-    } finally { setBusy(false) }
-  }
 
   async function handleCreateJob() {
     if (!newJobName.trim() || !sectionRow) return
@@ -697,61 +661,100 @@ export default function AddTimeDrawer({
     } finally { setBusy(false) }
   }
 
+  // ── Applying the job ──────────────────────────────────────────────────────────────────────
+  /**
+   * Writes model_operations and nothing else: the chosen operations × every selected model the
+   * job isn't on yet, through linkOperationsToModels — the app's only insert into that table.
+   * One write per model, so a failure is pinned to the model it belongs to.
+   */
+  async function applyJob(operationIds: string[]) {
+    if (operationIds.length === 0) return
+    setApplying(true); setError(null)
+    const failed: string[] = []
+    const next = new Map(existingLinks)
+    for (const model of modelsToApply) {
+      let linkError: string | null
+      try {
+        const linkResult = await linkOperationsToModels(
+          supabase, operationIds.map((operation_id) => ({ operation_id, product_id: model.id }))
+        )
+        linkError = linkResult.error
+      } catch (err) {
+        linkError = err instanceof Error ? err.message : 'the write was rejected'
+      }
+      if (linkError) { failed.push(`${model.model} (${linkError})`); continue }
+      next.set(model.id, new Set([...(next.get(model.id) ?? []), ...operationIds]))
+    }
+    setExistingLinks(next)
+    setApplying(false)
+    setApplyPrompt(null)
+    if (failed.length > 0) {
+      // A short write may still have landed some rows — re-read rather than guess.
+      setLinksVersion((v) => v + 1)
+      setError(`Could not apply ${jobName || 'this job'} to ${failed.join('; ')}. No time has been recorded.`)
+      return
+    }
+    setStep(4)
+  }
+
   // ── Submit ────────────────────────────────────────────────────────────────────────────────
   /** Stated, never silently disabled — a dead button with no reason beside it is the thing this
    * whole screen exists to stop being. */
   const blockingReason = useMemo(() => {
     if (!userId) return 'Still identifying you — give it a moment and try again.'
+    if (selectedProductIds.size === 0) return 'Pick at least one model on step 3 — a time has to be recorded against something.'
+    if (tickedCount === 0) return 'Tick at least one operation to record a time against.'
     if (entered.bad.length > 0) {
-      return `These operations have something that isn't a number of minutes in them: ${entered.bad.join(', ')}. Clear the box to skip an operation.`
+      return `These operations have something that isn't a number of minutes in them: ${entered.bad.join(', ')}.`
     }
-    if (entered.ok.length === 0) return 'Enter minutes against at least one operation on step 3 — a blank box means "not collected" and writes nothing.'
-    if (selectedProductIds.size === 0) return 'Pick at least one model — a time has to be recorded against something.'
-    // Fails closed: without the existing applies-list every model would be read as "job doesn't
-    // apply yet" and every ticked operation linked, silently restoring deliberate exclusions.
-    if (linksError) return 'Could not read this job’s existing model links, so it isn’t safe to write applicability — go back a step and forward again to retry.'
+    if (entered.blank.length > 0) {
+      return `Enter minutes for ${entered.blank.join(', ')}, or untick ${entered.blank.length === 1 ? 'it' : 'them'}.`
+    }
+    // Fails closed: without the applies-list a time could be offered against a pair it can't be
+    // recorded for, with no warning.
+    if (linksError) return 'Could not read this job’s existing model links — go back a step and forward again to retry.'
     return null
-  }, [userId, entered, selectedProductIds, linksError])
+  }, [userId, entered, tickedCount, selectedProductIds, linksError])
 
-  async function handleSubmit() {
+  /** Save, by way of the warning when a timed operation doesn't apply somewhere. */
+  function requestSave() {
     if (blockingReason) { setError(blockingReason); return }
+    if (unlinkedTimed.length > 0) { setUnlinkedConfirm(true); return }
+    void save(false)
+  }
+
+  /**
+   * Records the times. `linkUnlinked` is the answer to the warning dialog and the ONLY way this
+   * function writes model_operations: true links exactly the (timed operation, model) pairs the
+   * dialog named; false links nothing and records each time only where its operation applies.
+   */
+  async function save(linkUnlinked: boolean) {
+    setUnlinkedConfirm(false)
     setSaving(true); setError(null)
-    const models = [...selectedProductIds]
+    const models = selectedModels
     const trimmedNote = note.trim()
     const out: AddTimeResult = {
       jobId: job, jobName, lineId, created: 0, totalMinutes: 0,
       modelCount: models.length, notesWritten: 0, applicability: [], failures: [],
       nothingSaved: false,
     }
+    /** product → operations that apply to it, as of this save. */
+    const appliesNow = new Map(models.map((m) => [m.id, new Set(existingLinks.get(m.id) ?? [])]))
     try {
-      // ── 1. Applicability FIRST ──────────────────────────────────────────────────────
-      // Before the times, so a run can never land against an operation the model isn't yet
-      // recorded as doing. linkOperationsToModels is the single writer and upserts, so a pair
-      // that already exists is a no-op rather than a duplicate-key error — nothing here can
-      // delete a model_operations row.
-      //
-      // ONE WRITE PER MODEL, so a failure can be pinned to the model it belongs to. A model
-      // whose links did not all land gets NO times — it is dropped from the models the times
-      // are recorded against, and the rest still save. Banking four of five and naming the
-      // fifth beats losing all five to one rejected write and inviting a duplicate re-entry.
-      const savedModels: string[] = []
-      for (const planned of applicabilityPlan) {
-        const outcome: ModelApplicabilityOutcome = {
-          productId: planned.productId,
-          model: planned.model,
-          alreadyApplied: planned.alreadyApplies,
-          linked: 0,
-          timedAdditions: planned.timedAdditions,
-          skippedForLinkFailure: false,
-          linkError: null,
-        }
-        out.applicability.push(outcome)
-        if (planned.toLink.length > 0) {
-          // A throw is the same failure as a returned error — see the copy panel's guard.
+      // ── 1. The named pairs, only if the user chose to link them ──────────────────────────
+      if (linkUnlinked) {
+        for (const model of models) {
+          const ops = unlinkedTimed.filter((u) => u.models.some((m) => m.id === model.id)).map((u) => u.operation)
+          if (ops.length === 0) continue
+          const outcome: ModelApplicabilityOutcome = {
+            productId: model.id, model: model.model, alreadyApplied: true, linked: 0,
+            timedAdditions: [], skippedForLinkFailure: false, linkError: null,
+          }
+          out.applicability.push(outcome)
           let linkError: string | null
           try {
             const linkResult = await linkOperationsToModels(
-              supabase, planned.toLink.map((operation_id) => ({ operation_id, product_id: planned.productId }))
+              supabase, ops.map((o) => ({ operation_id: o.id, product_id: model.id }))
             )
             outcome.linked = linkResult.linked
             linkError = linkResult.error
@@ -761,33 +764,28 @@ export default function AddTimeDrawer({
           if (linkError) {
             outcome.skippedForLinkFailure = true
             outcome.linkError = linkError
-            out.failures.push(
-              `${planned.model}: its applies-list could not be written (${linkError}), so NO times `
-              + 'were saved against it. Fix that and enter the times again for this model only.'
-            )
             continue
           }
+          outcome.timedAdditions = ops.map((o) => o.name)
+          for (const o of ops) appliesNow.get(model.id)?.add(o.id)
         }
-        savedModels.push(planned.productId)
       }
 
-      // Every model's link failed: write nothing. A time recorded against no model is not a
-      // smaller save, it is a record nothing can find.
-      if (savedModels.length === 0) {
-        out.nothingSaved = true
-        setResult(out)
-        return
-      }
-
-      // ── 2. Then the times — against the models whose applicability landed, only ────────
+      // ── 2. The times — each against the models its operation applies to, and no others ────
       for (const { operation, minutes } of entered.ok) {
+        const targets = models.filter((m) => appliesNow.get(m.id)?.has(operation.id))
+        const left = models.filter((m) => !appliesNow.get(m.id)?.has(operation.id))
+        if (targets.length === 0) {
+          out.failures.push(`${operation.name}: not recorded — it doesn’t apply to ${models.length === 1 ? models[0].model : 'any selected model'}.`)
+          continue
+        }
         try {
           // THE single insert path. Never a direct .insert() into operation_times: this is what
           // derives the team/line provenance from the operation's job and supersedes whatever
           // was the current record for each (operation, model) pair.
           const { created, refusedProductIds } = await recordOperationTime(supabase, {
             operationId: operation.id,
-            productIds: savedModels,
+            productIds: targets.map((m) => m.id),
             operatorId: operatorId || null,
             collectedBy: userId as string,
             totalMinutes: minutes,
@@ -796,15 +794,9 @@ export default function AddTimeDrawer({
           })
           out.created += 1
           out.totalMinutes += minutes
-          // Step 1 linked every timed operation to every saved model, so the guard should pass
-          // them all. If it refused any — an unlink landing in between — say which, rather than
-          // letting "added" imply every model got it.
-          if (refusedProductIds.length > 0) {
-            const names = refusedProductIds.map((id) => products.find((p) => p.id === id)?.model ?? 'a model')
-            out.failures.push(
-              `${operation.name}: not saved against ${names.join(', ')} — it no longer applies to `
-              + `${refusedProductIds.length === 1 ? 'that model' : 'those models'}. Saved against the rest.`
-            )
+          const missed = [...left.map((m) => m.model), ...refusedProductIds.map((id) => products.find((p) => p.id === id)?.model ?? 'a model')]
+          if (missed.length > 0) {
+            out.failures.push(`${operation.name}: recorded, but not against ${missed.join(', ')} — it doesn’t apply there.`)
           }
           if (trimmedNote) {
             try {
@@ -819,6 +811,7 @@ export default function AddTimeDrawer({
           out.failures.push(`${operation.name}: ${err instanceof Error ? err.message : 'could not be saved'}`)
         }
       }
+      out.nothingSaved = out.created === 0
       setResult(out)
     } finally {
       setSaving(false)
@@ -829,8 +822,24 @@ export default function AddTimeDrawer({
   const stepReason: string | null =
     step === 1 ? (!lineId ? 'Pick a production line.' : !section ? 'Pick a section — a job belongs to one, and a job’s team comes from it.' : null)
     : step === 2 ? (!job ? 'Pick a job, or create one.' : null)
-    : step === 3 ? (entered.bad.length > 0 ? `Not a number: ${entered.bad.join(', ')}` : entered.ok.length === 0 ? 'Enter minutes against at least one operation.' : null)
+    : step === 3 ? (
+      selectedProductIds.size === 0 ? 'Pick at least one model — a time has to be recorded against something.'
+        // Fails closed: without the applies-list there is no telling which models need the job applied.
+        : linksError ? 'Could not read this job’s existing model links — go back a step and forward again to retry.'
+          : null)
     : null
+
+  /** Leaving the Models step is the point of applying: any selected model the job isn't on yet
+   * gets the one prompt before the wizard moves on. A job with no operations has nothing to link
+   * yet — step 4 offers it again once it has. */
+  function goNext() {
+    if (stepReason) return
+    if (step === 3 && modelsToApply.length > 0 && operations.length > 0) {
+      setApplyPrompt({ choosing: false, picked: new Set() })
+      return
+    }
+    setStep((s) => (s + 1) as Step)
+  }
 
   function close() { onDone(result) }
 
@@ -862,17 +871,13 @@ export default function AddTimeDrawer({
           <div style={result.failures.length > 0 ? { ...ERR_BOX, fontSize: 13 } : OK_BOX}>
             {result.nothingSaved ? (
               <div>
-                <strong>Nothing was saved.</strong> None of the selected models’ applies-lists could
-                be written, so no times were recorded against any of them. Every model below is
-                unchanged — fix the cause and enter the form again.
+                <strong>No time was recorded.</strong> Each one is listed below with the reason.
               </div>
             ) : (
               <div>
                 Added {plural(result.created, 'time')} to <strong>{result.jobName || 'this job'}</strong> —{' '}
                 {fmtTotal(result.totalMinutes)} minutes
-                {result.applicability.some((a) => a.skippedForLinkFailure) && (
-                  <>, against {plural(result.applicability.filter((a) => !a.skippedForLinkFailure).length, 'model')} of {result.modelCount} selected</>
-                )}.
+                {' '}across {plural(result.modelCount, 'model')}.
                 {result.notesWritten > 0 && <> Note saved on {plural(result.notesWritten, 'record')}.</>}
               </div>
             )}
@@ -886,7 +891,7 @@ export default function AddTimeDrawer({
                         times were saved here, deliberately" is the thing the reader must not
                         miss when the rest of the box says times were added. */}
                     {a.skippedForLinkFailure
-                      ? <><strong>{a.model}</strong> — <strong>skipped, no times saved</strong>: its applies-list could not be written{a.linkError ? <> ({a.linkError})</> : null}.</>
+                      ? <><strong>{a.model}</strong> — <strong>could not be linked</strong>{a.linkError ? <> ({a.linkError})</> : null}, so the times for the operations that don’t apply to it were left off it.</>
                       : a.linked > 0
                         ? <>Linked {plural(a.linked, 'operation')} to <strong>{a.model}</strong>.</>
                         : <><strong>{a.model}</strong> unchanged.</>}
@@ -912,9 +917,11 @@ export default function AddTimeDrawer({
   }
 
   return (
+    <>
     <Modal
       title={`Add Time — ${STEP_TITLES[step]}`}
-      onClose={close}
+      // A prompt open on top owns Escape and the backdrop; this one must not close under it.
+      onClose={applyPrompt || unlinkedConfirm ? () => {} : close}
       maxWidth={720}
       // Back / Next / Save are pinned, not appended after the step's content. Step 4 lists every
       // model on the line (89 on Caravan) and on a tablet that ran the Save button off the
@@ -939,7 +946,7 @@ export default function AddTimeDrawer({
                   thing that can happen. Disabled whenever blockingReason has something to say;
                   the sentence above is what says it. */}
               {step < 4 ? (
-                <button type="button" className="btn-primary" disabled={!!stepReason} onClick={() => setStep((s) => (s + 1) as Step)}>
+                <button type="button" className="btn-primary" disabled={!!stepReason} title={stepReason ?? undefined} onClick={goNext}>
                   Next
                 </button>
               ) : (
@@ -947,7 +954,8 @@ export default function AddTimeDrawer({
                   type="button"
                   className="btn-primary"
                   disabled={saving || !!blockingReason}
-                  onClick={handleSubmit}
+                  title={blockingReason ?? undefined}
+                  onClick={requestSave}
                 >
                   {saving
                     ? 'Saving…'
@@ -971,7 +979,7 @@ export default function AddTimeDrawer({
                 color: n === step ? 'var(--blue)' : 'var(--text-muted)',
               }}
             >
-              {n}. {['Where', 'Job', 'Minutes', 'Models'][n - 1]}
+              {n}. {['Where', 'Job', 'Models', 'Minutes'][n - 1]}
             </span>
           ))}
         </div>
@@ -991,7 +999,7 @@ export default function AddTimeDrawer({
                     options={lines.map((l) => ({ id: l.id, label: l.name }))}
                     value={lineId}
                     onChange={(v) => { setLineId(v); setTeam(''); setSection(''); setJob(''); setSelectedProductIds(new Set()) }}
-                    placeholder="Search lines…" emptyLabel="— Select a production line —"
+                    placeholder="Search lines…" emptyLabel="— Select a production line —" searchable={false}
                   />
                 </div>
               )}
@@ -1005,7 +1013,7 @@ export default function AddTimeDrawer({
                     options={teams.map((t) => ({ id: t.id, label: t.name }))}
                     value={team}
                     onChange={(v) => { setTeam(v); setSection(''); setJob('') }}
-                    placeholder="Search teams…" emptyLabel="— All teams on this line —"
+                    placeholder="Search teams…" emptyLabel="— All teams on this line —" searchable={false}
                     disabled={!lineId}
                   />
                 </div>
@@ -1020,32 +1028,9 @@ export default function AddTimeDrawer({
                     options={sectionOptions.map((s) => ({ id: s.id, label: s.name }))}
                     value={section}
                     onChange={(v) => { setSection(v); setJob('') }}
-                    placeholder="Search sections…" emptyLabel="— Select a section —"
+                    placeholder="Search sections…" emptyLabel="— Select a section —" searchable={false}
                     disabled={!lineId}
                   />
-                  {/* A section belongs to exactly one team, so createSection needs one before it
-                      can be offered. */}
-                  {lineId && (
-                    team ? (
-                      <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-                        <input
-                          className="input" style={{ flex: 1, fontSize: 12, padding: '6px 9px' }}
-                          placeholder="New section name…"
-                          value={newSectionName}
-                          disabled={busy}
-                          onChange={(e) => setNewSectionName(e.target.value)}
-                          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleCreateSection() } }}
-                        />
-                        <button type="button" className="btn-ghost" disabled={busy || !newSectionName.trim()} onClick={handleCreateSection}>
-                          {busy ? '…' : 'Create section'}
-                        </button>
-                      </div>
-                    ) : (
-                      <p style={{ fontSize: 11, color: 'var(--text-muted)', margin: '8px 0 0' }}>
-                        Pick a team above to create a new section — every section belongs to one.
-                      </p>
-                    )
-                  )}
                 </div>
               )}
             </>
@@ -1091,15 +1076,57 @@ export default function AddTimeDrawer({
             </>
           )}
 
-          {/* ── Step 3 — OPERATIONS AND MINUTES ──────────────────────────────────────── */}
+          {/* ── Step 3 — MODELS ──────────────────────────────────────────────────────── */}
           {step === 3 && (
+            <div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 2, marginBottom: 6 }}>
+                <span style={{ ...LABEL, marginBottom: 0 }}>Models ({selectedProductIds.size} selected)</span>
+                <InfoPopover tone="info" label="About this list">
+                  Tick the models these times were collected for. One time is written per
+                  operation, recorded against every model ticked here that the operation applies
+                  to. Gaps are listed first, then models already covered, then models{' '}
+                  {jobName || 'this job'} doesn’t apply to yet. Each model’s icon says which it is.
+                </InfoPopover>
+              </div>
+              {products.length === 0 ? (
+                <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: 0 }}>
+                  No models on this production line.
+                </p>
+              ) : (
+                <ModelSeriesPicker
+                  products={products}
+                  selectedIds={selectedProductIds}
+                  onToggle={toggleModel}
+                  onToggleSeries={toggleSeries}
+                  sortWithinSeries={sortByGapFirst}
+                  renderRowStatus={(p) => modelInfo(p.id)}
+                />
+              )}
+            </div>
+          )}
+
+          {/* ── Step 4 — OPERATIONS AND MINUTES, OPERATOR, NOTE ─────────────────────────── */}
+          {step === 4 && (
             <>
               <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                {jobName} · {plural(operations.length, 'operation')} · leave a box blank for anything
-                not collected. <strong>Applies</strong> is separate from minutes: it says the
-                operation is required for these models, which is what makes an untimed operation
-                show up as a gap.
+                {jobName} · {plural(operations.length, 'operation')} · for{' '}
+                {selectedModels.length === 1 ? <strong>{selectedModels[0].model}</strong> : <strong>{plural(selectedModels.length, 'model')}</strong>}.
+                Tick the operations you are recording a time for and enter the minutes. The tick is
+                about <strong>this entry only</strong> — it never changes which operations apply.
               </div>
+
+              {/* Operations exist that the job's apply step never covered — created just now, or
+                  the job had none when the models were picked. Offered, never done silently. */}
+              {modelsToApply.length > 0 && operations.length > 0 && (
+                <div style={WARN_BOX}>
+                  <strong>{jobName}</strong> doesn’t apply to{' '}
+                  {modelsToApply.length === 1 ? modelsToApply[0].model : plural(modelsToApply.length, 'selected model')} yet,
+                  so none of its operations will show as gaps there.{' '}
+                  <button type="button" style={LINK_BTN} onClick={() => setApplyPrompt({ choosing: false, picked: new Set() })}>
+                    Apply it…
+                  </button>
+                </div>
+              )}
 
               {operations.length === 0 ? (
                 <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: 0 }}>
@@ -1107,49 +1134,66 @@ export default function AddTimeDrawer({
                 </p>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  <SelectAllControl
+                    noun="operation" total={operations.length} selected={tickedCount}
+                    title="Ticks or clears every operation for time entry. It does not change which operations apply."
+                    onSetAll={(select) => setTimeTicks(select ? new Set(operations.map((o) => o.id)) : new Set())}
+                    style={{ padding: '2px 0 8px', borderBottom: '1px solid var(--border)' }}
+                  />
                   {operations.map((op) => {
-                    const timed = timedOperationIds.has(op.id)
+                    const ticked = timeTicks.has(op.id)
+                    const appliesCount = selectedModels.filter((m) => linkedTo(m.id, op.id)).length
+                    const missing = selectedModels.filter((m) => !linkedTo(m.id, op.id))
                     return (
-                      <div
-                        key={op.id}
-                        style={{
-                          display: 'grid', gridTemplateColumns: '1fr 84px 96px', gap: 10, alignItems: 'center',
-                          padding: '6px 0', borderBottom: '1px solid #f2f2f2',
-                        }}
-                      >
-                        <span style={{ fontSize: 13, color: 'var(--text)', minWidth: 0 }}>{op.name}</span>
-                        {/* Applicability, not minutes — this is what coverage and the gap report
-                            read. Forced on and disabled once minutes are entered: a recorded time
-                            means the operation applies, so the way to untick it is to clear the
-                            box, not to contradict yourself here. */}
-                        <label
-                          style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, color: timed ? 'var(--text-muted)' : 'var(--text-mid)', cursor: timed ? 'default' : 'pointer' }}
-                          title={timed
-                            ? 'You recorded a time for this operation, so it applies to the selected models. Clear the minutes to untick it.'
-                            : 'Untick if this operation does not apply to the selected models.'}
-                        >
+                      <div key={op.id} style={{ padding: '6px 0', borderBottom: '1px solid #f2f2f2' }}>
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr auto 96px', gap: 10, alignItems: 'center' }}>
+                          <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--text)', minWidth: 0, cursor: 'pointer' }}>
+                            <input
+                              type="checkbox" checked={ticked} aria-label={`Record a time for ${op.name}`}
+                              style={{ width: 16, height: 16, accentColor: 'var(--blue)', flexShrink: 0 }}
+                              onChange={() => setTimeTicks((prev) => {
+                                const next = new Set(prev)
+                                if (next.has(op.id)) next.delete(op.id)
+                                else next.add(op.id)
+                                return next
+                              })}
+                            />
+                            <span style={{ minWidth: 0 }}>{op.name}</span>
+                          </label>
+                          {/* What model_operations says, read-only. Nothing on this row writes it. */}
+                          {linksError ? <span /> : appliesCount === selectedModels.length ? (
+                            <span className="badge badge-green" style={{ fontSize: 10 }} title="This operation applies to every selected model">Applies</span>
+                          ) : appliesCount === 0 ? (
+                            <span className="badge badge-grey" style={{ fontSize: 10 }} title={`This operation is not linked to ${selectedModels.length === 1 ? 'this model' : 'any selected model'}`}>Doesn’t apply</span>
+                          ) : (
+                            <span className="badge badge-amber" style={{ fontSize: 10 }} title={`Not linked to: ${missing.map((m) => m.model).join(', ')}`}>
+                              Applies to {appliesCount} of {selectedModels.length}
+                            </span>
+                          )}
                           <input
-                            type="checkbox"
-                            checked={appliesTo(op.id)}
-                            disabled={timed}
-                            onChange={(e) => setAppliesByOperation((prev) => ({ ...prev, [op.id]: e.target.checked }))}
+                            type="number" min={0} step="0.01" inputMode="decimal" placeholder="min"
+                            className="input" style={{ width: '100%', textAlign: 'right', fontSize: 13 }}
+                            aria-label={`Minutes for ${op.name}`}
+                            value={minutesByOperation[op.id] ?? ''}
+                            onChange={(e) => {
+                              const value = e.target.value
+                              setMinutesByOperation((prev) => ({ ...prev, [op.id]: value }))
+                              // Typing a figure is choosing the operation; clearing it leaves the tick alone.
+                              if (value.trim()) setTimeTicks((prev) => (prev.has(op.id) ? prev : new Set(prev).add(op.id)))
+                            }}
                           />
-                          Applies
-                        </label>
-                        <input
-                          type="number" min={0} step="0.01" inputMode="decimal" placeholder="min"
-                          className="input" style={{ width: '100%', textAlign: 'right', fontSize: 13 }}
-                          value={minutesByOperation[op.id] ?? ''}
-                          onChange={(e) => setMinutesByOperation((prev) => ({ ...prev, [op.id]: e.target.value }))}
-                        />
+                        </div>
+                        {ticked && !linksError && missing.length > 0 && (
+                          <p style={{ margin: '4px 0 0 24px', fontSize: 11, color: '#92400e', lineHeight: 1.5 }}>
+                            ⚠ Doesn’t apply to {missing.length <= 2 ? missing.map((m) => m.model).join(' or ') : plural(missing.length, 'selected model')} —
+                            a time can’t be recorded there unless it is linked. You’ll be asked when you save.
+                          </p>
+                        )}
                       </div>
                     )
                   })}
                   <div style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 0 0', fontSize: 13, fontWeight: 700, color: 'var(--text)' }}>
-                    <span>
-                      {plural(entered.ok.length, 'operation')} entered ·{' '}
-                      {operations.filter((o) => appliesTo(o.id)).length} of {operations.length} apply
-                    </span>
+                    <span>{plural(entered.ok.length, 'time')} entered</span>
                     <span>{fmtTotal(runningTotal)}m</span>
                   </div>
                 </div>
@@ -1185,75 +1229,10 @@ export default function AddTimeDrawer({
                     Add {plural(parseOperationNames(pasteText).names.length, 'operation')}
                   </button>
                 )}
-              </div>
-            </>
-          )}
-
-          {/* ── Step 4 — MODELS, OPERATOR, NOTE ──────────────────────────────────────── */}
-          {step === 4 && (
-            <>
-              <div>
-                <span style={LABEL}>Models ({selectedProductIds.size} selected)</span>
-                <p style={{ fontSize: 11, color: 'var(--text-muted)', margin: '0 0 8px' }}>
-                  One time is written per operation, linked to every model ticked here. The badge
-                  says whether this job already applies to the model and what has been recorded —
-                  gaps first, then models already covered, then models the job doesn&apos;t apply to
-                  yet, which ticking would also link.
+                <p style={{ fontSize: 11, color: 'var(--text-muted)', margin: '6px 0 0' }}>
+                  A new operation is added to the job only. It doesn’t apply to any model until it is linked.
                 </p>
-                {products.length === 0 ? (
-                  <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: 0 }}>
-                    No models on this production line.
-                  </p>
-                ) : (
-                  <ModelSeriesPicker
-                    products={products}
-                    selectedIds={selectedProductIds}
-                    onToggle={toggleModel}
-                    onToggleSeries={toggleSeries}
-                    sortWithinSeries={sortByGapFirst}
-                    renderRowStatus={(p) => modelBadge(p.id)}
-                  />
-                )}
               </div>
-
-              {/* ── What this will do to applicability, per model ─────────────────────
-                  Stated before submit rather than reported after, because the two cases are not
-                  interchangeable and case (b) deliberately does LESS than it looks like it
-                  should. A reader has to be able to see that a model with 1 of 8 operations is
-                  staying that way. */}
-              {applicabilityPlan.length > 0 && (
-                <div>
-                  <span style={LABEL}>Applicability</span>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                    {applicabilityPlan.map((planned) => (
-                      <div key={planned.productId} style={{ fontSize: 12, lineHeight: 1.5 }}>
-                        <strong style={{ color: 'var(--text)' }}>{planned.model}</strong>
-                        {planned.alreadyApplies ? (
-                          <>
-                            {' '}— already applies, {planned.existingCount} of {planned.totalOperations} operations
-                            {planned.toLink.length === 0 && <span style={{ color: 'var(--text-muted)' }}>, unchanged.</span>}
-                            {planned.toLink.length > 0 && '.'}
-                            {planned.timedAdditions.map((name) => (
-                              <div key={name} style={{ color: 'var(--amber)', paddingLeft: 12 }}>
-                                + {name} linked (you recorded a time for it).
-                              </div>
-                            ))}
-                          </>
-                        ) : (
-                          <span style={{ color: 'var(--text-mid)' }}>
-                            {' '}— job will be linked, {plural(planned.toLink.length, 'operation')}.
-                          </span>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                  <p style={{ fontSize: 11, color: 'var(--text-muted)', margin: '8px 0 0' }}>
-                    A model that already has this job keeps exactly the operations it has — partial
-                    lists are deliberate and are never restored from here. Nothing is ever unlinked
-                    by this drawer.
-                  </p>
-                </div>
-              )}
 
               <div>
                 <span style={LABEL}>Operator (optional)</span>
@@ -1287,5 +1266,143 @@ export default function AddTimeDrawer({
 
       </div>
     </Modal>
+
+      {/* ── 1. APPLICABILITY — asked once, at the point of applying ────────────────────────
+          A job the model doesn't have yet is being applied to it. That is a decision about
+          model_operations and nothing else, so it is asked on its own, before any time is
+          entered, and written by the shared linkOperationsToModels. */}
+      {applyPrompt && (
+        <Modal
+          title={`Apply ${jobName || 'this job'}`}
+          onClose={applying ? () => {} : () => setApplyPrompt(null)}
+          maxWidth={520}
+          footer={applyPrompt.choosing ? (
+            <>
+              <button type="button" className="btn-ghost" disabled={applying} onClick={() => setApplyPrompt({ choosing: false, picked: applyPrompt.picked })}>Back</button>
+              <button
+                type="button" className="btn-primary"
+                disabled={applying || pickedToApply.length === 0}
+                title={pickedToApply.length === 0 ? 'Tick at least one operation that applies first' : undefined}
+                onClick={() => applyJob(pickedToApply)}
+              >
+                {applying ? 'Linking…' : `Link ${plural(pickedToApply.length, 'operation')}`}
+              </button>
+            </>
+          ) : (
+            <>
+              <button type="button" className="btn-ghost" disabled={applying} onClick={() => setApplyPrompt(null)}>Cancel</button>
+              <button type="button" className="btn-ghost" disabled={applying} onClick={() => setApplyPrompt({ choosing: true, picked: applyPrompt.picked })}>
+                Choose which apply
+              </button>
+              <button type="button" className="btn-primary" disabled={applying} onClick={() => applyJob(operations.map((o) => o.id))}>
+                {applying ? 'Linking…' : `Link all ${plural(operations.length, 'operation')}`}
+              </button>
+            </>
+          )}
+        >
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12, fontSize: 14, color: 'var(--text-mid)', lineHeight: 1.6 }}>
+            <p style={{ margin: 0, color: 'var(--text)' }}>
+              Apply <strong>{jobName}</strong> to{' '}
+              {modelsToApply.length === 1
+                ? <strong>{modelsToApply[0].model}</strong>
+                : <strong>{modelsToApply.length} models</strong>}
+              ?{' '}
+              {applyPrompt.choosing
+                ? <>{plural(pickedToApply.length, 'operation')} will be linked{modelsToApply.length > 1 && ' to each'}.</>
+                : <>{plural(operations.length, 'operation')} will be linked{modelsToApply.length > 1 && ' to each'}.</>}
+            </p>
+            {modelsToApply.length > 1 && (
+              <p style={{ margin: 0, fontSize: 12, color: 'var(--text-muted)' }}>
+                {modelsToApply.map((m) => m.model).join(', ')}
+              </p>
+            )}
+            {applyPrompt.choosing ? (
+              <>
+                <SelectAllControl
+                  noun="operation" total={operations.length} selected={pickedToApply.length}
+                  onSetAll={(select) => setApplyPrompt({ choosing: true, picked: select ? new Set(operations.map((o) => o.id)) : new Set() })}
+                  style={{ paddingBottom: 8, borderBottom: '1px solid var(--border)' }}
+                />
+                <div className="checkbox-list" style={{ maxHeight: 'none' }}>
+                  {operations.map((op) => (
+                    <label key={op.id} className="checkbox-row" style={{ cursor: 'pointer' }}>
+                      <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                        <input
+                          type="checkbox" checked={applyPrompt.picked.has(op.id)} disabled={applying}
+                          onChange={() => {
+                            const picked = new Set(applyPrompt.picked)
+                            if (picked.has(op.id)) picked.delete(op.id)
+                            else picked.add(op.id)
+                            setApplyPrompt({ choosing: true, picked })
+                          }}
+                        />
+                        <span style={{ minWidth: 0 }}>{op.name}</span>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+                <p style={{ margin: 0, fontSize: 12, color: 'var(--text-muted)' }}>
+                  Only the ticked operations will apply. The rest stay off {modelsToApply.length === 1 ? 'this model' : 'these models'} and
+                  will not show as gaps.
+                </p>
+              </>
+            ) : (
+              <p style={{ margin: 0, fontSize: 12, color: 'var(--text-muted)' }}>
+                Linking says the work is required for {modelsToApply.length === 1 ? 'this model' : 'these models'} — every
+                operation without a recorded time then shows as a gap, which is the point. It records
+                nothing about time. Choose which apply if this job does different work on {modelsToApply.length === 1 ? 'this model' : 'these models'}.
+              </p>
+            )}
+          </div>
+        </Modal>
+      )}
+
+      {/* ── A time against an operation that doesn't apply ─────────────────────────────────
+          Ticking for time entry never links anything. A time can only be recorded against an
+          operation the model is recorded as doing, so the pairs are named here and the user
+          chooses — linking is its own, stated act, never a side effect of saving. */}
+      {unlinkedConfirm && (
+        <Modal
+          title="Some of these operations don’t apply"
+          onClose={() => setUnlinkedConfirm(false)}
+          maxWidth={540}
+          footer={(
+            <>
+              <button type="button" className="btn-ghost" onClick={() => setUnlinkedConfirm(false)}>Cancel</button>
+              <button
+                type="button" className="btn-ghost"
+                title="Records each time only against the models its operation already applies to. Nothing is linked."
+                onClick={() => save(false)}
+              >
+                Save without them
+              </button>
+              <button type="button" className="btn-primary" onClick={() => save(true)}>
+                Link {plural(unlinkedTimed.reduce((n, u) => n + u.models.length, 0), 'pair')} and save
+              </button>
+            </>
+          )}
+        >
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, fontSize: 13, color: 'var(--text-mid)', lineHeight: 1.6 }}>
+            <p style={{ margin: 0 }}>
+              You entered a time for {plural(unlinkedTimed.length, 'operation')} that{' '}
+              {unlinkedTimed.length === 1 ? 'doesn’t' : 'don’t'} apply to every selected model. A time can
+              only be recorded where the operation applies.
+            </p>
+            <ul style={{ margin: 0, paddingLeft: 18, maxHeight: 220, overflowY: 'auto' }}>
+              {unlinkedTimed.map((u) => (
+                <li key={u.operation.id}>
+                  <strong style={{ color: 'var(--text)' }}>{u.operation.name}</strong> — doesn’t apply to{' '}
+                  {u.models.length <= 3 ? u.models.map((m) => m.model).join(', ') : plural(u.models.length, 'model')}
+                </li>
+              ))}
+            </ul>
+            <p style={{ margin: 0, fontSize: 12, color: 'var(--text-muted)' }}>
+              <strong>Link and save</strong> adds those operations to those models, then records the times.{' '}
+              <strong>Save without them</strong> links nothing and leaves those times off those models.
+            </p>
+          </div>
+        </Modal>
+      )}
+    </>
   )
 }

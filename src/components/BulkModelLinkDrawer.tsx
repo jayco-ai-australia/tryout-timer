@@ -1,5 +1,6 @@
 'use client'
 
+import SelectAllControl from '@/components/SelectAllControl'
 import { useEffect, useMemo, useState } from 'react'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import ConfirmDialog from '@/components/ConfirmDialog'
@@ -343,17 +344,13 @@ export default function BulkModelLinkDrawer({
 
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 8 }}>
           <div style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)' }}>
-            Models — {modelCount} selected
+            Models
           </div>
-          {modelCount > 0 && (
-            <button
-              type="button"
-              onClick={() => { setPickedIds(new Set()); setResult(null) }}
-              style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-mid)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'inherit' }}
-            >
-              Clear
-            </button>
-          )}
+          <SelectAllControl
+            noun="model" total={products.length}
+            selected={products.filter((p) => pickedIds.has(p.id)).length}
+            onSetAll={(select) => { setPickedIds(select ? new Set(products.map((p) => p.id)) : new Set()); setResult(null) }}
+          />
         </div>
 
         {loading ? (
@@ -395,6 +392,9 @@ export default function BulkModelLinkDrawer({
           type="button"
           className="btn-primary"
           disabled={applying || modelCount === 0 || opCount === 0}
+          title={opCount === 0 ? 'There are no operations to link'
+            : modelCount === 0 ? 'Tick at least one model first'
+              : undefined}
           onClick={() => setConfirming(true)}
         >
           {applying ? 'Applying…' : effectiveMode === 'add' ? `Link to ${plural(opCount, 'operation')}` : `Replace on ${plural(opCount, 'operation')}`}

@@ -1,10 +1,11 @@
 'use client'
 
+import SelectAllControl from '@/components/SelectAllControl'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import Link from 'next/link'
 import ConfirmDialog from '@/components/ConfirmDialog'
 import { ModelSeriesPicker } from '@/components/ModelLinker'
-import { addOperationTimeNote, copiedNoteFor, recordOperationTime } from '@/lib/operationTimes'
+import { addOperationTimeNote, copiedNoteFor, recordOperationTime, selectCountedTimes } from '@/lib/operationTimes'
 import { buildReportHref } from '@/lib/reports'
 import { linkOperationsToModels, READ_CHUNK } from '@/lib/modelOperations'
 // Every read in this file goes through these. The three that did not were the last unpaged reads
@@ -164,9 +165,9 @@ export default function CopyToModelsPanel({
   }
 
   const [targetIds, setTargetIds] = useState<Set<string>>(new Set())
-  // Every job selected by default — the common case is "this model is that model", and
-  // deselecting the few that differ is less work than ticking the many that don't.
-  const [jobIds, setJobIds] = useState<Set<string>>(() => new Set(jobs.map((j) => j.jobId)))
+  // Opens with nothing selected, like every other picker — the select-all above the list is the
+  // one click for "this model is that model".
+  const [jobIds, setJobIds] = useState<Set<string>>(new Set())
 
   const [runs, setRuns] = useState<SourceRun[] | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -193,6 +194,13 @@ export default function CopyToModelsPanel({
   // write three times onto each target, each superseding the last, leaving the target's figure
   // set by whichever historical row happened to be written final. Copying history forward as
   // though it were current is exactly the error this filter prevents.
+  //
+  // HIDDEN records are excluded for the same reason, and more so: a copy is written as an ordinary
+  // (not hidden) record, so copying a hidden one would launder a figure nobody trusts back into
+  // every target's total. This read does not go through currentForOperation (it needs each run's
+  // operator, not just the figure), so it has to drop them itself. If the source's current record
+  // for an operation is hidden, that operation has no figure and nothing is copied for it —
+  // exactly what currentForOperation says about the same pair.
   useEffect(() => {
     let cancelled = false
     async function load() {
@@ -217,9 +225,15 @@ export default function CopyToModelsPanel({
         // `superseded_by is null` only narrows it further. See lib/chunkedIn on the distinction.
         const rows = (await selectIn<{ operation_id: string; total_minutes: number | null; operator_id: string | null }>(
           timeIds,
-          (chunk) => supabase
-            .from('operation_times').select('operation_id, total_minutes, operator_id')
-            .in('id', chunk).is('superseded_by', null),
+          // Only records that count (onlyCountedTimes): a retired or hidden figure is not one to
+          // copy onto another model.
+          // selectCountedTimes carries the operation/job join, so a figure under a retired
+          // operation or job is not offered for copying either.
+          (chunk) => selectCountedTimes(supabase, 'operation_id, total_minutes, operator_id')
+            .in('id', chunk).is('superseded_by', null) as unknown as PromiseLike<{
+              data: { operation_id: string; total_minutes: number | null; operator_id: string | null }[] | null
+              error: { message: string } | null
+            }>,
         )).map((r) => ({
           operationId: r.operation_id, totalMinutes: r.total_minutes, operatorId: r.operator_id,
         } satisfies SourceRun))
@@ -306,7 +320,8 @@ export default function CopyToModelsPanel({
       const timeIds = [...new Set(linkRows.map((l) => l.operation_time_id))]
       // NOT filtered to the current record: this is the "already timed" warning, and a target
       // whose only records are archived has still been timed. Same existence question coverage
-      // asks — see lib/coverage.ts.
+      // asks — see lib/coverage.ts. Hidden records are counted here too: they exist, the copy
+      // will supersede them, and the warning is about what is already there.
       //
       // Identity lookup by primary key, so selectIn is complete — see the source read above.
       const timeRows = await selectIn<{ id: string; operation_id: string }>(
@@ -480,7 +495,6 @@ export default function CopyToModelsPanel({
     }
   }
 
-  const allJobsSelected = jobs.length > 0 && jobIds.size === jobs.length
   const loadingRuns = runs === null
 
   return (
@@ -656,14 +670,11 @@ export default function CopyToModelsPanel({
           {/* ── Jobs ───────────────────────────────────────────────────────────────── */}
           <div>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
-              <span style={SECTION_LABEL}>Jobs to copy ({selectedJobs.length} of {jobs.length})</span>
-              <button
-                type="button"
-                className="finder-row-action"
-                onClick={() => setJobIds(allJobsSelected ? new Set() : new Set(jobs.map((j) => j.jobId)))}
-              >
-                {allJobsSelected ? 'Select none' : 'Select all'}
-              </button>
+              <span style={SECTION_LABEL}>Jobs to copy</span>
+              <SelectAllControl
+                noun="job" total={jobs.length} selected={selectedJobs.length}
+                onSetAll={(select) => setJobIds(select ? new Set(jobs.map((j) => j.jobId)) : new Set())}
+              />
             </div>
             {jobs.length === 0 ? (
               <p style={{ fontSize: 13, color: 'var(--text-muted)' }}>
@@ -738,6 +749,9 @@ export default function CopyToModelsPanel({
             type="button"
             className="btn-primary"
             disabled={!canCopy || loadingRuns || checking}
+            title={targets.length === 0 ? 'Tick at least one target model first'
+              : selectedJobs.length === 0 ? 'Tick at least one job to copy first'
+                : undefined}
             onClick={openConfirm}
           >
             {checking ? 'Checking…' : running ? 'Copying…' : `Copy to ${plural(targets.length, 'model')}`}
