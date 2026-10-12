@@ -161,10 +161,10 @@ export interface OperationTime {
   completed_at: string | null
   total_minutes: number | null
   is_imported: boolean
-  /** NOT an "admin hid this" flag despite the name — it marks a superseded import batch, and
-   * most rows in prod are false. Reads must not filter on it; see the is_active note at the top
-   * of lib/operationTimes.ts. */
-  is_active: boolean
+  /** false = retired or superseded: kept as history, counted in NO labour figure and NO coverage
+   * number. NULLABLE — null and true are both live, so the test is always `!== false`, never
+   * `=== true`. The one definition is lib/operationTimes' countsTowardLabour. */
+  is_active: boolean | null
   /**
    * THE labour-content pointer. null = this is the CURRENT record for its operation+model, and
    * there is exactly one. Non-null = archived: this run was replaced by the record with that id,
@@ -176,6 +176,14 @@ export interface OperationTime {
    * own, and nothing but that module writes it.
    */
   superseded_by: string | null
+  /**
+   * The "not counted at all" flag — the one is_active was mistaken for. A hidden record stays in
+   * the table as history (history views list it, marked) but contributes to NO labour figure and
+   * NO coverage number: lib/operationTimes' pickCurrent and lib/coverage's computeCoverageCombos
+   * both drop it, so no screen has to remember to. Independent of superseded_by — a record can be
+   * archived, hidden, both or neither. Set in the database; the app has no control for it yet.
+   */
+  is_hidden: boolean
   team_id: string | null
   production_line_id: string | null
   created_at: string
@@ -197,8 +205,8 @@ export interface OperationTimeNote {
 
 /** Fully joined operation_time record, as used on /records and /admin. */
 export interface OperationTimeWithRelations extends OperationTime {
-  operations: (Pick<Operation, 'id' | 'name' | 'job_id' | 'primary_operator_id' | 'secondary_operator_id'> & {
-    jobs?: (Pick<Job, 'id' | 'name' | 'team_id' | 'production_line_id'> & {
+  operations: (Pick<Operation, 'id' | 'name' | 'job_id' | 'primary_operator_id' | 'secondary_operator_id' | 'is_active'> & {
+    jobs?: (Pick<Job, 'id' | 'name' | 'team_id' | 'production_line_id' | 'is_active'> & {
       teams?: Pick<Team, 'id' | 'name'> | null
       production_lines?: Pick<ProductionLine, 'id' | 'name'> | null
     }) | null

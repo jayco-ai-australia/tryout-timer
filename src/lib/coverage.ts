@@ -13,17 +13,23 @@
  * model_operations, to any operation whose job_id = J — regardless of who (if anyone) is
  * assigned to that operation. A model m in requiredModels(J) is "covered" if there exists an
  * operation_time, linked to m via operation_time_models, whose own operation also belongs to
- * job J.
+ * job J. A retired or hidden operation_time (is_active = false, or is_hidden = true) covers
+ * nothing — lib/operationTimes' countsTowardLabour drops it here, the one coverage definition,
+ * so no caller has to filter it.
  *
  * Everything here works off a flat list of (job, model) "combos" — see computeCoverageCombos
  * — so the three rollups (per-job, per-team, per-series) are just different groupings of the
  * same underlying set, never three separate calculations.
  */
 
+import { countsTowardLabour, operationProductKey, type TimeExclusionFlags } from './operationTimes'
+
 export interface CoverageJobInput { id: string; name: string; team_id: string | null }
 export interface CoverageOperationInput { id: string; job_id: string }
 export interface CoverageModelOperationInput { operation_id: string; product_id: string }
-export interface CoverageOperationTimeInput { id: string; operation_id: string }
+/** is_active and is_hidden are required so a caller cannot forget to select them and silently
+ * count retired or hidden records as coverage — the same reasoning as superseded_by on lib/operationTimes' TimeRow. */
+export interface CoverageOperationTimeInput extends TimeExclusionFlags { id: string; operation_id: string }
 export interface CoverageOperationTimeModelInput { operation_time_id: string; product_id: string }
 export interface CoverageProductInput { id: string; product_series: string | null }
 
@@ -100,6 +106,7 @@ export function computeCoverageCombos(input: {
 
   const jobIdByTimeId = new Map(
     operationTimes
+      .filter(countsTowardLabour)
       .map((t) => [t.id, jobIdByOperationId.get(t.operation_id)] as const)
       .filter((pair): pair is [string, string] => !!pair[1])
   )
@@ -212,4 +219,73 @@ export function seriesCoverageFromCombos(combos: CoverageCombo[], products: Cove
     coveredCount: entry.covered,
     coveragePct: entry.required > 0 ? (entry.covered / entry.required) * 100 : null,
   }))
+}
+
+/**
+ * Per-operation coverage: of the models linked to THIS operation via model_operations, how many
+ * have at least one recorded operation_time. Deliberately simpler than computeCoverageCombos, which
+ * rolls the same three junctions up to (job × model) combos — here the unit is one operation, so
+ * a job's two operations covering different halves of the same model set each report their own
+ * gap instead of cancelling each other out.
+ *
+ * "Timed" follows computeCoverageCombos' definition — the *existence* of an operation_time linked to
+ * the model via operation_time_models — not whether that time has a total_minutes value, so an
+ * in-progress capture still counts as collected. Coverage is deliberately unmoved by the
+ * current-record rule: a superseded time is still a time that was collected, so a pair with
+ * nothing but archived records still counts as timed here. (The FIGURES shown in pane 4 come
+ * from the shared currentForOperation, which takes the current record and skips null minutes.)
+ *
+ * A HIDDEN record does not make a pair timed — same rule as computeCoverageCombos.
+ *
+ * Used by /setup's operation-row badges and its collected-times pane. It lived in SetupClient
+ * until the hidden flag arrived; moved here so it is filtered with the rest of coverage.
+ */
+export interface OperationCoverage { timed: number; total: number }
+
+/**
+ * The (operation, product) pairs that count as timed, keyed by operationProductKey — the
+ * operation×model unit, as opposed to computeCoverageCombos' job×model one. Existence of a
+ * linked, non-hidden time; the current-record rule plays no part (see above).
+ *
+ * The one place this set is built: computeOperationCoverage below and /dashboard's operation-
+ * level coverage line both ask it, so a hidden record drops out of both here.
+ */
+export function timedOperationProductKeys(
+  operationTimes: CoverageOperationTimeInput[],
+  operationTimeModels: CoverageOperationTimeModelInput[]
+): Set<string> {
+  const opByTimeId = new Map(operationTimes.filter(countsTowardLabour).map((t) => [t.id, t.operation_id]))
+  const timedPairs = new Set<string>()
+  for (const tm of operationTimeModels) {
+    const opId = opByTimeId.get(tm.operation_time_id)
+    if (opId) timedPairs.add(operationProductKey(opId, tm.product_id))
+  }
+  return timedPairs
+}
+
+export function computeOperationCoverage(input: {
+  operationIds: string[]
+  modelOperations: { operation_id: string; product_id: string }[]
+  operationTimes: CoverageOperationTimeInput[]
+  operationTimeModels: { operation_time_id: string; product_id: string }[]
+}): Record<string, OperationCoverage> {
+  const { operationIds, modelOperations, operationTimes, operationTimeModels } = input
+
+  const linkedByOp = new Map<string, Set<string>>()
+  for (const mo of modelOperations) {
+    let set = linkedByOp.get(mo.operation_id)
+    if (!set) { set = new Set(); linkedByOp.set(mo.operation_id, set) }
+    set.add(mo.product_id)
+  }
+
+  const timedPairs = timedOperationProductKeys(operationTimes, operationTimeModels)
+
+  const result: Record<string, OperationCoverage> = {}
+  for (const opId of operationIds) {
+    const linked = linkedByOp.get(opId)
+    let timed = 0
+    if (linked) for (const productId of linked) if (timedPairs.has(operationProductKey(opId, productId))) timed += 1
+    result[opId] = { timed, total: linked?.size ?? 0 }
+  }
+  return result
 }

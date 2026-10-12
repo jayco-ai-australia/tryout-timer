@@ -8,6 +8,7 @@ import {
 } from '@/lib/collectors'
 import { COLLECTION_TIMEFRAMES, periodRangeLabel, type CollectionTimeframe } from '@/lib/periods'
 import { fmtDateTime, fmtHours, fmtMinutes, plural } from '@/lib/format'
+import { TimeExclusionBadges } from '@/components/HiddenTimeBadge'
 
 /**
  * Who's collecting — /dashboard's per-person view of the same operation_times the "Times
@@ -227,7 +228,8 @@ function RowGroup({
           className="right mono"
           title={
             `${fmtHours(row.totalMinutes)} h` +
-            (row.untimed > 0 ? ` · ${plural(row.untimed, 'time')} have no minutes recorded and are not in this total` : '')
+            (row.untimed > 0 ? ` · ${plural(row.untimed, 'time')} have no minutes recorded and are not in this total` : '') +
+            (row.hidden > 0 ? ` · ${plural(row.hidden, 'time')} retired or hidden — collected, not counted in this total` : '')
           }
         >
           {fmtMinutes(row.totalMinutes)}m
@@ -279,9 +281,10 @@ function RowGroup({
                           </div>
                         </div>
                         <div style={{ textAlign: 'right', whiteSpace: 'nowrap', flexShrink: 0 }}>
-                          <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)', fontFamily: 'ui-monospace, "Cascadia Code", monospace' }}>
+                          <div style={{ fontSize: 13, fontWeight: 700, color: d.hidden || d.retired ? 'var(--text-muted)' : 'var(--text)', fontFamily: 'ui-monospace, "Cascadia Code", monospace', textDecoration: d.hidden || d.retired ? 'line-through' : undefined }}>
                             {d.minutes != null ? `${fmtMinutes(d.minutes)}m` : '—'}
                           </div>
+                          {(d.hidden || d.retired) && <div style={{ marginTop: 3 }}><TimeExclusionBadges hidden={d.hidden} retired={d.retired} /></div>}
                           <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
                             {fmtDateTime(d.collectedAt)}
                           </div>

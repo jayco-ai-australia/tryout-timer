@@ -1,5 +1,6 @@
 'use client'
 
+import { type TimeParentFlags, TIME_FLAG_COLUMNS, isRetiredTime } from '@/lib/operationTimes'
 import { useEffect, useMemo, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { selectIn } from '@/lib/chunkedIn'
@@ -13,6 +14,7 @@ import { linkOperationsToModels, unlinkOperationsFromModels } from '@/lib/modelO
 import { fmtDate, fmtMinutes } from '@/lib/format'
 import { modelsForLine } from '@/lib/lines'
 import type { OperationTimeNote, Product } from '@/lib/types'
+import { TimeExclusionBadges } from '@/components/HiddenTimeBadge'
 
 /**
  * The series-grouped "which models does this operation apply to" UI — shared by /model-total's
@@ -62,6 +64,10 @@ interface TimeDetailRow {
   collectedByName: string | null
   /** null = the current record for this model; set = archived behind that one. */
   superseded_by: string | null
+  /** Listed and marked; not part of the figure (currentForOperation drops it). */
+  is_hidden: boolean
+  /** is_active = false. Listed and marked; not part of the figure either. */
+  retired: boolean
 }
 
 /**
@@ -356,7 +362,7 @@ export default function ModelLinker({ operationId, operationName, productionLine
     const [
       { data: prodRows, error: prodError },
       { data: modelOps, error: modelOpsError },
-      { data: times, error: timesError },
+      { data: timeData, error: timesError },
     ] = await Promise.all([
       // lib/lines, not a products-by-line query: a pre-assembly line owns no products and
       // inherits the models of the lines it feeds. Wrapped back into the { data, error } shape
@@ -379,7 +385,7 @@ export default function ModelLinker({ operationId, operationName, productionLine
       // the shared helper and each record labelled with what it is.
       supabase
         .from('operation_times')
-        .select('id, total_minutes, created_at, collected_by, superseded_by')
+        .select(`id, total_minutes, created_at, collected_by, superseded_by, ${TIME_FLAG_COLUMNS}`)
         .eq('operation_id', operationId)
         .order('created_at', { ascending: false }),
     ])
@@ -387,7 +393,12 @@ export default function ModelLinker({ operationId, operationName, productionLine
     if (modelOpsError) loadErrors.push(modelOpsError.message)
     if (timesError) loadErrors.push(timesError.message)
 
-    const timeIds = (times ?? []).map((t) => t.id)
+    // The row shape is stated here, not inferred — see lib/operationTimes' TIME_PARENT_JOIN.
+    const times = (timeData ?? []) as unknown as {
+      id: string; total_minutes: number | null; created_at: string; collected_by: string | null
+      superseded_by: string | null; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null
+    }[]
+    const timeIds = times.map((t) => t.id)
     const [timeModelsResult, notesResult] = await Promise.all([
       // Chunked (lib/chunkedIn): timeIds is every recorded run on this operation, which grows
       // with history — one run per model per re-measure. Feeds currentForOperation and the link
@@ -432,9 +443,9 @@ export default function ModelLinker({ operationId, operationName, productionLine
     // Re-shape the (operation_id, times) rows the shared lookup expects, so this stays on the
     // exact same rule as every other screen — then remap its "operationId:productId" keys down
     // to plain productId, since this component is always scoped to one operation.
-    const rawTimes = (times ?? []).map((t) => ({
+    const rawTimes = times.map((t) => ({
       id: t.id, operation_id: operationId, total_minutes: t.total_minutes,
-      superseded_by: t.superseded_by, created_at: t.created_at,
+      superseded_by: t.superseded_by, is_active: t.is_active, is_hidden: t.is_hidden, operations: t.operations, created_at: t.created_at,
     }))
     const pairStats = currentForOperation(rawTimes, timeModels)
     const nextStats: Record<string, OperationTimeStat> = {}
@@ -452,12 +463,14 @@ export default function ModelLinker({ operationId, operationName, productionLine
     setProducts(prodRows ?? [])
     setLinkedProductIds(new Set((modelOps ?? []).map((r) => r.product_id)))
     setStats(nextStats)
-    setTimeDetails((times ?? []).map((t) => ({
+    setTimeDetails(times.map((t) => ({
       id: t.id,
       total_minutes: t.total_minutes,
       created_at: t.created_at,
       collectedByName: t.collected_by ? nameById.get(t.collected_by) ?? null : null,
       superseded_by: t.superseded_by,
+      is_hidden: t.is_hidden,
+      retired: isRetiredTime(t),
     })))
     setTimeModelLinks(timeModels)
     setNotesByTime(nextNotesByTime)
@@ -563,7 +576,9 @@ export default function ModelLinker({ operationId, operationName, productionLine
 
   /** Products with ANY recorded time for this operation — the unlink guard's question, and
    * lib/coverage.ts's definition of timed. Existence only: a pair whose records are all
-   * superseded has still been timed, and unlinking it would orphan that history. */
+   * superseded has still been timed, and unlinking it would orphan that history. The same goes
+   * for HIDDEN records, deliberately: hidden means "not counted", not "not there" — the run and
+   * its link still exist, so unlinking still orphans it and still needs the confirm. */
   const timedProductIds = useMemo(
     () => new Set(timeModelLinks.map((tm) => tm.product_id)),
     [timeModelLinks]
@@ -644,12 +659,15 @@ export default function ModelLinker({ operationId, operationName, productionLine
                   style={{ display: 'flex', gap: 12, padding: '8px 10px', border: '1px solid var(--border)', borderRadius: 8, background: 'var(--bg)' }}
                 >
                   <div style={{ width: 130, flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 2 }}>
-                    <span style={{ fontSize: 13, fontWeight: 700, color: record.superseded_by ? 'var(--text-muted)' : 'var(--text)' }}>{fmtMinutes(record.total_minutes)}m</span>
+                    <span style={{ fontSize: 13, fontWeight: 700, color: record.superseded_by || record.is_hidden || record.retired ? 'var(--text-muted)' : 'var(--text)', textDecoration: record.is_hidden || record.retired ? 'line-through' : undefined }}>{fmtMinutes(record.total_minutes)}m</span>
                     {/* The figure above this list is ONE of these records, not their average —
                         so which one it is has to be on the row. */}
-                    <span className={'badge ' + (record.superseded_by ? 'badge-grey' : 'badge-green')} style={{ alignSelf: 'flex-start' }}>
-                      {record.superseded_by ? 'archived' : 'current'}
-                    </span>
+                    {(record.superseded_by || (!record.is_hidden && !record.retired)) && (
+                      <span className={'badge ' + (record.superseded_by ? 'badge-grey' : 'badge-green')} style={{ alignSelf: 'flex-start' }}>
+                        {record.superseded_by ? 'archived' : 'current'}
+                      </span>
+                    )}
+                    <TimeExclusionBadges hidden={record.is_hidden} retired={record.retired} />
                     <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{fmtDate(record.created_at)}</span>
                     {record.collectedByName && (
                       <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>by {record.collectedByName}</span>

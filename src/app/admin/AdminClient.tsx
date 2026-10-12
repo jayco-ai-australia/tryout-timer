@@ -3,6 +3,7 @@
 import { useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import ConfirmDialog from '@/components/ConfirmDialog'
+import { TimeExclusionBadges } from '@/components/HiddenTimeBadge'
 import { fmtDate, fmtMinutes } from '@/lib/format'
 import { deleteOperationTime } from '@/lib/operationTimes'
 import type { ChangeRequestStatus, OperatorChangeRequest, Profile, OperationTimeWithRelations, UserRole } from '@/lib/types'
@@ -23,6 +24,13 @@ interface Props {
 }
 
 type Tab = 'users' | 'records' | 'requests'
+
+/** Retired as lib/operationTimes' isRetiredTime means it: the record itself, or the operation
+ * or job above it. Spelled against this page's own joined row, whose parent flags are optional
+ * on the shared relation type. */
+function retiredRecord(r: OperationTimeWithRelations): boolean {
+  return r.is_active === false || r.operations?.is_active === false || r.operations?.jobs?.is_active === false
+}
 
 export default function AdminClient({ profiles: initialProfiles, records: initialRecords, requests: initialRequests }: Props) {
   const supabase = createClient()
@@ -143,7 +151,10 @@ export default function AdminClient({ profiles: initialProfiles, records: initia
                     <td className="primary">{r.operations?.name ?? '—'}</td>
                     <td>{r.operators?.full_name ?? '—'}</td>
                     <td className="mono">{r.chassis?.chassisnumber ?? '—'}</td>
-                    <td className="blue">{fmtMinutes(r.total_minutes)}</td>
+                    <td className={r.is_hidden || retiredRecord(r) ? undefined : 'blue'} style={r.is_hidden || retiredRecord(r) ? { color: 'var(--text-muted)' } : undefined}>
+                      {fmtMinutes(r.total_minutes)}
+                      {(r.is_hidden || retiredRecord(r)) && <>{' '}<TimeExclusionBadges hidden={r.is_hidden} retired={retiredRecord(r)} /></>}
+                    </td>
                     <td>{fmtDate(r.completed_at ?? r.created_at)}</td>
                     <td className="right">
                       <button onClick={() => setConfirm({ type: 'record', id: r.id })} style={{ fontSize: 12, fontWeight: 600, color: 'var(--red)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>

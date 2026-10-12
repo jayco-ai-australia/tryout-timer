@@ -1,5 +1,7 @@
 'use client'
 
+import type { RangeableQuery } from '@/lib/supabaseRead'
+import { type TimeParentFlags } from '@/lib/operationTimes'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { createClient } from '@/lib/supabase/client'
@@ -8,9 +10,11 @@ import {
 } from '@/lib/modelOperations'
 import { fetchAllChunked } from '@/lib/supabaseRead'
 import { modelsForLine } from '@/lib/lines'
-import { modelTotalMinutes, operationProductKey } from '@/lib/operationTimes'
 import {
-  aggregateCoverage, computeCoverageCombos, modelCoverageFromCombos, type ModelCoverage,
+  TIME_FLAG_COLUMNS, countsTowardLabour, modelTotalMinutes, onlyCountedTimes, operationProductKey, selectCountedTimes,
+} from '@/lib/operationTimes'
+import {
+  aggregateCoverage, computeCoverageCombos, modelCoverageFromCombos, timedOperationProductKeys, type ModelCoverage,
 } from '@/lib/coverage'
 import { fetchFutureBuilds, fmtScheduleDate, todayIsoDate } from '@/lib/schedule'
 import { periodBounds, periodRangeLabel } from '@/lib/periods'
@@ -295,13 +299,17 @@ export default function DashboardClient({ role, lines, initialLineId }: Props) {
       // fetched only to be discarded by currentForOperation. superseded_by is still selected: the
       // helper decides which row is the figure, and handing it rows without the column would have
       // it guess.
+      //
+      // Retired and hidden records are filtered AT THE QUERY (onlyCountedTimes): this screen only
+      // aggregates. The flags are still selected — the helpers' types require them, and
+      // modelTotalMinutes and computeCoverageCombos apply the same rule again.
       const timeIds = [...new Set(operationTimeModels.map((tm) => tm.operation_time_id))]
-      const operationTimes = await fetchAllChunked<{ id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null }>(
+      const operationTimes = await fetchAllChunked<{ id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null }>(
         timeIds, READ_CHUNK,
-        (chunk) => supabase
-          .from('operation_times').select('id, operation_id, total_minutes, superseded_by')
-          .in('id', chunk).is('superseded_by', null)
-          .order('id'),
+        (chunk) => onlyCountedTimes(supabase
+          .from('operation_times').select(`id, operation_id, total_minutes, superseded_by, ${TIME_FLAG_COLUMNS}`)
+          .in('id', chunk).is('superseded_by', null))
+          .order('id') as unknown as RangeableQuery<{ id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null }>,
         { table: 'operation_times' }
       )
 
@@ -355,6 +363,7 @@ export default function DashboardClient({ role, lines, initialLineId }: Props) {
         const jobIdByOperationId = new Map(operations.map((o) => [o.id, o.job_id]))
         const jobIdByTimeId = new Map<string, string>()
         for (const t of operationTimes) {
+          if (!countsTowardLabour(t)) continue // mirrors computeCoverageCombos, or `matched` disagrees with pct
           const j = jobIdByOperationId.get(t.operation_id)
           if (j) jobIdByTimeId.set(t.id, j)
         }
@@ -392,15 +401,10 @@ export default function DashboardClient({ role, lines, initialLineId }: Props) {
       }
       // ── end TEMPORARY diagnostics ───────────────────────────────────────────────────
 
-      // Operation × model, the demoted detail line. Counted here rather than in coverage.ts
-      // because it is a different unit — one per model_operations row — and coverage.ts owns
-      // exactly one definition of coverage on purpose.
-      const operationByTimeId = new Map(operationTimes.map((t) => [t.id, t.operation_id]))
-      const timedPairs = new Set<string>()
-      for (const tm of operationTimeModels) {
-        const opId = operationByTimeId.get(tm.operation_time_id)
-        if (opId) timedPairs.add(operationProductKey(opId, tm.product_id))
-      }
+      // Operation × model, the demoted detail line — one per model_operations row. The timed set
+      // comes from lib/coverage (it used to be built inline here), so hidden records drop out of
+      // it exactly as they do from the job×model combos above.
+      const timedPairs = timedOperationProductKeys(operationTimes, operationTimeModels)
       const allocatedOperations = modelOperations.length
       const timedOperations = modelOperations.filter(
         (mo) => timedPairs.has(operationProductKey(mo.operation_id, mo.product_id))
@@ -473,8 +477,12 @@ export default function DashboardClient({ role, lines, initialLineId }: Props) {
       // were recorded in a window — not labour content. A run that has since been superseded was
       // still collected that day, and hiding it would make the week's work shrink retroactively
       // every time somebody re-measured something.
+      //
+      // Retired and hidden records ARE left out (onlyCountedTimes): these are headline tiles, and
+      // a record excluded from every labour figure is not counted on one either.
       async function countTimes(fromDate: Date, toDate?: Date): Promise<number> {
-        let q = supabase.from('operation_times').select('id', { count: 'exact', head: true })
+        // selectCountedTimes carries the operation/job join the parent conditions filter on.
+        let q = selectCountedTimes(supabase, 'id', { count: 'exact', head: true })
           .gte('created_at', fromDate.toISOString())
         if (toDate) q = q.lt('created_at', toDate.toISOString())
         if (lineId) q = q.eq('production_line_id', lineId)

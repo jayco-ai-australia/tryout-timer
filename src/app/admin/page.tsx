@@ -17,11 +17,12 @@ export default async function AdminPage() {
 
   const [{ data: profiles }, { data: records }, { data: requests }] = await Promise.all([
     supabase.from('profiles').select('id, full_name, role, created_at').order('created_at', { ascending: false }),
-    // No is_active filter — and no screen filters on it, see lib/operationTimes.ts. This list
-    // is every recorded time, newest first.
+    // Not filtered on is_active or is_hidden: this list is every recorded time, newest first, and
+    // AdminClient marks the retired and hidden ones (see lib/operationTimes.ts) — including a
+    // record whose operation or job is retired, which is why both parents' is_active ride along.
     supabase.from('operation_times').select(`
       *,
-      operations ( id, name, job_id, jobs ( id, name ) ),
+      operations ( id, name, job_id, is_active, jobs ( id, name, is_active ) ),
       operators ( id, full_name ),
       chassis ( id, chassisnumber, product_id, products ( id, product_code, model ) ),
       collector:profiles!collected_by ( full_name )

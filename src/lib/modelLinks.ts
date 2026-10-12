@@ -1,3 +1,4 @@
+import { type TimeParentFlags, TIME_FLAG_COLUMNS, isRetiredTime } from './operationTimes'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { selectIn } from './chunkedIn'
 import { fetchAllChunked, READ_CHUNK, type RangeableQuery } from './supabaseRead'
@@ -52,6 +53,11 @@ export interface AffectedTimePreview {
   /** created_at, ISO — "date" in the confirmation. */
   createdAt: string
   minutes: number | null
+  /** Hidden (is_hidden) — listed like any other run, because it is still linked and still goes
+   * unattached; marked, because its minutes count for nothing either way. */
+  hidden: boolean
+  /** Retired (is_active = false) — listed and marked for the same reason. */
+  retired: boolean
   /** Models this run stays linked to afterwards. Empty means it becomes unattached. */
   otherModels: string[]
   /** No other model link — this run ends up in operation_times with nothing pointing at it. */
@@ -109,14 +115,17 @@ export async function previewModelUnlink(
 
   // Every run on these operations. Fans out (one operation, many runs), so chunked AND paged —
   // a truncated read here would leave a run silently attached to a model that no longer does it.
+  //
+  // Retired and hidden runs are NOT filtered out: this is the unlink guard's list, and such a run is still a
+  // run linked to this model — unlinking still detaches it, so it still needs the confirm.
   const timeRows = await fetchAllChunked<{
-    id: string; operation_id: string; total_minutes: number | null; created_at: string
+    id: string; operation_id: string; total_minutes: number | null; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null; created_at: string
   }>(
     operationIds, READ_CHUNK,
     (chunk) => supabase
-      .from('operation_times').select('id, operation_id, total_minutes, created_at')
+      .from('operation_times').select(`id, operation_id, total_minutes, ${TIME_FLAG_COLUMNS}, created_at`)
       .in('operation_id', chunk).order('id') as unknown as RangeableQuery<{
-        id: string; operation_id: string; total_minutes: number | null; created_at: string
+        id: string; operation_id: string; total_minutes: number | null; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null; created_at: string
       }>,
     { table: 'operation_times' }
   )
@@ -173,6 +182,8 @@ export async function previewModelUnlink(
       operationName: operationNameById.get(t.operation_id) ?? '—',
       createdAt: t.created_at,
       minutes: t.total_minutes,
+      hidden: t.is_hidden,
+      retired: isRetiredTime(t),
       otherModels: others,
       becomesUnattached: others.length === 0,
     }

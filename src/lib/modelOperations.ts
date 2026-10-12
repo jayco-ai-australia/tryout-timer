@@ -98,6 +98,10 @@ export async function fetchOperationIdsForModel(
  * their operation_times behind a link that no longer exists. There is no error to catch on that
  * path; a capped response is a normal 200. Every query below carries a total order over its
  * primary key, without which paging could skip a row and reproduce the same hole.
+ *
+ * HIDDEN times (is_hidden) are counted here, deliberately — unlike every coverage number. Hidden
+ * means "not counted", not "not there": the run and its link still exist, and unlinking the pair
+ * would still orphan it. Same for fetchTimedOperationIdsForModel below.
  */
 export async function fetchTimedPairs(
   supabase: SupabaseClient,

@@ -1,5 +1,5 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
-import { chunked, fetchAllChunked, fetchAllRows, logSupabaseError, READ_CHUNK } from './supabaseRead'
+import { chunked, fetchAllChunked, fetchAllRows, logSupabaseError, READ_CHUNK, type RangeableQuery } from './supabaseRead'
 import { selectIn } from './chunkedIn'
 import type { OperationTime, OperationTimeNote } from './types'
 
@@ -8,20 +8,42 @@ import type { OperationTime, OperationTimeNote } from './types'
  * (/collect, /tryouts, /dashboard, /model-total) goes through the helpers here so the labour
  * math and the insert shape can't drift between screens.
  *
- * ── is_active: do NOT filter reads on it ──────────────────────────────────────────────────
- * operation_times has an is_active column, and it is tempting to read it as "an admin hid this
- * time" and exclude it from averages, totals and coverage. Do not. In this database it does not
- * mean that.
+ * ── The two exclusion flags: is_active and is_hidden ─────────────────────────────────────────
+ * operation_times carries two flags that take a record out of every figure:
  *
- * Measured 2026-08-20: 759 of 1244 rows are is_active = false — 750 of them imported, all
- * created 6–11 Aug, i.e. an import batch that was superseded by the re-import of 10–11 Aug and
- * flagged rather than deleted. They are ordinary history and they carry most of the recorded
- * coverage: on the Caravan line, 758 of the 781 times linked to its models sit in that batch.
+ *   is_hidden  (boolean, not null)            — deliberately hidden from reporting.
+ *   is_active  (boolean, NULLABLE, default true) — false = retired or superseded.
  *
- * Filtering reads on `.eq('is_active', true)` was tried and reverted — it silently dropped 61%
- * of every average and total in the app and took /dashboard coverage from 68.0% to 0.5%, which
- * is what surfaced it. If per-time hiding is wanted, it needs a flag that means only that, or
- * the legacy batch reconciled first; until then every read here counts every row.
+ * And a record is only as live as what it hangs off: a time under a RETIRED OPERATION, or under
+ * an operation whose JOB is retired, does not count either. Retiring structure has to take its
+ * labour out of the figures, or "retire" would look like "delete" and behave like nothing.
+ *
+ * A record COUNTS when `is_active IS NOT FALSE AND is_hidden = false`, AND its operation's
+ * is_active IS NOT FALSE, AND its job's is_active IS NOT FALSE. That is one rule with one
+ * definition — countsTowardLabour below — and every labour figure and coverage number in the app
+ * is built on something that calls it: pickCurrent here, and lib/coverage's
+ * computeCoverageCombos / timedOperationProductKeys. A record stops counting because the helper
+ * drops it, not because each screen remembers to.
+ *
+ * IS NOT FALSE, never `= true`: the column is nullable, and a null is a live record. A plain
+ * `.eq('is_active', true)` silently drops every null.
+ *
+ * Two ways to apply it, and which one depends on what the read is for:
+ *   - A read that feeds a figure AND a history view (most of them — "current + N archived" needs
+ *     the rows) must NOT filter at the query. It SELECTs both flags — TimeRow and
+ *     CoverageOperationTimeInput make that compulsory — and the helpers drop what doesn't count.
+ *     History views then list the excluded records, marked (components/HiddenTimeBadge).
+ *   - A read that ONLY aggregates filters at the query, through onlyCountedTimes below — never
+ *     by spelling the two conditions out at the call site.
+ *
+ * ── History of the is_active rule ────────────────────────────────────────────────────────────
+ * Until October 2026 this module said the opposite: do NOT filter on is_active. Measured
+ * 2026-08-20, 759 of 1244 rows were is_active = false — a superseded import batch that then
+ * carried most of the recorded coverage (758 of the 781 times on the Caravan line), so filtering
+ * took /dashboard coverage from 68.0% to 0.5% and was reverted. Since then the line has been
+ * re-collected (Caravan: 645 live records against 758 retired and 882 hidden), and the retired
+ * batch is exactly the labour that must no longer appear in a total. The rule was reversed on
+ * purpose; a coverage figure that drops because of it is the honest one.
  */
 
 /**
@@ -38,7 +60,8 @@ export interface OperationTimeStat {
   minutes: number
   /** Which record that is, so a caller can open or promote against it. */
   currentId: string
-  /** How many superseded records sit behind it. Displayed as history, never averaged in. */
+  /** How many superseded records sit behind it. Displayed as history, never averaged in.
+   * Hidden records are not included — they are not part of the figure's history either. */
   archived: number
 }
 
@@ -81,6 +104,118 @@ export function jobCompleteness(timedOps: number, totalOps: number): JobComplete
 }
 
 /**
+ * The flags of a time record's PARENTS — its operation and that operation's job — exactly as
+ * PostgREST returns the join. Retiring an operation or a job has to stop the times under it
+ * counting, or retiring looks like deleting and isn't.
+ */
+export interface TimeParentFlags {
+  /** operations.is_active. null and true are live; only false is retired. */
+  is_active: boolean | null
+  /** jobs.is_active, through the operation's job_id. */
+  jobs: { is_active: boolean | null } | null
+}
+
+/**
+ * Everything that decides whether a time record counts, as every read that feeds a figure has to
+ * carry it. ALL of it REQUIRED: optional, a read that forgot to select a flag — the record's own
+ * or a parent's — would count retired or hidden work as live and nothing would say so. Required,
+ * a query that leaves one out fails the build.
+ */
+export interface TimeExclusionFlags {
+  /** Nullable in the database. null and true are both live; only false is retired. */
+  is_active: boolean | null
+  is_hidden: boolean
+  /** The parent operation and job. Select it with TIME_PARENT_JOIN. */
+  operations: TimeParentFlags | null
+}
+
+/**
+ * The join that brings the parent flags back with a time record. `!inner` at both levels, which
+ * is what lets onlyCountedTimes filter on them: PostgREST only drops a top-level row for a
+ * condition on an embedded table when that embed is an inner join.
+ */
+// Typed `string`, not as its literal: supabase-js parses a literal select at the type level and,
+// with no generated schema to consult, guesses every embed is an array — which is wrong for
+// these two many-to-one joins. As a plain string the result is left for the caller's row type
+// to state, and that row type is where TimeExclusionFlags makes the join compulsory.
+export const TIME_PARENT_JOIN: string = 'operations!inner ( is_active, jobs!inner ( is_active ) )'
+
+/** The columns a select has to name for TimeExclusionFlags — appended, not retyped. */
+export const TIME_FLAG_COLUMNS: string = `is_active, is_hidden, ${TIME_PARENT_JOIN}`
+
+/**
+ * A counted-only read of operation_times with the join ALREADY in the select — for a read that
+ * hands its rows to no helper (a head-count, a list of figures to copy), where nothing in the
+ * type system would notice the join had been left out. `columns` is what the caller wants back;
+ * the join is appended here so onlyCountedTimes always has something to filter on.
+ */
+export function selectCountedTimes(
+  supabase: SupabaseClient, columns: string, options?: { count?: 'exact'; head?: boolean }
+) {
+  return onlyCountedTimes(supabase.from('operation_times').select(`${columns}, ${TIME_PARENT_JOIN}`, options))
+}
+
+/**
+ * Parent flags for a row whose retired-ness has ALREADY been folded into its own is_active by the
+ * caller (isRetiredTime) and which no longer carries the join — a UI row model being handed back
+ * to a helper. Never a substitute for selecting the join on a database read.
+ */
+export const LIVE_PARENTS: TimeParentFlags = { is_active: true, jobs: { is_active: true } }
+
+/** The record's operation or job is retired. */
+export function hasRetiredParent(time: Pick<TimeExclusionFlags, 'operations'>): boolean {
+  return time.operations?.is_active === false || time.operations?.jobs?.is_active === false
+}
+
+/**
+ * "Retired" as a history view badges it: the record itself is retired, or its operation or job
+ * is. Either way it is kept, listed, and counted nowhere.
+ */
+export function isRetiredTime(time: Pick<TimeExclusionFlags, 'is_active' | 'operations'>): boolean {
+  return time.is_active === false || hasRetiredParent(time)
+}
+
+/**
+ * THE rule for "does this record count", and the only place it is written for rows in hand:
+ *
+ *   operation_times.is_active IS NOT FALSE AND operation_times.is_hidden = false
+ *   AND its operation's is_active IS NOT FALSE
+ *   AND its job's is_active IS NOT FALSE
+ *
+ * Every labour figure and every coverage number goes through it. A row whose parents did not
+ * come back at all does NOT count: that can only mean the join was filtered or left out, and
+ * counting it would be the silent failure this type exists to prevent. See the module note.
+ */
+export function countsTowardLabour(time: TimeExclusionFlags): boolean {
+  if (time.is_active === false || time.is_hidden) return false
+  const operation = time.operations
+  if (!operation || operation.is_active === false) return false
+  return operation.jobs != null && operation.jobs.is_active !== false
+}
+
+/**
+ * The same rule as a QUERY filter, for a read that only aggregates and has no use for the
+ * excluded rows. `not.is.false` is SQL's IS NOT FALSE: it keeps nulls, which `.eq(true)` drops.
+ *
+ * The select MUST include TIME_PARENT_JOIN (TIME_FLAG_COLUMNS does) — the parent conditions are
+ * filters on that join, and PostgREST rejects the request outright without it, which is the
+ * right failure: loud.
+ *
+ * Not for a read that also feeds a history view — those select the flags and let
+ * countsTowardLabour decide, so the excluded records can still be listed and marked.
+ */
+export function onlyCountedTimes<Q>(query: Q): Q {
+  // Typed loosely on purpose: supabase's filter builder is too deeply generic to constrain here
+  // without tripping the compiler's instantiation limit. It is mutable and returns itself.
+  interface Filterable { not(column: string, operator: string, value: unknown): Filterable; eq(column: string, value: unknown): Filterable }
+  return (query as unknown as Filterable)
+    .not('is_active', 'is', false)
+    .eq('is_hidden', false)
+    .not('operations.is_active', 'is', false)
+    .not('operations.jobs.is_active', 'is', false) as unknown as Q
+}
+
+/**
  * The minimum of an operation_times row needed to work out a labour figure.
  *
  * superseded_by is REQUIRED, deliberately and unavoidably: it is the column that says which row
@@ -88,8 +223,10 @@ export function jobCompleteness(timedOps: number, totalOps: number): JobComplete
  * answer that silently treats every archived run as current, and never hear about it — which is
  * exactly the class of drift this module exists to prevent. Required, TypeScript finds every
  * read that feeds a number.
+ *
+ * is_active and is_hidden are required for exactly the same reason — see TimeExclusionFlags.
  */
-interface TimeRow {
+export interface TimeRow extends TimeExclusionFlags {
   id: string
   operation_id: string
   total_minutes: number | null
@@ -111,8 +248,14 @@ interface TimeModelRow { operation_time_id: string; product_id: string }
  * figure is at least deterministic between renders instead of depending on row order. Where it
  * holds none, there is no figure: null, and the caller renders the pair as untimed rather than
  * quietly promoting an archived run to headline status.
+ *
+ * Hidden rows are dropped FIRST, before anything else is asked: they are neither the figure nor
+ * the history behind it. A pair whose current record is hidden therefore has no figure — its
+ * archived runs are not promoted in its place, because superseded means "replaced", and a hidden
+ * replacement does not make the run it replaced trustworthy again. The pair reads untimed.
  */
-function pickCurrent(rows: TimeRow[]): OperationTimeStat | null {
+function pickCurrent(allRows: TimeRow[]): OperationTimeStat | null {
+  const rows = allRows.filter(countsTowardLabour)
   const current = rows.filter((r) => r.superseded_by == null)
   if (current.length === 0) return null
 
@@ -177,6 +320,9 @@ export function operationProductKey(operationId: string, productId: string): str
  * out. It also works over a set already filtered to `superseded_by is null` — every row is then
  * current, and `archived` reads 0 because no history was asked for. Either input gives the same
  * `minutes`; only the history count differs, so a surface that shows the count must not filter.
+ *
+ * Hidden rows may be handed in (and should be — never filter them at the query); they are
+ * dropped by pickCurrent.
  */
 export function currentForOperation(times: TimeRow[], timeModels: TimeModelRow[]): Record<string, OperationTimeStat> {
   const timeById = new Map(times.map((t) => [t.id, t]))
@@ -321,7 +467,9 @@ export interface ModelTotalFetchResult extends ModelTotalResult {
      * model's timed operations" (e.g. the breakdown's per-job operator line) doesn't need a
      * second fetch for operations it already has. */
     operations: { id: string; job_id: string; primary_operator_id: string | null; secondary_operator_id: string | null }[]
-    operationTimes: { id: string; operation_id: string }[]
+    /** is_active and is_hidden ride along so coverage built from these rows drops retired and
+     * hidden records exactly as the total did (computeCoverageCombos requires both). */
+    operationTimes: (TimeExclusionFlags & { id: string; operation_id: string })[]
     operationTimeModels: TimeModelRow[]
     /** Hop 3's jobs, with the line each one belongs to. `jobs.production_line_id` is the source
      * of truth for which line a piece of labour sits on (operation_times carries a copy stamped
@@ -329,7 +477,9 @@ export interface ModelTotalFetchResult extends ModelTotalResult {
      * re-fetched: a caller splitting this total by line — /model-total's labour-source filter —
      * must attribute exactly the jobs this total was built from, or the parts stop summing to
      * the whole. */
-    jobs: { id: string; name: string; production_line_id: string | null }[]
+    /** is_active rides along so a caller can HIDE a retired job without losing its label —
+     * the read itself stays unfiltered (see below). */
+    jobs: { id: string; name: string; production_line_id: string | null; is_active: boolean }[]
   }
 }
 
@@ -347,8 +497,9 @@ export interface ModelTotalFetchResult extends ModelTotalResult {
  * to it via operation_time_models," full stop. Scoping the fetch by line silently dropped any
  * operation_time recorded under a job on a different line, which is exactly how a model with a
  * real, non-zero total in the database renders as 0.0m on the page. product_id is now the only
- * filter that ever touches this data — no production_line_id, is_imported, or is_active filter
- * anywhere in the chain.
+ * filter that ever touches the QUERY — no production_line_id or is_imported filter anywhere in
+ * the chain. (Retired and hidden records are read and then dropped by pickCurrent, not by the
+ * query — see the module note.)
  *
  * Logs a row count at every hop (junction → operation_times → operations/jobs) so the next
  * "total is 0 / wrong" report can be diagnosed from the browser console alone.
@@ -393,9 +544,10 @@ export async function fetchModelTotal(supabase: SupabaseClient, productId: strin
     }
   }
 
-  // Hop 2: the operation_times rows themselves — id IN (...) only. No production_line_id,
-  // is_imported, or is_active filter here or anywhere above it. See the is_active note at the
-  // top of this module: filtering it here is what took /dashboard coverage to 0.5%.
+  // Hop 2: the operation_times rows themselves — id IN (...) only. No production_line_id or
+  // is_imported filter here or anywhere above it. is_active and is_hidden are SELECTED rather
+  // than filtered: pickCurrent drops what doesn't count (see the module note), and the rows stay
+  // available to the diagnostics below.
   //
   // Deliberately NOT filtered to `superseded_by is null` either, even though only the current
   // record contributes to the total. The page shows "current + N archived" beside every figure,
@@ -411,10 +563,11 @@ export async function fetchModelTotal(supabase: SupabaseClient, productId: strin
   const times = await selectIn<TimeRow>(timeIds, async (chunk) => {
     const res = await supabase
       .from('operation_times')
-      .select('id, operation_id, total_minutes, superseded_by, created_at')
+      .select(`id, operation_id, total_minutes, superseded_by, ${TIME_FLAG_COLUMNS}, created_at`)
       .in('id', chunk)
     if (res.error) logSupabaseError('hop 2 — operation_times WHERE id IN (…)', res.error)
-    return res
+    // The row shape is stated here, not inferred — see TIME_PARENT_JOIN.
+    return res as unknown as { data: TimeRow[] | null; error: typeof res.error }
   })
   console.log(
     '[modelTotalMinutes] hop 2 — operation_times WHERE id IN (…):',
@@ -450,9 +603,11 @@ export async function fetchModelTotal(supabase: SupabaseClient, productId: strin
 
   const jobIds = [...new Set(operations.map((o) => o.job_id as string))]
   // Identity lookup by id — NOT filtered to is_active, so a retired job still labels the
-  // operations feeding this total. See the note at the top of lib/jobs.
-  const jobs = await selectIn<{ id: string; name: string; production_line_id: string | null }>(jobIds, async (chunk) => {
-    const res = await supabase.from('jobs').select('id, name, production_line_id').in('id', chunk)
+  // operations feeding this total. See the note at the top of lib/jobs. is_active is SELECTED,
+  // though: a job can be retired while its operations stay active, and /model-total has to be
+  // able to drop such a job from its list rather than show structure every other screen hides.
+  const jobs = await selectIn<{ id: string; name: string; production_line_id: string | null; is_active: boolean }>(jobIds, async (chunk) => {
+    const res = await supabase.from('jobs').select('id, name, production_line_id, is_active').in('id', chunk)
     if (res.error) logSupabaseError('hop 3 — jobs WHERE id IN (…)', res.error)
     return res
   })
@@ -479,13 +634,20 @@ export async function fetchModelTotal(supabase: SupabaseClient, productId: strin
    * to is_active, so a retired one's times land here), i.e. a genuine short-fall.
    */
   const currentMinutes = result.totalMinutes
-  const archivedMinutes = times
-    .filter((t) => t.superseded_by != null)
+  // Retired and hidden records are neither the figure nor its history; counted apart so they
+  // don't read as unaccounted-for minutes. An excluded archived record is counted here, not as
+  // archived.
+  const hiddenMinutes = times
+    .filter((t) => !countsTowardLabour(t))
     .reduce((sum, t) => sum + (t.total_minutes ?? 0), 0)
-  const unaccounted = rawSumMinutes - currentMinutes - archivedMinutes
+  const archivedMinutes = times
+    .filter((t) => countsTowardLabour(t) && t.superseded_by != null)
+    .reduce((sum, t) => sum + (t.total_minutes ?? 0), 0)
+  const unaccounted = rawSumMinutes - currentMinutes - archivedMinutes - hiddenMinutes
   console.log(
     '[modelTotalMinutes] TOTAL (current record per operation, summed):', currentMinutes,
     '— archived history not counted:', archivedMinutes,
+    '— retired/hidden records not counted:', hiddenMinutes,
     '— raw SUM(total_minutes) over every row, for comparison:', rawSumMinutes
   )
   if (Math.abs(unaccounted) > 0.005) {
@@ -514,16 +676,16 @@ export async function fetchModelTotal(supabase: SupabaseClient, productId: strin
     },
     raw: {
       operations: operations.map((o) => ({ id: o.id, job_id: o.job_id, primary_operator_id: o.primary_operator_id, secondary_operator_id: o.secondary_operator_id })),
-      operationTimes: times.map((t) => ({ id: t.id, operation_id: t.operation_id })),
+      operationTimes: times.map((t) => ({ id: t.id, operation_id: t.operation_id, is_active: t.is_active, is_hidden: t.is_hidden, operations: t.operations })),
       operationTimeModels: linkRows,
-      jobs: jobs.map((j) => ({ id: j.id, name: j.name, production_line_id: j.production_line_id })),
+      jobs: jobs.map((j) => ({ id: j.id, name: j.name, production_line_id: j.production_line_id, is_active: j.is_active })),
     },
   }
 }
 
 /** A recorded run plus the FULL set of models it counts towards. See
  * fetchOperationTimesForModel — the fan-out is the thing an editor has to see. */
-export interface OperationTimeWithModels extends OperationTime {
+export interface OperationTimeWithModels extends OperationTime, TimeExclusionFlags {
   productIds: string[]
 }
 
@@ -764,6 +926,107 @@ async function resolveTimeProvenance(
   return resolved
 }
 
+// ── Re-stamping: keeping a time's team and line in step with where its operation sits ──────
+/**
+ * operation_times carries its own team_id and production_line_id, stamped from the operation's
+ * job when the time was recorded (resolveTimeProvenance above). They are a COPY, and a copy goes
+ * stale the moment the structure above it moves: re-file a job under another team or line and
+ * its recorded labour stays banked where it used to be, on every read that trusts the stamp.
+ *
+ * Nothing crosses a production line, so in practice it is the TEAM that changes; both columns
+ * are written together so they can never disagree with where the job is filed.
+ *
+ * So every act that changes which team an operation sits under re-stamps the times
+ * beneath it, and every one of them does it through the three functions below — nothing else
+ * writes these two columns after the insert:
+ *
+ *   move a section to another team           lib/sectionManager's moveSectionAcrossTeams
+ *   move a job to another section            lib/sections' setJobSection
+ *   move an operation to another job         lib/operations' setOperationJob
+ *   merge operations (and so jobs, sections) lib/mergeOperations' mergeOperations
+ *
+ * The write is counted on the way back (`count: 'exact'`) rather than assumed. An update
+ * filtered out by RLS succeeds having changed nothing, and a time left on the old line is the
+ * exact failure this exists to prevent — so a short count throws.
+ */
+export interface TimeLocation {
+  teamId: string | null
+  productionLineId: string | null
+}
+
+/**
+ * Where a job's work is filed: its SECTION's team and line. The section owns both (see
+ * lib/sections' teamForJob); the job's own columns are the fallback for a job in no section.
+ */
+export async function resolveJobLocation(supabase: SupabaseClient, jobId: string): Promise<TimeLocation> {
+  // Identity lookup — not filtered to is_active: a retired job's times still belong somewhere.
+  const { data: job, error } = await supabase
+    .from('jobs').select('team_id, production_line_id, section_id').eq('id', jobId).single()
+  if (error || !job) throw new Error(error?.message ?? 'That job no longer exists')
+  type SectionLocation = { team_id: string | null; production_line_id: string | null }
+  let section: SectionLocation | null = null
+  if (job.section_id) {
+    const { data } = await supabase
+      .from('sections').select('team_id, production_line_id').eq('id', job.section_id).single()
+    section = (data ?? null) as SectionLocation | null
+  }
+  return {
+    teamId: section?.team_id ?? (job.team_id as string | null) ?? null,
+    productionLineId: section?.production_line_id ?? (job.production_line_id as string | null) ?? null,
+  }
+}
+
+/** Re-stamps every recorded time under these operations. Returns how many rows were written. */
+export async function restampTimesForOperations(
+  supabase: SupabaseClient, operationIds: string[], location: TimeLocation
+): Promise<number> {
+  // Nothing to say: a job in no section and on no line has no location to stamp. Leaving the
+  // old stamp is better than blanking both columns.
+  if (operationIds.length === 0 || (location.teamId === null && location.productionLineId === null)) return 0
+
+  let expected = 0
+  let updated = 0
+  for (const chunk of chunked([...new Set(operationIds)], READ_CHUNK)) {
+    const { count: before, error: countError } = await supabase
+      .from('operation_times').select('id', { count: 'exact', head: true }).in('operation_id', chunk)
+    if (countError) throw new Error(`Counting recorded times to re-stamp: ${countError.message}`)
+    if (!before) continue
+    expected += before
+    const { count, error } = await supabase
+      .from('operation_times')
+      .update({ team_id: location.teamId, production_line_id: location.productionLineId }, { count: 'exact' })
+      .in('operation_id', chunk)
+    if (error) throw new Error(`Re-stamping recorded times: ${error.message}`)
+    updated += count ?? 0
+  }
+  if (updated < expected) {
+    throw new Error(
+      `only ${updated} of ${expected} recorded time${expected === 1 ? '' : 's'} could be re-stamped with the new ` +
+      'team and line — the database declined the rest (check the update policy on operation_times)'
+    )
+  }
+  return updated
+}
+
+/** Re-stamps every time under a job with where that job is filed NOW. Call it after the move. */
+export async function restampTimesForJob(supabase: SupabaseClient, jobId: string): Promise<number> {
+  const location = await resolveJobLocation(supabase, jobId)
+  const operations = await fetchAllRows<{ id: string }>(
+    () => supabase.from('operations').select('id').eq('job_id', jobId).order('id'),
+    { table: 'operations' }
+  )
+  return restampTimesForOperations(supabase, operations.map((o) => o.id), location)
+}
+
+/** Re-stamps every time under one operation with where its job is filed NOW. */
+export async function restampTimesForOperation(supabase: SupabaseClient, operationId: string): Promise<number> {
+  const { data: operation, error } = await supabase
+    .from('operations').select('job_id').eq('id', operationId).single()
+  if (error || !operation) throw new Error(error?.message ?? 'That operation no longer exists')
+  const location = await resolveJobLocation(supabase, operation.job_id as string)
+  return restampTimesForOperations(supabase, [operationId], location)
+}
+
 /**
  * The only function anywhere that inserts into operation_times (and, via this, the only place
  * that inserts into operation_time_models). Every screen that records a time — /collect, the
@@ -845,6 +1108,9 @@ export async function recordOperationTime(
       completed_at: completedAt,
       total_minutes: totalMinutes,
       is_imported: isImported,
+      // Written explicitly, never left to the column defaults: a new record counts, and says so.
+      is_active: true,
+      is_hidden: false,
       team_id: provenance.teamId,
       production_line_id: provenance.productionLineId,
     })
@@ -1113,12 +1379,14 @@ export async function fetchOperationTimesForModel(
   operationId: string,
   productId: string
 ): Promise<OperationTimeWithModels[]> {
-  const times = await fetchAllRows<OperationTime>(
+  const times = await fetchAllRows<OperationTime & TimeExclusionFlags>(
     () => supabase
-      .from('operation_times').select('*').eq('operation_id', operationId)
+      // The parent flags ride along (TIME_PARENT_JOIN): the times drawer marks a record whose
+      // operation or job is retired, and the delete-promotion below must not promote one.
+      .from('operation_times').select(`*, ${TIME_PARENT_JOIN}`).eq('operation_id', operationId)
       // Newest first, with id breaking ties — paging is only sound over a total order, and
       // created_at alone is not one.
-      .order('created_at', { ascending: false }).order('id'),
+      .order('created_at', { ascending: false }).order('id') as unknown as RangeableQuery<OperationTime & TimeExclusionFlags>,
     { table: 'operation_times' }
   )
   if (times.length === 0) return []
@@ -1246,9 +1514,13 @@ export async function deleteOperationTime(supabase: SupabaseClient, operationTim
       const pairTimes = await fetchOperationTimesForModel(supabase, subject.operation_id as string, productId)
       const remaining = pairTimes.filter((t) => t.id !== operationTimeId)
       if (remaining.length === 0) continue
-      if (remaining.some((t) => t.superseded_by == null)) continue // the pair still has a current record
+      // A retired or hidden record marked current is not a figure (pickCurrent drops it), so it
+      // doesn't excuse the pair from a promotion — and a record that counts is promoted ahead of
+      // one that doesn't, or the pair would read untimed with a live record sitting in its history.
+      if (remaining.some((t) => t.superseded_by == null && countsTowardLabour(t))) continue // the pair still has a current record
 
-      const promoted = newestFirst(remaining)[0]
+      const promoted = newestFirst(remaining.filter(countsTowardLabour))[0] ?? newestFirst(remaining)[0]
+      if (promoted.superseded_by == null) continue
       const orphaned = remaining
         .filter((t) => t.id !== promoted.id && t.superseded_by === operationTimeId)
         .map((t) => t.id)

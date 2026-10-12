@@ -1,9 +1,12 @@
 'use client'
 
+import { isRetiredTime } from '@/lib/operationTimes'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import ConfirmDialog from '@/components/ConfirmDialog'
 import OperatorSelect from '@/components/OperatorSelect'
+import { TimeExclusionBadges } from '@/components/HiddenTimeBadge'
+import { countsTowardLabour } from '@/lib/operationTimes'
 import { fmtDateTime, fmtMinutes, plural } from '@/lib/format'
 import { fetchOperators, operatorsForLine, type OperatorOption } from '@/lib/operators'
 import {
@@ -62,6 +65,15 @@ import type { OperationTimeNote, UserRole } from '@/lib/types'
  * what the figure used to be: read-only, dimmed, and offering exactly one action — Promote, which
  * makes one of them the figure again and archives the current one in its place. Editing an
  * archived record would be editing history to no effect, so it isn't offered.
+ *
+ * ── Hidden records ─────────────────────────────────────────────────────────────────────────
+ * A record with is_hidden set is listed here like any other — this drawer is history — and
+ * marked "hidden — not counted in totals" wherever it appears. It still sits in the current slot
+ * or the archived list by superseded_by, because that is still what the chain says; it just
+ * contributes nothing (currentForOperation drops it). A pair whose current record is hidden
+ * therefore has no figure, and the drawer says so. A hidden ARCHIVED record is not offered for
+ * promotion: promoting it would archive the counted figure behind a record that counts for
+ * nothing, leaving the pair untimed. Hiding and unhiding are done in the database for now.
  *
  * ── What RLS makes read-only rather than what it makes fail ────────────────────────────────
  * Every gate here comes from lib/permissions, which is the UI's copy of the RLS policies. Nothing
@@ -153,9 +165,10 @@ function RecordRow({
         }}
       >
         <span style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
-          <span style={{ fontSize: 14, fontWeight: 700, color: archived ? 'var(--text-muted)' : 'var(--blue)' }}>
+          <span style={{ fontSize: 14, fontWeight: 700, color: archived || !countsTowardLabour(time) ? 'var(--text-muted)' : 'var(--blue)', textDecoration: !countsTowardLabour(time) ? 'line-through' : undefined }}>
             {fmtMinutes(time.total_minutes)}m
           </span>
+          <TimeExclusionBadges hidden={time.is_hidden} retired={isRetiredTime(time)} />
           <span style={{ fontSize: 12, color: 'var(--text-mid)' }}>
             {time.operator_id ? operatorNameById.get(time.operator_id) ?? 'Unknown operator' : 'No operator'}
           </span>
@@ -361,6 +374,9 @@ export default function OperationTimesDrawer({
   )
   /** Editing an archived record is not offered — see the note at the top. */
   const editingIsArchived = editing ? editing.time.superseded_by != null : false
+  /** Promoting a retired or hidden record is not offered — see the note at the top. */
+  const HIDDEN_PROMOTE_REASON =
+    'This record is retired or hidden — not counted in totals. Promoting it would leave this model with no figure for the operation.'
 
   /**
    * MAY THIS PERSON PROMOTE THAT RECORD — asked of TWO records, not one.
@@ -637,7 +653,23 @@ export default function OperationTimesDrawer({
                 </p>
               )}
 
-              {editingIsArchived && (
+              {isRetiredTime(editing.time) && !editing.time.is_hidden && (
+                <p style={INFO_BOX}>
+                  <strong>This record is retired — not counted in totals.</strong> It is kept as
+                  history, but no labour figure or coverage number anywhere includes it, so
+                  changing it moves nothing.
+                </p>
+              )}
+
+              {editing.time.is_hidden && (
+                <p style={INFO_BOX}>
+                  <strong>This record is hidden — not counted in totals.</strong> It is kept as
+                  history, but no labour figure or coverage number anywhere includes it, so
+                  changing it moves nothing.
+                </p>
+              )}
+
+              {editingIsArchived && countsTowardLabour(editing.time) && (
                 <p style={INFO_BOX}>
                   <strong>This is an archived record.</strong> It was replaced, so it is history
                   and changing it would move no figure anywhere. Promote it to make it
@@ -655,6 +687,7 @@ export default function OperationTimesDrawer({
                 <span className={'badge ' + (editingIsArchived ? 'badge-grey' : 'badge-green')}>
                   {editingIsArchived ? 'archived' : 'current'}
                 </span>
+                <TimeExclusionBadges hidden={editing.time.is_hidden} retired={isRetiredTime(editing.time)} />
                 <span>
                   Recorded {fmtDateTime(editing.time.created_at)}
                   {editing.time.is_imported && ' · imported'}
@@ -802,8 +835,8 @@ export default function OperationTimesDrawer({
                     type="button"
                     className="btn-primary"
                     style={SMALL_BTN}
-                    disabled={saving || !promoteGate(editing).allowed}
-                    title={promoteGate(editing).reason ?? undefined}
+                    disabled={saving || !promoteGate(editing).allowed || !countsTowardLabour(editing.time)}
+                    title={(!countsTowardLabour(editing.time) ? HIDDEN_PROMOTE_REASON : promoteGate(editing).reason) ?? undefined}
                     onClick={() => setConfirmPromote(editing)}
                   >
                     {saving ? 'Working…' : `Make this ${thisModelName}’s current time`}
@@ -842,11 +875,20 @@ export default function OperationTimesDrawer({
 
               <span className="label" style={{ marginBottom: 0 }}>Current</span>
               {currentRecord ? (
-                <RecordRow
-                  record={currentRecord} productId={productId} archived={false}
-                  operatorNameById={operatorNameById}
-                  onOpen={() => openEditor(currentRecord)}
-                />
+                <>
+                  <RecordRow
+                    record={currentRecord} productId={productId} archived={false}
+                    operatorNameById={operatorNameById}
+                    onOpen={() => openEditor(currentRecord)}
+                  />
+                  {!countsTowardLabour(currentRecord.time) && (
+                    <p style={WARN_BOX}>
+                      The current record is {currentRecord.time.is_hidden ? 'hidden' : 'retired'}, so {thisModelName} has no labour figure for
+                      this operation and it reads as an untimed gap. Archived records are not
+                      counted in its place.
+                    </p>
+                  )}
+                </>
               ) : (
                 <p style={WARN_BOX}>
                   Every record for {thisModelName} is archived, so this operation has no labour
@@ -875,8 +917,8 @@ export default function OperationTimesDrawer({
                         operatorNameById={operatorNameById}
                         onOpen={() => openEditor(record)}
                         onPromote={() => setConfirmPromote(record)}
-                        promoteDisabled={saving || !gate.allowed}
-                        promoteBlockedReason={gate.reason}
+                        promoteDisabled={saving || !gate.allowed || !countsTowardLabour(record.time)}
+                        promoteBlockedReason={!countsTowardLabour(record.time) ? HIDDEN_PROMOTE_REASON : gate.reason}
                       />
                     )
                   })}
@@ -936,7 +978,9 @@ export default function OperationTimesDrawer({
           message={
             `${thisModelName}'s labour content for this operation becomes ` +
             `${fmtMinutes(confirmPromote.time.total_minutes)}m.` +
-            (currentRecord
+            (currentRecord && !countsTowardLabour(currentRecord.time)
+              ? ` The current record (${fmtMinutes(currentRecord.time.total_minutes)}m) is ${currentRecord.time.is_hidden ? 'hidden' : 'retired'} and provides no figure; it is archived behind this one — still ${currentRecord.time.is_hidden ? 'hidden' : 'retired'}, still kept.`
+              : currentRecord
               ? ` The record currently providing it (${fmtMinutes(currentRecord.time.total_minutes)}m) is archived behind it — kept, not deleted, and promotable back at any time.`
               : ' This operation has no current record right now, so nothing is archived in its place.') +
             ' Every total and breakdown showing this operation moves to the new figure. Coverage does not change: both records are times that were collected.'

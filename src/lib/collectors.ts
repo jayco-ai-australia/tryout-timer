@@ -1,5 +1,7 @@
+import { type TimeParentFlags, isRetiredTime } from './operationTimes'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { fetchAllChunked, fetchAllRows, READ_CHUNK, type RangeableQuery } from './supabaseRead'
+import { TIME_FLAG_COLUMNS, countsTowardLabour } from './operationTimes'
 import { periodBounds, timeframeWindow, type CollectionTimeframe, type PeriodWindow } from './periods'
 
 /**
@@ -33,8 +35,8 @@ import { periodBounds, timeframeWindow, type CollectionTimeframe, type PeriodWin
  * Every read goes through lib/supabaseRead. On the Overall timeframe the summary sweep is well
  * past the 1,000-row response cap, and a capped response is a normal 200 with a short array —
  * an unpaged read would silently produce counts that are simply wrong, which is the exact bug
- * already fixed on this screen's coverage headline. Note also `is_active` is NOT filtered: on
- * this table it flags a superseded import batch, not a hidden row (see lib/operationTimes).
+ * already fixed on this screen's coverage headline. Note also `is_active` is NOT filtered at
+ * the query: a retired record was still collected. Its minutes are what is left out — see below.
  */
 
 /** The ownerless bucket's key. A real collector's key is their profile id, which is a uuid and
@@ -59,10 +61,13 @@ export interface CollectorSummaryRow {
   imported: boolean
   /** operation_times rows in the window. This is the "showing 100 of N" N. */
   count: number
-  /** Sum of total_minutes across those rows, skipping the nulls. */
+  /** Sum of total_minutes across those rows, skipping the nulls and the retired or hidden ones. */
   totalMinutes: number
   /** Rows whose total_minutes is NULL — counted in `count`, absent from `totalMinutes`. */
   untimed: number
+  /** Rows excluded from every figure — hidden (is_hidden) or retired (is_active = false).
+   * Collected, so counted in `count`; not counted as minutes, so absent from `totalMinutes`. */
+  hidden: number
 }
 
 export interface CollectorSummary {
@@ -70,6 +75,7 @@ export interface CollectorSummary {
    * descending, with the imported bucket forced last. */
   rows: CollectorSummaryRow[]
   totalCount: number
+  /** Hidden rows excluded, as on each row. */
   totalMinutes: number
 }
 
@@ -92,6 +98,11 @@ export interface CollectorScope {
  * a later re-measure does not undo. Filtering to current records would quietly rewrite a
  * collector's history every time somebody superseded one of their runs. Labour content is the
  * separate question, and lib/operationTimes owns it.
+ *
+ * is_active and is_hidden are not filtered either — a retired or hidden record was still
+ * collected, so it stays in every count and every detail list (marked there). It is only kept out
+ * of the minutes sums (lib/operationTimes' countsTowardLabour): its minutes are not counted
+ * anywhere.
  */
 function scopedTimes(
   supabase: SupabaseClient,
@@ -122,13 +133,13 @@ export async function fetchCollectorSummary(
 
   // Read 1 — the whole window, two columns. Ordered by the primary key because .range() paging
   // is only sound over a total order (see lib/supabaseRead); nothing downstream cares about it.
-  const times = await fetchAllRows<{ collected_by: string | null; total_minutes: number | null }>(
-    () => scopedTimes(supabase, 'collected_by, total_minutes', window, lineId)
-      .order('id') as unknown as RangeableQuery<{ collected_by: string | null; total_minutes: number | null }>,
+  const times = await fetchAllRows<{ collected_by: string | null; total_minutes: number | null; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null }>(
+    () => scopedTimes(supabase, `collected_by, total_minutes, ${TIME_FLAG_COLUMNS}`, window, lineId)
+      .order('id') as unknown as RangeableQuery<{ collected_by: string | null; total_minutes: number | null; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null }>,
     { table: 'operation_times' }
   )
 
-  interface Bucket { collectedBy: string | null; count: number; totalMinutes: number; untimed: number }
+  interface Bucket { collectedBy: string | null; count: number; totalMinutes: number; untimed: number; hidden: number }
   const buckets = new Map<string, Bucket>()
   let totalCount = 0
   let totalMinutes = 0
@@ -136,12 +147,13 @@ export async function fetchCollectorSummary(
     const key = row.collected_by ?? IMPORTED_COLLECTOR_KEY
     let bucket = buckets.get(key)
     if (!bucket) {
-      bucket = { collectedBy: row.collected_by, count: 0, totalMinutes: 0, untimed: 0 }
+      bucket = { collectedBy: row.collected_by, count: 0, totalMinutes: 0, untimed: 0, hidden: 0 }
       buckets.set(key, bucket)
     }
     bucket.count += 1
     totalCount += 1
-    if (row.total_minutes == null) bucket.untimed += 1
+    if (!countsTowardLabour(row)) bucket.hidden += 1
+    else if (row.total_minutes == null) bucket.untimed += 1
     else { bucket.totalMinutes += row.total_minutes; totalMinutes += row.total_minutes }
   }
 
@@ -168,6 +180,7 @@ export async function fetchCollectorSummary(
       count: bucket.count,
       totalMinutes: bucket.totalMinutes,
       untimed: bucket.untimed,
+      hidden: bucket.hidden,
     }
   })
 
@@ -193,6 +206,10 @@ export interface CollectorDetailRow {
   minutes: number | null
   /** created_at, ISO — the "when it was collected" the caller formats. */
   collectedAt: string
+  /** Listed, and marked as not counted. */
+  hidden: boolean
+  /** is_active = false. Listed, and marked as not counted. */
+  retired: boolean
 }
 
 /**
@@ -215,14 +232,14 @@ export async function fetchCollectorDetail(
   // The one read here that is deliberately NOT paged: .limit() IS the cap, and it is set well
   // under the 1,000-row response cap, so there is nothing behind it to be silently truncated.
   // Reading it to exhaustion would defeat the point of capping it.
-  let query = scopedTimes(supabase, 'id, operation_id, total_minutes, created_at', window, lineId)
+  let query = scopedTimes(supabase, `id, operation_id, total_minutes, ${TIME_FLAG_COLUMNS}, created_at`, window, lineId)
   query = collectedBy === null ? query.is('collected_by', null) : query.eq('collected_by', collectedBy)
   const { data, error } = await query
     .order('created_at', { ascending: false })
     .limit(COLLECTOR_DETAIL_LIMIT)
   if (error) throw new Error(error.message)
   const times = (data ?? []) as unknown as {
-    id: string; operation_id: string; total_minutes: number | null; created_at: string
+    id: string; operation_id: string; total_minutes: number | null; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null; created_at: string
   }[]
   if (times.length === 0) return []
 
@@ -287,6 +304,8 @@ export async function fetchCollectorDetail(
       models: modelsByTimeId.get(t.id) ?? [],
       minutes: t.total_minutes,
       collectedAt: t.created_at,
+      hidden: t.is_hidden,
+      retired: isRetiredTime(t),
     }
   })
 }

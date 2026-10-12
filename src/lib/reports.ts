@@ -1,3 +1,4 @@
+import { type TimeParentFlags, TIME_FLAG_COLUMNS, isRetiredTime } from './operationTimes'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { selectIn } from './chunkedIn'
 import { fetchAllChunked, fetchAllRows, logSupabaseError, READ_CHUNK, type RangeableQuery } from './supabaseRead'
@@ -18,6 +19,10 @@ import { teamForJob } from './sections'
  * listing it would double-count the same job on a printed sheet. Nothing else is filtered out:
  * imported rows, rows with no operator and rows on retired operations all appear, because they
  * are all real records of work that was measured.
+ *
+ * RETIRED (is_active = false) and HIDDEN (is_hidden) rows are listed too — this page is a record
+ * of what was collected — and each is marked. They are the one thing kept out of the minutes
+ * total (summariseReport): their minutes are not counted anywhere.
  *
  * ── The joins, and the three that have bitten us ──────────────────────────────────────────
  *  1. operation_times has NO product_id. Which model(s) a run counts for lives entirely in the
@@ -42,7 +47,7 @@ import { teamForJob } from './sections'
  */
 
 /** Column list for the base read — everything a row needs plus the columns it is filtered by. */
-const TIME_COLUMNS = 'id, operation_id, operator_id, total_minutes, created_at, team_id, production_line_id, chassis_id'
+const TIME_COLUMNS = `id, operation_id, operator_id, total_minutes, ${TIME_FLAG_COLUMNS}, created_at, team_id, production_line_id, chassis_id`
 
 /**
  * operation_times as this page reads it.
@@ -57,6 +62,9 @@ interface RawTime {
   operation_id: string
   operator_id: string | null
   total_minutes: number | null
+  is_active: boolean | null
+  is_hidden: boolean
+  operations: TimeParentFlags | null
   created_at: string
   team_id: string | null
   production_line_id: string | null
@@ -122,6 +130,10 @@ export interface ReportRow {
   operationName: string
   operatorName: string
   minutes: number | null
+  /** Listed and marked; left out of ReportTotals.totalMinutes. */
+  hidden: boolean
+  /** is_active = false. Listed and marked; left out of ReportTotals.totalMinutes. */
+  retired: boolean
   /** Comma-separated on screen and in print. Empty when the run was never linked to a model. */
   models: string[]
   /** Joined with "; ". Empty when the run has no notes. */
@@ -130,7 +142,13 @@ export interface ReportRow {
 
 export interface ReportTotals {
   recordCount: number
+  /** Retired and hidden records excluded. */
   totalMinutes: number
+  /** Records listed that are retired (is_active = false) and not also hidden — counted in
+   * recordCount, not in totalMinutes. */
+  retiredCount: number
+  /** Records listed that are hidden — counted in recordCount, not in totalMinutes. */
+  hiddenCount: number
   operationCount: number
   jobCount: number
 }
@@ -598,6 +616,8 @@ export async function fetchReportRows(
       // never a reason to drop the record.
       operatorName: (t.operator_id && operatorNameById.get(t.operator_id)) || NONE,
       minutes: t.total_minutes,
+      hidden: t.is_hidden,
+      retired: isRetiredTime(t),
       models: modelsByTime.get(t.id) ?? [],
       notes: notesByTime.get(t.id) ?? [],
     })
@@ -619,12 +639,16 @@ export async function fetchReportRows(
  * the rows that have one — an untimed record still counts as a record. */
 export function summariseReport(rows: ReportRow[]): ReportTotals {
   let totalMinutes = 0
+  let hiddenCount = 0
+  let retiredCount = 0
   const operations = new Set<string>()
   const jobs = new Set<string>()
   for (const r of rows) {
-    totalMinutes += r.minutes ?? 0
+    if (r.hidden) hiddenCount += 1
+    else if (r.retired) retiredCount += 1
+    else totalMinutes += r.minutes ?? 0
     if (r.operationName !== NONE) operations.add(`${r.jobName}::${r.operationName}`)
     if (r.jobName !== NONE) jobs.add(r.jobName)
   }
-  return { recordCount: rows.length, totalMinutes, operationCount: operations.size, jobCount: jobs.size }
+  return { recordCount: rows.length, totalMinutes, hiddenCount, retiredCount, operationCount: operations.size, jobCount: jobs.size }
 }

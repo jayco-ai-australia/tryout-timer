@@ -1,7 +1,9 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { computeCoverageCombos, type CoverageCombo } from './coverage'
 import { listPreAssemblyAreas, loadLineSplit } from './lines'
-import { currentForOperation, operationProductKey } from './operationTimes'
+import {
+  TIME_FLAG_COLUMNS, currentForOperation, onlyCountedTimes, operationProductKey, type TimeExclusionFlags,
+} from './operationTimes'
 import { fetchScheduleWindow, type ScheduleWindow } from './schedule'
 import { fetchAllChunked, logSupabaseError, READ_CHUNK, type RangeableQuery } from './supabaseRead'
 import { selectIn } from './chunkedIn'
@@ -54,7 +56,7 @@ import { selectIn } from './chunkedIn'
 interface JobRow { id: string; name: string; production_line_id: string | null }
 interface OperationRow { id: string; job_id: string }
 interface ModelOperationRow { operation_id: string; product_id: string }
-interface TimeRow { id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null }
+interface TimeRow extends TimeExclusionFlags { id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null }
 interface TimeModelRow { operation_time_id: string; product_id: string }
 interface ProductRow { id: string; model: string; product_series: string | null; production_line_id: string | null }
 
@@ -104,6 +106,25 @@ export interface AreaReport {
    * timed". */
   jobCount: number
   buildLines: BuildLineGroup[]
+  /** The booked chassis behind `scheduled` — how many vans this area's denominator stands for. */
+  scheduledChassis: number
+  /** What this area's denominator leaves out of the schedule's matched models, and why. Reported,
+   * never used: nothing here feeds a coverage figure, it only accounts for the gap between the
+   * page's "N scheduled models" and this area's "of M". */
+  excluded: AreaExclusions
+}
+
+/** A count of models and the booked chassis they stand for. */
+export interface ModelTally { models: number; chassis: number }
+
+export interface AreaExclusions {
+  /** Scheduled models whose build line this area does not feed (production_line_feeds). */
+  notFed: ModelTally
+  /** The names of those build lines, A–Z, so the page can say which. */
+  notFedLines: string[]
+  /** Scheduled models with no production_line_id — they belong to no build line, so no area's
+   * feeds can reach them. */
+  noBuildLine: ModelTally
 }
 
 export interface PreAssemblyCoverageReport {
@@ -112,6 +133,10 @@ export interface PreAssemblyCoverageReport {
   window: ScheduleWindow
   /** Distinct scheduled models across the whole window, before any per-area narrowing. */
   scheduledModels: number
+  /** Scheduled product_ids with no `products` row behind them. They are inside `scheduledModels`
+   * (which counts ids) and inside the matched chassis, but can sit in no area's denominator
+   * because there is no model to place. Reported so the page can say so. */
+  unresolved: ModelTally
 }
 
 /**
@@ -147,6 +172,14 @@ export async function fetchPreAssemblyCoverage(supabase: SupabaseClient): Promis
     return res
   }, READ_CHUNK)
   const productById = new Map(products.map((p) => [p.id, p]))
+  const chassisFor = (productId: string) => window.buildsByProductId.get(productId) ?? 0
+
+  const unresolved: ModelTally = { models: 0, chassis: 0 }
+  for (const id of window.productIds) {
+    if (productById.has(id)) continue
+    unresolved.models += 1
+    unresolved.chassis += chassisFor(id)
+  }
 
   // ── 3. The areas' structure: jobs → operations ────────────────────────────────────────────
   // Scoped by the JOB's line, not by the operation's or the time's. jobs.production_line_id is
@@ -194,11 +227,15 @@ export async function fetchPreAssemblyCoverage(supabase: SupabaseClient): Promis
   // yes/no on coverage — no run counts, no history — so archived rows would be fetched only to be
   // discarded by currentForOperation. superseded_by is still selected: the helper decides which
   // row is the figure, and handing it rows without the column would have it guess.
+  //
+  // Retired and hidden records are filtered AT THE QUERY (onlyCountedTimes): this report only
+  // aggregates, so it has no use for them. The flags are still selected — the helpers' types
+  // require them, and currentForOperation / computeCoverageCombos apply the same rule again.
   const operationTimes = await fetchAllChunked<TimeRow>(
     operationIds, READ_CHUNK,
-    (chunk) => supabase
-      .from('operation_times').select('id, operation_id, total_minutes, superseded_by')
-      .in('operation_id', chunk).is('superseded_by', null)
+    (chunk) => onlyCountedTimes(supabase
+      .from('operation_times').select(`id, operation_id, total_minutes, superseded_by, ${TIME_FLAG_COLUMNS}`)
+      .in('operation_id', chunk).is('superseded_by', null))
       .order('id') as unknown as RangeableQuery<TimeRow>,
     { table: 'operation_times' }
   )
@@ -246,6 +283,18 @@ export async function fetchPreAssemblyCoverage(supabase: SupabaseClient): Promis
       .filter((p) => p.production_line_id !== null && feeds.has(p.production_line_id))
       .sort((a, b) => a.model.localeCompare(b.model))
     const scopedProductIds = new Set(scopedProducts.map((p) => p.id))
+
+    // The other side of that filter, counted. Accounting only — see AreaExclusions.
+    const excluded: AreaExclusions = { notFed: { models: 0, chassis: 0 }, notFedLines: [], noBuildLine: { models: 0, chassis: 0 } }
+    const notFedLineIds = new Set<string>()
+    for (const p of products) {
+      if (scopedProductIds.has(p.id)) continue
+      const tally = p.production_line_id === null ? excluded.noBuildLine : excluded.notFed
+      tally.models += 1
+      tally.chassis += chassisFor(p.id)
+      if (p.production_line_id !== null) notFedLineIds.add(p.production_line_id)
+    }
+    excluded.notFedLines = [...notFedLineIds].map((id) => lineSplit.name(id)).sort((a, b) => a.localeCompare(b))
 
     // Coverage, from coverage.ts, over exactly this area's operations and this area's models.
     // Narrowing the INPUTS rather than filtering the output is what keeps "applicable" derived
@@ -366,8 +415,10 @@ export async function fetchPreAssemblyCoverage(supabase: SupabaseClient): Promis
       hasTimes: areaTimeModels.some((tm) => scopedProductIds.has(tm.product_id)),
       jobCount: areaJobIds.size,
       buildLines,
+      scheduledChassis: scopedProducts.reduce((sum, p) => sum + chassisFor(p.id), 0),
+      excluded,
     }
   })
 
-  return { areas: areaReports, window, scheduledModels: window.productIds.length }
+  return { areas: areaReports, window, scheduledModels: window.productIds.length, unresolved }
 }

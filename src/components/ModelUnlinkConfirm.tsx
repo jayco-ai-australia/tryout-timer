@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import ConfirmDialog from '@/components/ConfirmDialog'
+import { TimeExclusionBadges } from '@/components/HiddenTimeBadge'
 import { fmtDate, fmtMinutes, plural } from '@/lib/format'
 import {
   previewModelUnlink, unlinkOperationsFromModel,
@@ -132,11 +133,12 @@ export default function ModelUnlinkConfirm({
                     <span style={{ color: 'var(--text-muted)' }}>{fmtDate(t.createdAt)}</span>{' '}
                     <strong style={{ color: 'var(--text)' }}>{t.operationName}</strong>{' '}
                     <span style={{ color: 'var(--text-muted)' }}>{fmtMinutes(t.minutes)}m</span>
+                    {(t.hidden || t.retired) && <>{' '}<TimeExclusionBadges hidden={t.hidden} retired={t.retired} /></>}
                   </span>
                   <span style={{ flexShrink: 0, fontWeight: 600, color: t.becomesUnattached ? 'var(--amber)' : 'var(--text-muted)' }}>
                     {t.becomesUnattached
                       ? 'becomes unattached'
-                      : `still counts for ${t.otherModels.join(', ')}`}
+                      : `${t.hidden || t.retired ? 'still linked to' : 'still counts for'} ${t.otherModels.join(', ')}`}
                   </span>
                 </div>
               ))}

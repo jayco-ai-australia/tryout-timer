@@ -14,6 +14,7 @@ import {
   type ReportDatePreset, type ReportFilterLabels, type ReportFilters, type ReportRow,
 } from '@/lib/reports'
 import type { ProductionLine, Section } from '@/lib/types'
+import { TimeExclusionBadges } from '@/components/HiddenTimeBadge'
 
 /**
  * /reports — a filter-driven list of individual time records, built to be printed and handed to
@@ -289,7 +290,7 @@ export default function ReportsClient({ lines, defaultLineId, initialFilters }: 
     requestAnimationFrame(() => requestAnimationFrame(() => window.print()))
   }
 
-  const totalsLine = `${plural(totals.recordCount, 'record')} · ${fmtMinutes(totals.totalMinutes)} minutes (${fmtHours(totals.totalMinutes)}h) · ${plural(totals.operationCount, 'operation')} · ${plural(totals.jobCount, 'job')}`
+  const totalsLine = `${plural(totals.recordCount, 'record')}${totals.hiddenCount + totals.retiredCount > 0 ? ` (${[totals.retiredCount > 0 ? `${totals.retiredCount} retired` : '', totals.hiddenCount > 0 ? `${totals.hiddenCount} hidden` : ''].filter(Boolean).join(', ')}, not counted)` : ''} · ${fmtMinutes(totals.totalMinutes)} minutes (${fmtHours(totals.totalMinutes)}h) · ${plural(totals.operationCount, 'operation')} · ${plural(totals.jobCount, 'job')}`
   const emptyMessage = result ? describeEmptyResult(result.labels) : 'No times recorded.'
 
   return (
@@ -431,7 +432,11 @@ export default function ReportsClient({ lines, defaultLineId, initialFilters }: 
         <div className="stat-card">
           <div className="stat-card-label">Records</div>
           <div className="stat-card-value">{totals.recordCount}</div>
-          <div className="stat-card-sub">individual times, not averaged</div>
+          <div className="stat-card-sub">
+            {totals.hiddenCount + totals.retiredCount > 0
+              ? `${[totals.retiredCount > 0 ? `${totals.retiredCount} retired` : '', totals.hiddenCount > 0 ? `${totals.hiddenCount} hidden` : ''].filter(Boolean).join(', ')} — listed, not in the minutes total`
+              : 'individual times, not averaged'}
+          </div>
         </div>
         <div className="stat-card">
           <div className="stat-card-label">Total minutes</div>
@@ -483,7 +488,10 @@ export default function ReportsClient({ lines, defaultLineId, initialFilters }: 
                     <td className="primary">{r.jobName}</td>
                     <td className="primary">{r.operationName}</td>
                     <td>{r.operatorName}</td>
-                    <td className="right">{fmtMinutes(r.minutes)}</td>
+                    <td className="right">
+                      <span style={r.hidden || r.retired ? { textDecoration: 'line-through', color: 'var(--text-muted)' } : undefined}>{fmtMinutes(r.minutes)}</span>
+                      {(r.hidden || r.retired) && <div style={{ marginTop: 3 }}><TimeExclusionBadges hidden={r.hidden} retired={r.retired} /></div>}
+                    </td>
                     {/* Never blank: a run with no model is in a STATE, and an empty cell reads
                         as a rendering fault rather than as the thing the unattached filter finds. */}
                     <td>
@@ -561,7 +569,9 @@ export default function ReportsClient({ lines, defaultLineId, initialFilters }: 
                   <td>{r.jobName}</td>
                   <td>{r.operationName}</td>
                   <td>{r.operatorName}</td>
-                  <td className="rp-num">{fmtMinutes(r.minutes)}</td>
+                  {/* Words, not a strikethrough alone — a line through a number is easy to miss
+                      on a photocopy. */}
+                  <td className="rp-num">{fmtMinutes(r.minutes)}{(r.hidden || r.retired) && <><br />{r.hidden ? 'hidden' : 'retired'}, not counted</>}</td>
                   {/* Never blank, and italic rather than grey — the same reason as on screen,
                       except that here grey would not survive the photocopier either. */}
                   <td className={'rep-models' + (r.models.length > 0 ? '' : ' reports-none')}>
