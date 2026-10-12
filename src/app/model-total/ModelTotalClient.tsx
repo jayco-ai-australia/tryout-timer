@@ -15,7 +15,6 @@ import { selectIn } from '@/lib/chunkedIn'
 import { buildReportHref, UNATTACHED_PRODUCT_ID } from '@/lib/reports'
 import { buildSetupHref } from '@/lib/setupLinks'
 import { UNSECTIONED_KEY } from '@/components/FinderPanes'
-import { compareSections, teamForJob } from '@/lib/sections'
 import { loadLineSplit, modelsForLine, type LineSplit } from '@/lib/lines'
 import { usePersistedFilter } from '@/lib/useLocalStorage'
 import { usePageSetup } from '@/lib/usePageSetup'
@@ -162,41 +161,6 @@ interface JobHierarchy {
   sectionIdOfJob: Map<string, string | null>
   sectionsById: Map<string, HierarchySection>
   teamNameById: Map<string, string>
-}
-
-/**
- * One row of the SECTION DETAIL or TEAM DETAIL sheet: a group of summaryJobs rows, summed.
- *
- * minutes, timedOps and totalOps are plain sums of the job rows beneath — the Labour Matrix's
- * roll-up rule — so the SHARED jobCompleteness/jobFigure/rowClass mark a section or a team the
- * same way they mark a job: Σtimed = 0 → not timed; Σtimed = Σtotal → fully timed (the sums are
- * equal only if every job's are, since timed ≤ total for each); anything else → partial.
- */
-interface RollupRow {
-  key: string
-  name: string
-  teamId: string | null
-  /** The section itself, for the production-order sort. null on the "No section" bucket and on
-   * team rows. */
-  section: HierarchySection | null
-  minutes: number
-  timedOps: number
-  totalOps: number
-  jobCount: number
-}
-
-/** Bucket keys for jobs that don't reach the hierarchy — real states (a job with no section_id),
- * so they land in a visible row rather than dropping out of a total that includes them. */
-const NO_SECTION_KEY = '__no-section__'
-const NO_TEAM_KEY = '__no-team__'
-
-/** Adds one lower-grain row into a roll-up bucket. The only addition the Section and Team sheets
- * perform, so a section is its jobs summed and a team is its sections summed, by one rule. */
-function addInto(target: RollupRow, from: { minutes: number; timedOps: number; totalOps: number; jobCount: number }) {
-  target.minutes += from.minutes
-  target.timedOps += from.timedOps
-  target.totalOps += from.totalOps
-  target.jobCount += from.jobCount
 }
 
 /** A job's figure as it prints, with the asterisk that says it is not the whole job. The
@@ -889,68 +853,20 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
   /**
    * ── The roll-up ───────────────────────────────────────────────────────────────────────
    *
-   * THE rule the four recorded-times sheets turn on: the operation figures are computed ONCE —
+   * THE rule the recorded-times sheets turn on: the operation figures are computed ONCE —
    * fetchModelTotal's current record per operation (superseded_by null, not hidden) — and every
-   * coarser grain is a sum of the grain below it:
+   * coarser grain is a sum of the grain below it, done in one place (./breakdownTree):
    *
    *   operation  result.operations                    (Operations Detail)
-   *   job        jobGroups' subtotal = Σ operations   (Job Detail, via summaryJobs)
-   *   section    sectionRollup       = Σ summaryJobs  (Section Detail)
-   *   team       teamRollup          = Σ sectionRollup (Team Detail)
+   *   job        jobGroups' subtotal = Σ operations   (Job Detail)
+   *   section    the tree's section node = Σ its jobs (Section Detail)
+   *   team       the tree's team node = Σ its sections (Team Detail)
    *
    * No grain re-reads a time or re-derives a figure; the hierarchy read above only says which
    * bucket a job lands in, and every job lands in exactly one (the no-section / no-team buckets
    * catch the rest). So each sheet's rows sum to visibleTotalMinutes, the on-screen total, and
-   * the sheets cannot disagree with each other.
+   * the sheets cannot disagree with each other or with the screen.
    */
-  const sectionRollup: RollupRow[] = useMemo(() => {
-    if (!hierarchy) return []
-    const byKey = new Map<string, RollupRow>()
-    for (const j of summaryJobs) {
-      const sectionId = hierarchy.sectionIdOfJob.get(j.jobId) ?? null
-      const section = sectionId ? hierarchy.sectionsById.get(sectionId) ?? null : null
-      const key = section?.id ?? NO_SECTION_KEY
-      const row = byKey.get(key) ?? {
-        key, name: section?.name ?? 'No section', section,
-        teamId: teamForJob({ section_id: section?.id ?? null }, hierarchy.sectionsById),
-        minutes: 0, timedOps: 0, totalOps: 0, jobCount: 0,
-      }
-      addInto(row, { minutes: j.minutes, timedOps: j.timedOps, totalOps: j.totalOps, jobCount: 1 })
-      byKey.set(key, row)
-    }
-    // The line's sequence: sort_order alone, then name (lib/sections' compareSections, the same
-    // comparator as the Labour Matrix and every section pane). No team step, so Quality's
-    // end-of-line Gate/Rework sections land last where their numbers put them. "No section" (a
-    // job with no section_id) is last of all.
-    return [...byKey.values()].sort((a, b) => {
-      if (!a.section || !b.section) return a.section ? -1 : b.section ? 1 : 0
-      return compareSections(a.section, b.section)
-    })
-  }, [hierarchy, summaryJobs])
-
-  /**
-   * Teams, summed from sectionRollup. ORDER: alphabetical by team name ("No team" last, id as the
-   * tie-break). Teams carry no sort_order of their own, and nothing else on the row says which
-   * team comes first in production — the Labour Matrix's Team grain falls back to the name for
-   * the same reason, so this matches it.
-   */
-  const teamRollup: RollupRow[] = useMemo(() => {
-    const byKey = new Map<string, RollupRow>()
-    for (const sec of sectionRollup) {
-      const key = sec.teamId ?? NO_TEAM_KEY
-      const row = byKey.get(key) ?? {
-        key, name: teamNameOf(sec.teamId) ?? 'No team', teamId: sec.teamId, section: null,
-        minutes: 0, timedOps: 0, totalOps: 0, jobCount: 0,
-      }
-      addInto(row, sec)
-      byKey.set(key, row)
-    }
-    return [...byKey.values()].sort((a, b) => {
-      if ((a.teamId === null) !== (b.teamId === null)) return a.teamId === null ? 1 : -1
-      const byName = a.name.localeCompare(b.name)
-      return byName !== 0 ? byName : a.key.localeCompare(b.key)
-    })
-  }, [sectionRollup, teamNameOf])
 
   /**
    * ── The breakdown tree: Line → Team → Section → Job ───────────────────────────────────
@@ -1316,13 +1232,13 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
    *               showing its minutes. What the screen currently shows, as a document.
    *   'summary' — JOB DETAIL: the same jobs, one line each — job name and the job's total.
    *               Nothing beneath them, and nothing beside them.
-   *   'section' — SECTION DETAIL: one line per section, the sum of its jobs, in production order.
-   *   'team'    — TEAM DETAIL: one line per team, the sum of its sections.
+   *   'section' — SECTION DETAIL: one line per section, the sum of its jobs, under its team.
+   *   'team'    — TEAM DETAIL: one line per team, the sum of its sections, under its line.
    *
    * The last four are ONE document at four grains. They share TimesSheetHead, and each grain is
    * the grain below it summed (see "The roll-up" above): a job's figure is its `subtotal`, a
-   * section's is sectionRollup, a team's is teamRollup — never a second derivation that happens
-   * to agree.
+   * section's and a team's are the breakdown tree's roll-ups — never a second derivation that
+   * happens to agree.
    *
    * Only ONE is mounted at a time. Every sheet is `.print-sheet`, which is the class the print
    * rule keys off to hide the rest of the page, so having two in the DOM would print both; the
@@ -1940,10 +1856,10 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
       )}
 
       {/* ── Printable recorded-times sheet · SECTION DETAIL ──────────────────────────────
-          Job Detail one grain up: one flat row per section, in the line's sequence — sort_order
-          alone, then name (lib/sections' compareSections, shared with the Labour Matrix). Each row is
-          sectionRollup — the section's summaryJobs rows summed. Nothing is read or re-derived
-          here, so the rows sum to the total in the header and to every other sheet. */}
+          Job Detail one grain up: one row per section, under its line and team — the same tree
+          and the same order as the screen and the other sheets (team, then sections.sort_order).
+          ONE TABLE PER TEAM, whose <thead> names the team, so the heading comes back at the top
+          of every sheet the team runs onto. Every figure is the tree's own roll-up. */}
       {productId && printMode === 'section' && (
         <div className="print-sheet rp-doc mt-times-sheet">
           <TimesSheetHead
@@ -1959,40 +1875,57 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
             printedAt={printedAt}
           />
 
-          {sectionRollup.length === 0 ? (
+          {tree.length === 0 ? (
             <p className="rp-meta">No jobs apply to this model in this selection.</p>
           ) : (
-            <table className="rp-table mt-times-table">
-              <thead>
-                <tr>
-                  <th className="mt-col-name">Section</th>
-                  <th className="mt-col-mins rp-num">Mins</th>
-                </tr>
-              </thead>
-              {/* One flat list in the line's sequence — no team rows, no team subtotals and no
-                  team influence on the order; Team Detail is the sheet for teams. */}
-              <tbody>
-                {sectionRollup.map((sec) => (
-                  <tr key={sec.key}>
-                    <td className={`mt-times-op${rowClass(sec.timedOps, sec.totalOps)}`}>
-                      {sec.name} <span style={{ fontWeight: 400 }}>· {plural(sec.jobCount, 'job')}</span>
-                      <JobStatusNote timedOps={sec.timedOps} totalOps={sec.totalOps} />
-                    </td>
-                    <td className={`rp-num${rowClass(sec.timedOps, sec.totalOps)}`}>
-                      {jobFigure(sec.minutes, sec.timedOps, sec.totalOps)}
+            <>
+              {tree.map((line) => (
+                <Fragment key={line.key}>
+                  <SheetGroupHead level="line" name={line.lineName} r={line} />
+                  {line.teams.map((team) => (
+                    <table key={team.key} className="rp-table mt-times-table mt-sec-table">
+                      <thead>
+                        <tr>
+                          <th className="mt-col-name mt-sec-head">{team.name} · {plural(team.sectionCount, 'section')}</th>
+                          <th className="mt-col-mins rp-num">Mins</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr className="rp-group">
+                          <td className={rowClass(team.timedOps, team.totalOps).trim()}>
+                            {team.timedOps === 0 && 'NOTHING TIMED — '}{rollupPhrase(team)}
+                          </td>
+                          <td className={`rp-num${rowClass(team.timedOps, team.totalOps)}`}>
+                            {jobFigure(team.minutes, team.timedOps, team.totalOps)}
+                          </td>
+                        </tr>
+                        {team.sections.map((sec) => (
+                          <tr key={sec.key}>
+                            <td className={`mt-times-op${rowClass(sec.timedOps, sec.totalOps)}`}>
+                              {sectionLabel(sec)} <span style={{ fontWeight: 400 }}>· {plural(sec.jobCount, 'job')}</span>
+                              <JobStatusNote timedOps={sec.timedOps} totalOps={sec.totalOps} />
+                            </td>
+                            <td className={`rp-num${rowClass(sec.timedOps, sec.totalOps)}`}>
+                              {jobFigure(sec.minutes, sec.timedOps, sec.totalOps)}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  ))}
+                </Fragment>
+              ))}
+              <table className="rp-table mt-times-table mt-sec-table">
+                <tbody>
+                  <tr className="mt-times-grand">
+                    <td className="mt-col-name mt-times-total">Total · {filterPhrase} · {rollupPhrase(totals)}</td>
+                    <td className="mt-col-mins rp-num mt-times-total">
+                      {fmtMinutes(visibleTotalMinutes)}m{anyIncomplete ? '*' : ''}
                     </td>
                   </tr>
-                ))}
-              </tbody>
-              <tbody>
-                <tr className="mt-times-grand">
-                  <td className="mt-times-total">Total · {filterPhrase}</td>
-                  <td className="rp-num mt-times-total">
-                    {fmtMinutes(visibleTotalMinutes)}m{anyIncomplete ? '*' : ''}
-                  </td>
-                </tr>
-              </tbody>
-            </table>
+                </tbody>
+              </table>
+            </>
           )}
 
           <p className="rp-foot">
@@ -2006,9 +1939,10 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
       )}
 
       {/* ── Printable recorded-times sheet · TEAM DETAIL ─────────────────────────────────
-          One row per team, alphabetical (teams carry no production order of their own), "No
-          team" last. Each row is teamRollup — the team's sectionRollup rows summed — so it is the
-          same figure as that team's heading on the Section Detail sheet. */}
+          One row per team, under its production line, in the same team order as every other
+          sheet (where each team first appears in the line's sequence). ONE TABLE PER LINE, whose
+          <thead> names the line and repeats across a page break. Each row is the tree's team
+          roll-up — the same figure as that team's row on the Section Detail sheet. */}
       {productId && printMode === 'team' && (
         <div className="print-sheet rp-doc mt-times-sheet">
           <TimesSheetHead
@@ -2024,38 +1958,53 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
             printedAt={printedAt}
           />
 
-          {teamRollup.length === 0 ? (
+          {tree.length === 0 ? (
             <p className="rp-meta">No jobs apply to this model in this selection.</p>
           ) : (
-            <table className="rp-table mt-times-table">
-              <thead>
-                <tr>
-                  <th className="mt-col-name">Team</th>
-                  <th className="mt-col-mins rp-num">Mins</th>
-                </tr>
-              </thead>
-              <tbody>
-                {teamRollup.map((t) => (
-                  <tr key={t.key}>
-                    <td className={`mt-times-op${rowClass(t.timedOps, t.totalOps)}`}>
-                      {t.name} <span style={{ fontWeight: 400 }}>· {plural(t.jobCount, 'job')}</span>
-                      <JobStatusNote timedOps={t.timedOps} totalOps={t.totalOps} />
-                    </td>
-                    <td className={`rp-num${rowClass(t.timedOps, t.totalOps)}`}>
-                      {jobFigure(t.minutes, t.timedOps, t.totalOps)}
+            <>
+              {tree.map((line) => (
+                <table key={line.key} className="rp-table mt-times-table mt-sec-table">
+                  <thead>
+                    <tr>
+                      <th className="mt-col-name mt-sec-head">{line.lineName} · {plural(line.teams.length, 'team')}</th>
+                      <th className="mt-col-mins rp-num">Mins</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr className="rp-group">
+                      <td className={rowClass(line.timedOps, line.totalOps).trim()}>
+                        {line.timedOps === 0 && 'NOTHING TIMED — '}{rollupPhrase(line)}
+                      </td>
+                      <td className={`rp-num${rowClass(line.timedOps, line.totalOps)}`}>
+                        {jobFigure(line.minutes, line.timedOps, line.totalOps)}
+                      </td>
+                    </tr>
+                    {line.teams.map((team) => (
+                      <tr key={team.key}>
+                        <td className={`mt-times-op${rowClass(team.timedOps, team.totalOps)}`}>
+                          {team.name}{' '}
+                          <span style={{ fontWeight: 400 }}>· {plural(team.sectionCount, 'section')} · {plural(team.jobCount, 'job')}</span>
+                          <JobStatusNote timedOps={team.timedOps} totalOps={team.totalOps} />
+                        </td>
+                        <td className={`rp-num${rowClass(team.timedOps, team.totalOps)}`}>
+                          {jobFigure(team.minutes, team.timedOps, team.totalOps)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ))}
+              <table className="rp-table mt-times-table mt-sec-table">
+                <tbody>
+                  <tr className="mt-times-grand">
+                    <td className="mt-col-name mt-times-total">Total · {filterPhrase} · {rollupPhrase(totals)}</td>
+                    <td className="mt-col-mins rp-num mt-times-total">
+                      {fmtMinutes(visibleTotalMinutes)}m{anyIncomplete ? '*' : ''}
                     </td>
                   </tr>
-                ))}
-              </tbody>
-              <tbody>
-                <tr className="mt-times-grand">
-                  <td className="mt-times-total">Total · {filterPhrase}</td>
-                  <td className="rp-num mt-times-total">
-                    {fmtMinutes(visibleTotalMinutes)}m{anyIncomplete ? '*' : ''}
-                  </td>
-                </tr>
-              </tbody>
-            </table>
+                </tbody>
+              </table>
+            </>
           )}
 
           <p className="rp-foot">
