@@ -285,6 +285,9 @@ export default function AddTimeDrawer({
   /** The apply prompt: open when set. `choosing` is the "Choose which apply" list, `picked` its ticks. */
   const [applyPrompt, setApplyPrompt] = useState<{ choosing: boolean; picked: Set<string> } | null>(null)
   const [applying, setApplying] = useState(false)
+  /** `job|model` pairs the prompt has been answered for — linked, partly linked or left as is.
+   * Lives as long as the drawer is open, which is the session "don't ask again" means. */
+  const [answered, setAnswered] = useState<Set<string>>(new Set())
   /** The Save-time warning that a timed operation doesn't apply to a selected model. */
   const [unlinkedConfirm, setUnlinkedConfirm] = useState(false)
   /** Bumped to re-read the applies-list after a write that may have landed only partly. */
@@ -481,16 +484,34 @@ export default function AddTimeDrawer({
     (productId: string, operationId: string) => existingLinks.get(productId)?.has(operationId) ?? false,
     [existingLinks]
   )
-  /** Selected models this job isn't on at all — the derived rule from lib/modelOperations'
-   * jobsApplying: a job applies to a model iff at least one of its operations does. These are
-   * the models the apply prompt is about; a model that already has the job never sees it. */
+  /**
+   * The selected models the apply prompt is about: every one where this job's operations are
+   * not ALL linked — none of them (the job doesn't apply yet) or only some (it applies partly) —
+   * with how many are linked and which are missing. A fully linked model never sees the prompt,
+   * and neither does one already answered for this job in this drawer (see `answered`): a
+   * partial list can be deliberate, and "Leave as is" has to stay answered.
+   */
+  const answerKey = useCallback((productId: string) => `${job}|${productId}`, [job])
   const modelsToApply = useMemo(
-    () => selectedModels.filter((m) => !operations.some((o) => linkedTo(m.id, o.id))),
-    [selectedModels, operations, linkedTo]
+    () => selectedModels
+      .filter((m) => !answered.has(answerKey(m.id)))
+      .map((model) => {
+        const missing = operations.filter((o) => !linkedTo(model.id, o.id))
+        return { model, missing, linked: operations.length - missing.length }
+      })
+      .filter((t) => t.missing.length > 0),
+    [selectedModels, operations, linkedTo, answered, answerKey]
+  )
+  /** Every model in the prompt is one the job isn't on at all — the plain "Apply" wording. */
+  const promptAllNew = modelsToApply.every((t) => t.linked === 0)
+  /** Operations "Choose which apply" can tick: those missing from at least one model asked about. */
+  const choosable = useMemo(
+    () => operations.filter((o) => modelsToApply.some((t) => t.missing.includes(o))),
+    [operations, modelsToApply]
   )
   const pickedToApply = useMemo(
-    () => operations.filter((o) => applyPrompt?.picked.has(o.id)).map((o) => o.id),
-    [operations, applyPrompt]
+    () => choosable.filter((o) => applyPrompt?.picked.has(o.id)).map((o) => o.id),
+    [choosable, applyPrompt]
   )
 
   // ── Time entry ────────────────────────────────────────────────────────────────────────────
@@ -589,21 +610,22 @@ export default function AddTimeDrawer({
       return (
         <InfoPopover tone="info" label="Job doesn’t apply yet">
           This job doesn’t apply to this model yet. Picking it asks, once, which {ofJob} to
-          link — before any time is entered.
+          link — or to leave it as it is — before any time is entered.
         </InfoPopover>
       )
     }
     const linked = `${st.appliedOps} ${ofJob} ${st.appliedOps === 1 ? 'is' : 'are'} linked`
+    const partialNote = st.partial ? ` Picking it asks whether to link the other ${st.totalOps - st.appliedOps}.` : ''
     if (!st.timed) {
       return (
         <InfoPopover tone="warning" label="Applies, nothing recorded">
-          This job applies to this model. {linked}. Nothing recorded yet.
+          This job applies to this model. {linked}. Nothing recorded yet.{partialNote}
         </InfoPopover>
       )
     }
     return (
       <InfoPopover tone="success" label="Applies, time recorded">
-        This job applies to this model. {linked}, {st.minutes > 0 ? `${fmtTotal(st.minutes)}m recorded` : 'time recorded'}.
+        This job applies to this model. {linked}, {st.minutes > 0 ? `${fmtTotal(st.minutes)}m recorded` : 'time recorded'}.{partialNote}
       </InfoPopover>
     )
   }
@@ -663,27 +685,29 @@ export default function AddTimeDrawer({
 
   // ── Applying the job ──────────────────────────────────────────────────────────────────────
   /**
-   * Writes model_operations and nothing else: the chosen operations × every selected model the
-   * job isn't on yet, through linkOperationsToModels — the app's only insert into that table.
-   * One write per model, so a failure is pinned to the model it belongs to.
+   * Writes model_operations and nothing else, through linkOperationsToModels — the app's only
+   * insert into that table. `operationIds` null is "Link all"; either way each model is sent only
+   * the operations it is missing, so nothing already linked is rewritten and nothing is ever
+   * unlinked. One write per model, so a failure is pinned to the model it belongs to.
    */
-  async function applyJob(operationIds: string[]) {
-    if (operationIds.length === 0) return
+  async function applyJob(operationIds: string[] | null) {
     setApplying(true); setError(null)
     const failed: string[] = []
     const next = new Map(existingLinks)
-    for (const model of modelsToApply) {
+    for (const { model, missing } of modelsToApply) {
+      const ids = missing.filter((o) => operationIds === null || operationIds.includes(o.id)).map((o) => o.id)
+      if (ids.length === 0) continue
       let linkError: string | null
       try {
         const linkResult = await linkOperationsToModels(
-          supabase, operationIds.map((operation_id) => ({ operation_id, product_id: model.id }))
+          supabase, ids.map((operation_id) => ({ operation_id, product_id: model.id }))
         )
         linkError = linkResult.error
       } catch (err) {
         linkError = err instanceof Error ? err.message : 'the write was rejected'
       }
       if (linkError) { failed.push(`${model.model} (${linkError})`); continue }
-      next.set(model.id, new Set([...(next.get(model.id) ?? []), ...operationIds]))
+      next.set(model.id, new Set([...(next.get(model.id) ?? []), ...ids]))
     }
     setExistingLinks(next)
     setApplying(false)
@@ -691,9 +715,23 @@ export default function AddTimeDrawer({
     if (failed.length > 0) {
       // A short write may still have landed some rows — re-read rather than guess.
       setLinksVersion((v) => v + 1)
-      setError(`Could not apply ${jobName || 'this job'} to ${failed.join('; ')}. No time has been recorded.`)
+      setError(`Could not link ${jobName || 'this job'} to ${failed.join('; ')}. No time has been recorded.`)
       return
     }
+    // A model given only SOME of its missing operations is a deliberate partial list now, so it
+    // is answered — not asked again any more than one left as it was. "Link all" leaves nothing
+    // to ask about, and stays unanswered so an operation added later is still offered.
+    if (operationIds !== null) {
+      setAnswered((prev) => new Set([...prev, ...modelsToApply.map((t) => answerKey(t.model.id))]))
+    }
+    setStep(4)
+  }
+
+  /** "Leave as is" — a real answer, not a cancel. Writes nothing, remembers the answer for each
+   * model asked about, and carries on to the Minutes step. */
+  function leaveAsIs() {
+    setAnswered((prev) => new Set([...prev, ...modelsToApply.map((t) => answerKey(t.model.id))]))
+    setApplyPrompt(null)
     setStep(4)
   }
 
@@ -829,8 +867,8 @@ export default function AddTimeDrawer({
           : null)
     : null
 
-  /** Leaving the Models step is the point of applying: any selected model the job isn't on yet
-   * gets the one prompt before the wizard moves on. A job with no operations has nothing to link
+  /** Leaving the Models step is the point of applying: any selected model the job isn't fully
+   * on, and that hasn't been answered for, gets the one prompt before the wizard moves on. A job with no operations has nothing to link
    * yet — step 4 offers it again once it has. */
   function goNext() {
     if (stepReason) return
@@ -1115,15 +1153,16 @@ export default function AddTimeDrawer({
                 about <strong>this entry only</strong> — it never changes which operations apply.
               </div>
 
-              {/* Operations exist that the job's apply step never covered — created just now, or
-                  the job had none when the models were picked. Offered, never done silently. */}
+              {/* Operations the apply step never covered — created just now, or the job had none
+                  when the models were picked. Offered, never done silently, and not for a model
+                  already answered "Leave as is". */}
               {modelsToApply.length > 0 && operations.length > 0 && (
                 <div style={WARN_BOX}>
-                  <strong>{jobName}</strong> doesn’t apply to{' '}
-                  {modelsToApply.length === 1 ? modelsToApply[0].model : plural(modelsToApply.length, 'selected model')} yet,
-                  so none of its operations will show as gaps there.{' '}
+                  {plural(modelsToApply.reduce((n, t) => Math.max(n, t.missing.length), 0), 'operation')} of{' '}
+                  <strong>{jobName}</strong> {modelsToApply.length === 1 ? `aren’t linked to ${modelsToApply[0].model.model}` : `aren’t linked to ${plural(modelsToApply.length, 'selected model')}`},
+                  so they won’t show as gaps there.{' '}
                   <button type="button" style={LINK_BTN} onClick={() => setApplyPrompt({ choosing: false, picked: new Set() })}>
-                    Apply it…
+                    Review…
                   </button>
                 </div>
               )}
@@ -1273,16 +1312,17 @@ export default function AddTimeDrawer({
           entered, and written by the shared linkOperationsToModels. */}
       {applyPrompt && (
         <Modal
-          title={`Apply ${jobName || 'this job'}`}
+          title={`${promptAllNew ? 'Apply' : 'Link the rest of'} ${jobName || 'this job'}`}
+          // Closing it is not an answer: it stays on the step it was opened from and asks again.
           onClose={applying ? () => {} : () => setApplyPrompt(null)}
-          maxWidth={520}
+          maxWidth={560}
           footer={applyPrompt.choosing ? (
             <>
               <button type="button" className="btn-ghost" disabled={applying} onClick={() => setApplyPrompt({ choosing: false, picked: applyPrompt.picked })}>Back</button>
               <button
                 type="button" className="btn-primary"
                 disabled={applying || pickedToApply.length === 0}
-                title={pickedToApply.length === 0 ? 'Tick at least one operation that applies first' : undefined}
+                title={pickedToApply.length === 0 ? 'Tick at least one operation to link first — or go back and choose Leave as is' : undefined}
                 onClick={() => applyJob(pickedToApply)}
               >
                 {applying ? 'Linking…' : `Link ${plural(pickedToApply.length, 'operation')}`}
@@ -1290,67 +1330,102 @@ export default function AddTimeDrawer({
             </>
           ) : (
             <>
-              <button type="button" className="btn-ghost" disabled={applying} onClick={() => setApplyPrompt(null)}>Cancel</button>
+              <button
+                type="button" className="btn-ghost" disabled={applying}
+                title="Writes nothing and carries on. You won’t be asked about this again while the drawer is open."
+                onClick={leaveAsIs}
+              >
+                Leave as is
+              </button>
               <button type="button" className="btn-ghost" disabled={applying} onClick={() => setApplyPrompt({ choosing: true, picked: applyPrompt.picked })}>
                 Choose which apply
               </button>
-              <button type="button" className="btn-primary" disabled={applying} onClick={() => applyJob(operations.map((o) => o.id))}>
-                {applying ? 'Linking…' : `Link all ${plural(operations.length, 'operation')}`}
+              <button type="button" className="btn-primary" disabled={applying} onClick={() => applyJob(null)}>
+                {applying ? 'Linking…' : modelsToApply.length === 1 ? `Link all ${plural(modelsToApply[0].missing.length, 'operation')}` : 'Link all'}
               </button>
             </>
           )}
         >
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12, fontSize: 14, color: 'var(--text-mid)', lineHeight: 1.6 }}>
-            <p style={{ margin: 0, color: 'var(--text)' }}>
-              Apply <strong>{jobName}</strong> to{' '}
-              {modelsToApply.length === 1
-                ? <strong>{modelsToApply[0].model}</strong>
-                : <strong>{modelsToApply.length} models</strong>}
-              ?{' '}
-              {applyPrompt.choosing
-                ? <>{plural(pickedToApply.length, 'operation')} will be linked{modelsToApply.length > 1 && ' to each'}.</>
-                : <>{plural(operations.length, 'operation')} will be linked{modelsToApply.length > 1 && ' to each'}.</>}
-            </p>
-            {modelsToApply.length > 1 && (
-              <p style={{ margin: 0, fontSize: 12, color: 'var(--text-muted)' }}>
-                {modelsToApply.map((m) => m.model).join(', ')}
+            {modelsToApply.length === 1 ? (
+              <p style={{ margin: 0, color: 'var(--text)' }}>
+                {modelsToApply[0].linked === 0 ? (
+                  <>
+                    Apply <strong>{jobName}</strong> to <strong>{modelsToApply[0].model.model}</strong>?{' '}
+                    {plural(applyPrompt.choosing ? pickedToApply.length : operations.length, 'operation')} will be linked.
+                  </>
+                ) : (
+                  <>
+                    <strong>{jobName}</strong> applies to <strong>{modelsToApply[0].model.model}</strong> on{' '}
+                    {modelsToApply[0].linked} of its {plural(operations.length, 'operation')}.{' '}
+                    {applyPrompt.choosing
+                      ? <>{plural(pickedToApply.length, 'more operation')} will be linked.</>
+                      : <>Link the other {modelsToApply[0].missing.length}?</>}
+                  </>
+                )}
               </p>
+            ) : (
+              <>
+                <p style={{ margin: 0, color: 'var(--text)' }}>
+                  <strong>{jobName}</strong> doesn’t fully apply to {modelsToApply.length} of the selected models.{' '}
+                  {applyPrompt.choosing
+                    ? <>The ticked operations will be linked to each, where they aren’t already.</>
+                    : <>Link the rest of its {plural(operations.length, 'operation')} to each?</>}
+                </p>
+                <ul style={{ margin: 0, paddingLeft: 18, fontSize: 13, maxHeight: 160, overflowY: 'auto' }}>
+                  {modelsToApply.map((t) => (
+                    <li key={t.model.id}>
+                      <strong style={{ color: 'var(--text)' }}>{t.model.model}</strong> —{' '}
+                      {t.linked === 0
+                        ? <>doesn’t apply yet; {plural(t.missing.length, 'operation')} would be linked</>
+                        : <>applies on {t.linked} of {operations.length}; the other {t.missing.length} would be linked</>}
+                    </li>
+                  ))}
+                </ul>
+              </>
             )}
             {applyPrompt.choosing ? (
               <>
                 <SelectAllControl
-                  noun="operation" total={operations.length} selected={pickedToApply.length}
-                  onSetAll={(select) => setApplyPrompt({ choosing: true, picked: select ? new Set(operations.map((o) => o.id)) : new Set() })}
+                  noun="operation" total={choosable.length} selected={pickedToApply.length}
+                  onSetAll={(select) => setApplyPrompt({ choosing: true, picked: select ? new Set(choosable.map((o) => o.id)) : new Set() })}
                   style={{ paddingBottom: 8, borderBottom: '1px solid var(--border)' }}
                 />
                 <div className="checkbox-list" style={{ maxHeight: 'none' }}>
-                  {operations.map((op) => (
-                    <label key={op.id} className="checkbox-row" style={{ cursor: 'pointer' }}>
-                      <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-                        <input
-                          type="checkbox" checked={applyPrompt.picked.has(op.id)} disabled={applying}
-                          onChange={() => {
-                            const picked = new Set(applyPrompt.picked)
-                            if (picked.has(op.id)) picked.delete(op.id)
-                            else picked.add(op.id)
-                            setApplyPrompt({ choosing: true, picked })
-                          }}
-                        />
-                        <span style={{ minWidth: 0 }}>{op.name}</span>
-                      </span>
-                    </label>
-                  ))}
+                  {operations.map((op) => {
+                    // Linked on every model being asked about: nothing to decide, and this
+                    // prompt never unlinks — shown ticked and fixed so the list is still the job.
+                    const already = !choosable.includes(op)
+                    return (
+                      <label key={op.id} className="checkbox-row" style={{ cursor: already ? 'default' : 'pointer', justifyContent: 'space-between' }}>
+                        <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                          <input
+                            type="checkbox" checked={already || applyPrompt.picked.has(op.id)} disabled={applying || already}
+                            onChange={() => {
+                              const picked = new Set(applyPrompt.picked)
+                              if (picked.has(op.id)) picked.delete(op.id)
+                              else picked.add(op.id)
+                              setApplyPrompt({ choosing: true, picked })
+                            }}
+                          />
+                          <span style={{ minWidth: 0, color: already ? 'var(--text-muted)' : undefined }}>{op.name}</span>
+                        </span>
+                        {already && <span className="badge badge-green" style={{ fontSize: 10 }}>Already linked</span>}
+                      </label>
+                    )
+                  })}
                 </div>
                 <p style={{ margin: 0, fontSize: 12, color: 'var(--text-muted)' }}>
-                  Only the ticked operations will apply. The rest stay off {modelsToApply.length === 1 ? 'this model' : 'these models'} and
-                  will not show as gaps.
+                  Only the ticked operations are added. The rest stay off {modelsToApply.length === 1 ? 'this model' : 'these models'} and
+                  will not show as gaps. Nothing is unlinked here.
                 </p>
               </>
             ) : (
               <p style={{ margin: 0, fontSize: 12, color: 'var(--text-muted)' }}>
                 Linking says the work is required for {modelsToApply.length === 1 ? 'this model' : 'these models'} — every
                 operation without a recorded time then shows as a gap, which is the point. It records
-                nothing about time. Choose which apply if this job does different work on {modelsToApply.length === 1 ? 'this model' : 'these models'}.
+                nothing about time. <strong>Leave as is</strong> if the job really does less work
+                here: it writes nothing, and you won’t be asked again while this drawer is open.
               </p>
             )}
           </div>
