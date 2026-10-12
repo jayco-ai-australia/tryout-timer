@@ -10,6 +10,11 @@
  * Portrait: both sheets on this page are a name and a number. (The coverage report is landscape
  * because it is six columns wide.) This also governs the older blank collection sheet, whose
  * margin was 14mm from a global rule and is now 12mm with everything else.
+ *
+ * NOT SUFFICIENT ON ITS OWN. Next.js keeps every visited route's CSS loaded after a client-side
+ * navigation, so Labour Matrix's A3 landscape (or Reports' A4 landscape) can load AFTER this rule
+ * and win. ModelTotalClient pins this same rule last in <head> through lib/usePageSetup. Change
+ * both together (MODEL_TOTAL_PAGE_CSS).
  */
 @page {
   size: A4 portrait;

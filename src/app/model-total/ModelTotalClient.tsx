@@ -15,11 +15,15 @@ import { selectIn } from '@/lib/chunkedIn'
 import { buildReportHref, UNATTACHED_PRODUCT_ID } from '@/lib/reports'
 import { buildSetupHref } from '@/lib/setupLinks'
 import { UNSECTIONED_KEY } from '@/components/FinderPanes'
+import { compareSections, teamForJob } from '@/lib/sections'
 import { loadLineSplit, modelsForLine, type LineSplit } from '@/lib/lines'
 import { usePersistedFilter } from '@/lib/useLocalStorage'
+import { usePageSetup } from '@/lib/usePageSetup'
 import ConfirmDialog from '@/components/ConfirmDialog'
+import AreaChips from '@/components/AreaChips'
 import OperationTimesDrawer from '@/components/OperationTimesDrawer'
-import BreakdownRow, { GRID_COLS, GRID_GAP } from './BreakdownRow'
+import BreakdownTable, { NotYetTimedTable } from './BreakdownTable'
+import { buildBreakdownTree, treeRollup, untimedCount, type HierarchySection, type JobNode, type MissingOpRow, type Rollup, type SectionNode } from './breakdownTree'
 import CopyToModelsPanel, { type CopyJob } from './CopyToModelsPanel'
 import type { Product, ProductionLine, UserRole } from '@/lib/types'
 
@@ -39,8 +43,16 @@ const SEL: React.CSSProperties = {
 }
 const EMPTY: React.CSSProperties = { textAlign: 'center', color: 'var(--text-muted)', fontSize: 13, padding: '40px 0' }
 const ADD_TIME_DRAWER_WIDTH: React.CSSProperties = { width: '50vw' }
-/** Reads on the X button's tooltip and heads its confirmation. */
-const UNLINK_LABEL = 'Doesn’t apply to this model'
+/** How far the breakdown is opened. Sections are always listed; this is what shows under them. */
+type Depth = 'sections' | 'jobs' | 'operations'
+const DEPTHS: { key: Depth; label: string; hint: string }[] = [
+  { key: 'sections', label: 'Sections', hint: 'Teams and sections only — every section closed' },
+  { key: 'jobs', label: 'Jobs', hint: 'Every section open to its jobs' },
+  { key: 'operations', label: 'Operations', hint: 'Every section and every job open, down to the operations' },
+]
+/** Stand-ins while the hierarchy read is in flight — module-level so the tree memo is stable. */
+const NO_SECTION_IDS = new Map<string, string | null>()
+const NO_SECTIONS = new Map<string, HierarchySection>()
 /** .gaps-drawer (see globals.css) is hard-coded to 25vw for the /dashboard gap drawer —
  * reused here for the slide-in/overlay/shadow behaviour, matching the convention of
  * overriding just the width to half the page. */
@@ -56,16 +68,13 @@ interface RequiredOpRow { id: string; name: string; job_id: string; primary_oper
 /** A job in the required set, with just enough of its section to name it and link to it, plus
  * the production line it sits on — jobs.production_line_id is the source of truth for which
  * line a piece of labour belongs to, and it is what the labour-source filter splits on. */
-interface RequiredJobRow { id: string; name: string; section_id: string | null; sectionName: string | null; productionLineId: string | null }
+interface RequiredJobRow { id: string; name: string; section_id: string | null; sectionName: string | null; productionLineId: string | null; isActive: boolean }
 /** What the jobs query actually returns, before the embedded section is flattened. */
 interface RawRequiredJobRow {
-  id: string; name: string; section_id: string | null; production_line_id: string | null
+  id: string; name: string; section_id: string | null; production_line_id: string | null; is_active: boolean
   sections?: { name: string } | { name: string }[] | null
 }
 
-/** An untimed/"missing" operation shown inside a Timed job card, greyed. Carries the operator
- * fields directly (from requiredOps) rather than an id looked up in a side map. */
-interface MissingOpRow { operationId: string; operationName: string; primaryOperatorId: string | null; secondaryOperatorId: string | null }
 
 /**
  * ── What labour is being counted ────────────────────────────────────────────────────────
@@ -87,11 +96,16 @@ interface MissingOpRow { operationId: string; operationName: string; primaryOper
 type LabourSource = 'all' | 'line' | 'pre'
 
 /**
- * The three sheets this page can print. 'times' and 'summary' are the SAME recorded-times
- * document at two depths — see handlePrint and TimesSheetHead — and 'blank' is a different
- * errand: an empty sheet that goes out to the line, not a record that comes back from it.
+ * The sheets this page can print. 'times', 'summary', 'section' and 'team' are the SAME
+ * recorded-times document at four grains — Operation → Job → Section → Team, the Labour
+ * Matrix's grain selector on paper; see handlePrint and TimesSheetHead — and 'blank' is a
+ * different errand: an empty sheet that goes out to the line, not a record that comes back.
  */
-type PrintMode = 'blank' | 'times' | 'summary'
+type PrintMode = 'blank' | 'times' | 'summary' | 'section' | 'team'
+
+/** This page's paper, kept identical to ./print.css. Module-level so usePageSetup's effect
+ * runs once per mount. */
+const MODEL_TOTAL_PAGE_CSS = '@page { size: A4 portrait; margin: 12mm; }'
 
 const LABOUR_SOURCES: { key: LabourSource; label: string; hint: string }[] = [
   { key: 'all', label: 'All', hint: 'Every job that applies to this model — pre-assembly and line labour together' },
@@ -125,51 +139,7 @@ interface UntimedJobGroup {
   operations: MissingOpRow[]
 }
 
-/**
- * Jobs sharing a production line, with that line's subtotal — the breakdown's grouping level
- * above the job card. Generic over the job group type so the timed and not-yet-timed halves are
- * grouped by the same function rather than two that can drift apart.
- */
-interface LineGroup<T> {
-  lineId: string | null
-  lineName: string
-  jobs: T[]
-  subtotal: number
-}
-
-/**
- * Groups job cards by production line, line labour first and pre-assembly after it, each half
- * A–Z. That order is the point of the "All" view: the build line's own work reads as the body of
- * the model, with the fed-in pre-assembly areas beneath it, rather than interleaved alphabetically
- * where "Chassis" lands between two Caravan jobs and looks like one of them.
- */
-function groupByLine<T extends { lineId: string | null; jobName: string }>(
-  jobs: T[],
-  minutesOf: (job: T) => number,
-  split: LineSplit | null,
-): LineGroup<T>[] {
-  const byLine = new Map<string, LineGroup<T>>()
-  for (const job of jobs) {
-    // '' keys the "no line at all" bucket — a real state (a job created before lines existed),
-    // and one that has to land somewhere visible rather than being dropped.
-    const key = job.lineId ?? ''
-    const group = byLine.get(key)
-      ?? { lineId: job.lineId, lineName: split?.name(job.lineId) ?? '—', jobs: [], subtotal: 0 }
-    group.jobs.push(job)
-    group.subtotal += minutesOf(job)
-    byLine.set(key, group)
-  }
-  return [...byLine.values()]
-    .map((g) => ({ ...g, jobs: [...g.jobs].sort((a, b) => a.jobName.localeCompare(b.jobName)) }))
-    .sort((a, b) => {
-      const aPre = split?.isPreAssembly(a.lineId) ?? false
-      const bPre = split?.isPreAssembly(b.lineId) ?? false
-      if (aPre !== bPre) return aPre ? 1 : -1
-      return a.lineName.localeCompare(b.lineName)
-    })
-}
-
-/** One row of the JOB SUMMARY sheet: a job that applies to this model, timed or not. */
+/** One row of the JOB DETAIL sheet (and the leaf the Section and Team sheets sum): a job that applies to this model, timed or not. */
 interface SummaryJobRow {
   jobId: string
   jobName: string
@@ -180,6 +150,53 @@ interface SummaryJobRow {
    * the two numbers the completeness rule below is built from, and nothing else. */
   timedOps: number
   totalOps: number
+}
+
+/** The job-hierarchy the SECTION DETAIL and TEAM DETAIL sheets group by: each job's section,
+ * each section's team and place in production order, and each team's name. Grouping data only —
+ * no figure is read from here. `key` is the job set it was read for, so a stale read (the model
+ * changed, a job was unlinked) is recognisable rather than silently grouped against. */
+
+interface JobHierarchy {
+  key: string
+  sectionIdOfJob: Map<string, string | null>
+  sectionsById: Map<string, HierarchySection>
+  teamNameById: Map<string, string>
+}
+
+/**
+ * One row of the SECTION DETAIL or TEAM DETAIL sheet: a group of summaryJobs rows, summed.
+ *
+ * minutes, timedOps and totalOps are plain sums of the job rows beneath — the Labour Matrix's
+ * roll-up rule — so the SHARED jobCompleteness/jobFigure/rowClass mark a section or a team the
+ * same way they mark a job: Σtimed = 0 → not timed; Σtimed = Σtotal → fully timed (the sums are
+ * equal only if every job's are, since timed ≤ total for each); anything else → partial.
+ */
+interface RollupRow {
+  key: string
+  name: string
+  teamId: string | null
+  /** The section itself, for the production-order sort. null on the "No section" bucket and on
+   * team rows. */
+  section: HierarchySection | null
+  minutes: number
+  timedOps: number
+  totalOps: number
+  jobCount: number
+}
+
+/** Bucket keys for jobs that don't reach the hierarchy — real states (a job with no section_id),
+ * so they land in a visible row rather than dropping out of a total that includes them. */
+const NO_SECTION_KEY = '__no-section__'
+const NO_TEAM_KEY = '__no-team__'
+
+/** Adds one lower-grain row into a roll-up bucket. The only addition the Section and Team sheets
+ * perform, so a section is its jobs summed and a team is its sections summed, by one rule. */
+function addInto(target: RollupRow, from: { minutes: number; timedOps: number; totalOps: number; jobCount: number }) {
+  target.minutes += from.minutes
+  target.timedOps += from.timedOps
+  target.totalOps += from.totalOps
+  target.jobCount += from.jobCount
 }
 
 /** A job's figure as it prints, with the asterisk that says it is not the whole job. The
@@ -208,8 +225,8 @@ function JobStatusNote({ timedOps, totalOps }: { timedOps: number; totalOps: num
 
 /**
  * A row's completeness as a class, appended to EVERY cell of the row so the whole line changes
- * together rather than just the figure. One function, so the detailed sheet and the job-summary
- * sheet cannot end up marking the same job two different ways.
+ * together rather than just the figure. One function, so every recorded-times sheet
+ * cannot end up marking the same job two different ways.
  *
  * What each class does is in globals.css's print block, and it is not only colour: see the note
  * there about mono printers, where #dc2626 lands as a mid-grey that is LESS legible than the
@@ -227,7 +244,7 @@ const INCOMPLETE_NOTE =
   '* not this job’s full labour content — some or all of its operations are not yet timed, and an untimed operation contributes 0.'
 
 /**
- * The header BOTH recorded-times sheets carry — DETAILED and JOB SUMMARY.
+ * The header EVERY recorded-times sheet carries — Operations, Job, Section and Team Detail.
  *
  * One component, not one per sheet. The two sheets differ in what they list underneath and in
  * nothing else, and a second header is precisely how two printouts of the same selection start
@@ -288,57 +305,26 @@ function collectOperatorIds(operations: { primaryOperatorId: string | null; seco
   return [...set]
 }
 
-/** The job header's label cell: chevron, name, and the operator line that truncates first. */
-function JobLabel({ name, open, operatorLabel, children }: {
-  name: string; open: boolean; operatorLabel: string
-  /** The inline Add Time link, on the rows that offer one. */
-  children?: React.ReactNode
-}) {
-  return (
-    <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
-        <ChevronIcon open={open} />
-        <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>{name}</span>
-      </span>
-      {children && <span style={{ flexShrink: 0 }}>{children}</span>}
-      {operatorLabel && (
-        <span style={{ fontSize: 12, fontStyle: 'italic', color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>
-          {operatorLabel}
-        </span>
-      )}
-    </span>
-  )
+/** A level's roll-up in words, for the printed sheets — the same three counts the screen's
+ * columns carry, with the untimed count stated rather than left to subtraction. */
+function rollupPhrase(r: Rollup): string {
+  return `${r.jobsCovered} of ${plural(r.jobCount, 'job')} timed · ${r.timedOps} of ${plural(r.totalOps, 'operation')} timed · ${untimedCount(r)} untimed`
 }
 
-/**
- * The per-line subtotal header above a run of job cards. The minutes are suppressed for the
- * not-yet-timed half, where every subtotal is 0 by definition and a column of "0m" would read
- * as a measurement rather than as an absence.
- */
-function LineHeading({ name, jobCount, subtotal, showSubtotal }: {
-  name: string; jobCount: number; subtotal: number; showSubtotal: boolean
-}) {
-  return (
-    <div className="labour-line-head">
-      <span style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-mid)' }}>
-        {name}
-      </span>
-      <span style={{ fontSize: 11, color: 'var(--text-muted)', flexShrink: 0 }}>
-        {plural(jobCount, 'job')}
-        {showSubtotal && <> · <strong style={{ color: 'var(--blue)' }}>{fmtMinutes(subtotal)}m</strong></>}
-      </span>
-    </div>
-  )
+/** A section's name on paper, with the tray said in words where the screen uses a badge. */
+function sectionLabel(section: SectionNode): string {
+  return section.tray ? `${section.name} (unsorted tray)` : section.name
 }
 
-function ChevronIcon({ open }: { open: boolean }) {
+/** A production-line or team heading on a recorded-times sheet: the name, its roll-up and its
+ * minutes. Marked by the shared rowClass, so a team with nothing timed prints as an untimed job
+ * does. */
+function SheetGroupHead({ level, name, r }: { level: 'line' | 'team'; name: string; r: Rollup }) {
   return (
-    <svg
-      width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
-      style={{ transform: open ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s', flexShrink: 0, color: 'var(--text-muted)' }}
-    >
-      <polyline points="6 9 12 15 18 9" />
-    </svg>
+    <p className={`mt-times-grouphead mt-times-${level}${rowClass(r.timedOps, r.totalOps)}`}>
+      <span>{name}</span>
+      <span>{rollupPhrase(r)} · {jobFigure(r.minutes, r.timedOps, r.totalOps)}</span>
+    </p>
   )
 }
 
@@ -516,7 +502,9 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
       let jobRows: RequiredJobRow[]
       try {
         jobRows = await selectIn<RawRequiredJobRow>(jobIds, async (chunk) => {
-          const res = await supabase.from('jobs').select('id, name, section_id, production_line_id, sections ( name )').in('id', chunk)
+          // is_active is selected, not filtered: the row still names the job, and jobPassesFilter
+          // is what hides a retired one — see jobActiveById.
+          const res = await supabase.from('jobs').select('id, name, section_id, production_line_id, is_active, sections ( name )').in('id', chunk)
           if (res.error) logSupabaseError('required set — jobs WHERE id IN (…)', res.error)
           return res
         }).then((rows) => rows.map((r) => ({
@@ -524,6 +512,7 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
           name: r.name,
           section_id: r.section_id,
           productionLineId: r.production_line_id,
+          isActive: r.is_active,
           // The embedded row arrives as an object or a one-element array depending on how
           // PostgREST resolves the relationship; both mean the same one section.
           sectionName: (Array.isArray(r.sections) ? r.sections[0]?.name : r.sections?.name) ?? null,
@@ -623,17 +612,37 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
     return map
   }, [modelTotal, requiredJobs])
 
+  /**
+   * job id → jobs.is_active, from the same two reads as jobLineById.
+   *
+   * A job can be retired (is_active = false) while its operations are still active and still
+   * linked to models — so filtering OPERATIONS on is_active, which both reads already do, is not
+   * enough to keep it off this page. /setup and /collect hide such a job; this page, and every
+   * sheet it prints, now does the same through jobPassesFilter below. Its recorded minutes leave
+   * the total with it, so the screen, the total and every printout still reconcile.
+   */
+  const jobActiveById = useMemo(() => {
+    const map = new Map<string, boolean>()
+    for (const j of modelTotal?.raw.jobs ?? []) map.set(j.id, j.is_active)
+    for (const j of requiredJobs) map.set(j.id, j.isActive)
+    return map
+  }, [modelTotal, requiredJobs])
+
   /** The pre-assembly areas this model actually has work on — the chip row. Derived from the
    * jobs in play, not from the full list of pre-assembly lines, so a chip is never offered that
    * would filter the breakdown down to nothing. */
   const preAssemblyAreas = useMemo(() => {
     if (!lineSplit) return []
     const ids = new Set<string>()
-    for (const lineId of jobLineById.values()) if (lineId && lineSplit.isPreAssembly(lineId)) ids.add(lineId)
+    for (const [jobId, lineId] of jobLineById) {
+      // A retired job is never on the page, so it can't be the reason a chip exists.
+      if (jobActiveById.get(jobId) === false) continue
+      if (lineId && lineSplit.isPreAssembly(lineId)) ids.add(lineId)
+    }
     return [...ids]
       .map((id) => ({ id, name: lineSplit.name(id) }))
       .sort((a, b) => a.name.localeCompare(b.name))
-  }, [jobLineById, lineSplit])
+  }, [jobLineById, jobActiveById, lineSplit])
 
   // A chip that no longer exists (different model, or its last job unlinked) would otherwise
   // keep filtering by an id nothing matches — an empty breakdown with no visible cause.
@@ -650,13 +659,16 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
    * from both.
    */
   const jobPassesFilter = useCallback((jobId: string): boolean => {
+    // A retired job is out under EVERY filter, before the labour-source split is asked. An id
+    // not in the map (its job row hasn't loaded) passes — absent is not the same as retired.
+    if (jobActiveById.get(jobId) === false) return false
     if (labourSource === 'all') return true
     const lineId = jobLineById.get(jobId) ?? null
     const isPre = lineSplit?.isPreAssembly(lineId) ?? false
     if (labourSource === 'line') return !isPre
     if (!isPre) return false
     return !areaLineId || lineId === areaLineId
-  }, [labourSource, areaLineId, jobLineById, lineSplit])
+  }, [labourSource, areaLineId, jobLineById, jobActiveById, lineSplit])
 
   // Coverage combos — computeCoverageCombos (coverage.ts, unchanged) fed with the union of the
   // required-set operations above and the timed operations fetchModelTotal already found, plus
@@ -763,16 +775,9 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
    */
   const visibleTotalMinutes = useMemo(() => jobGroups.reduce((sum, g) => sum + g.subtotal, 0), [jobGroups])
 
-  // The breakdown's grouping level: job cards gathered under the line they belong to, with that
-  // line's subtotal. Most useful on "All", where a model's build-line work and the pre-assembly
-  // work feeding it are on screen together and only the grouping tells them apart.
-  const timedLineGroups = useMemo(() => groupByLine(jobGroups, (g) => g.subtotal, lineSplit), [jobGroups, lineSplit])
-  // Nothing in here is timed, by definition, so every subtotal is 0 and none is rendered — the
-  // grouping is purely so the same job sits under the same heading in both halves.
-  const untimedLineGroups = useMemo(() => groupByLine(untimedJobGroups, () => 0, lineSplit), [untimedJobGroups, lineSplit])
 
   /**
-   * ── The JOB SUMMARY sheet's job list ──────────────────────────────────────────────────
+   * ── The JOB DETAIL sheet's job list ────────────────────────────────────────────────────
    *
    * EVERY job that applies to this model under the current filter, one row each — BOTH halves
    * of the on-screen breakdown, not just the timed one.
@@ -802,11 +807,6 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
     })),
   ], [jobGroups, untimedJobGroups])
 
-  /** Grouped by line through the SAME groupByLine the screen and the detailed sheet use, so a
-   * job sits under the same heading wherever it is read, and each line's jobs come out A–Z with
-   * the timed and untimed ones interleaved rather than in two piles. The line subtotals are the
-   * sum of the jobs' minutes — unchanged by the untimed rows, which are 0 by construction. */
-  const summaryLineGroups = useMemo(() => groupByLine(summaryJobs, (j) => j.minutes, lineSplit), [summaryJobs, lineSplit])
 
   /** Whether anything on the sheet is an incomplete figure — decides if the asterisk key is
    * printed at all, and whether the grand total carries one. Read off the same per-job counts
@@ -814,6 +814,187 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
   const anyIncomplete = useMemo(
     () => summaryJobs.some((j) => jobCompleteness(j.timedOps, j.totalOps) !== 'timed'),
     [summaryJobs],
+  )
+
+  /**
+   * ── The hierarchy above a job, for the Section and Team sheets ────────────────────────
+   *
+   * Read for every job this model has anything to do with (jobLineById's keys — the union of
+   * required and timed jobs), so the Show filter re-groups what is already in memory and issues
+   * nothing. Three identity reads: each job's section_id, those sections, those sections' teams.
+   *
+   * A job's team is its SECTION's team (lib/sections' teamForJob). jobs.team_id is legacy and is
+   * not selected — reading it would give this sheet a second answer to "whose job is this".
+   *
+   * Grouping only. No minutes are read here; every figure on the two sheets is a sum of
+   * summaryJobs rows, which are the on-screen job subtotals.
+   */
+  const hierarchyJobKey = useMemo(() => [...jobLineById.keys()].sort().join(','), [jobLineById])
+  const [hierarchy, setHierarchy] = useState<JobHierarchy | null>(null)
+  const [hierarchyError, setHierarchyError] = useState<string | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    setHierarchyError(null)
+    if (!hierarchyJobKey) { setHierarchy({ key: '', sectionIdOfJob: new Map(), sectionsById: new Map(), teamNameById: new Map() }); return }
+    const jobIds = hierarchyJobKey.split(',')
+
+    async function run() {
+      try {
+        const jobs = await selectIn<{ id: string; section_id: string | null }>(jobIds, async (chunk) => {
+          const res = await supabase.from('jobs').select('id, section_id').in('id', chunk)
+          if (res.error) logSupabaseError('model-total hierarchy — jobs WHERE id IN (…)', res.error)
+          return res
+        })
+        if (cancelled) return
+        // Not filtered to is_active: a merged-away section still labels the jobs pointing at it.
+        const sectionIds = [...new Set(jobs.map((j) => j.section_id).filter((id): id is string => !!id))]
+        const sections = await selectIn<HierarchySection>(sectionIds, async (chunk) => {
+          const res = await supabase.from('sections').select('id, name, team_id, sort_order').in('id', chunk)
+          if (res.error) logSupabaseError('model-total hierarchy — sections WHERE id IN (…)', res.error)
+          return res
+        })
+        if (cancelled) return
+        const teamIds = [...new Set(sections.map((sec) => sec.team_id).filter((id): id is string => !!id))]
+        const teams = await selectIn<{ id: string; name: string }>(teamIds, async (chunk) => {
+          const res = await supabase.from('teams').select('id, name').in('id', chunk)
+          if (res.error) logSupabaseError('model-total hierarchy — teams WHERE id IN (…)', res.error)
+          return res
+        })
+        if (cancelled) return
+        setHierarchy({
+          key: hierarchyJobKey,
+          sectionIdOfJob: new Map(jobs.map((j) => [j.id, j.section_id])),
+          sectionsById: new Map(sections.map((sec) => [sec.id, sec])),
+          teamNameById: new Map(teams.map((t) => [t.id, t.name])),
+        })
+      } catch (err) {
+        if (cancelled) return
+        setHierarchyError(err instanceof Error ? err.message : 'Could not load sections and teams')
+      }
+    }
+    run()
+    return () => { cancelled = true }
+  }, [supabase, hierarchyJobKey])
+
+  /** Only a hierarchy read for THIS job set groups anything — a stale one would put a newly
+   * linked job in "No section" on paper. The two buttons wait for it. */
+  const hierarchyReady = hierarchy !== null && hierarchy.key === hierarchyJobKey
+
+  /** null only for "no team"; a team id the read didn't resolve is still a team, just unnamed. */
+  const teamNameOf = useCallback(
+    (teamId: string | null) => (teamId ? hierarchy?.teamNameById.get(teamId) ?? 'Unknown team' : null),
+    [hierarchy],
+  )
+
+  /**
+   * ── The roll-up ───────────────────────────────────────────────────────────────────────
+   *
+   * THE rule the four recorded-times sheets turn on: the operation figures are computed ONCE —
+   * fetchModelTotal's current record per operation (superseded_by null, not hidden) — and every
+   * coarser grain is a sum of the grain below it:
+   *
+   *   operation  result.operations                    (Operations Detail)
+   *   job        jobGroups' subtotal = Σ operations   (Job Detail, via summaryJobs)
+   *   section    sectionRollup       = Σ summaryJobs  (Section Detail)
+   *   team       teamRollup          = Σ sectionRollup (Team Detail)
+   *
+   * No grain re-reads a time or re-derives a figure; the hierarchy read above only says which
+   * bucket a job lands in, and every job lands in exactly one (the no-section / no-team buckets
+   * catch the rest). So each sheet's rows sum to visibleTotalMinutes, the on-screen total, and
+   * the sheets cannot disagree with each other.
+   */
+  const sectionRollup: RollupRow[] = useMemo(() => {
+    if (!hierarchy) return []
+    const byKey = new Map<string, RollupRow>()
+    for (const j of summaryJobs) {
+      const sectionId = hierarchy.sectionIdOfJob.get(j.jobId) ?? null
+      const section = sectionId ? hierarchy.sectionsById.get(sectionId) ?? null : null
+      const key = section?.id ?? NO_SECTION_KEY
+      const row = byKey.get(key) ?? {
+        key, name: section?.name ?? 'No section', section,
+        teamId: teamForJob({ section_id: section?.id ?? null }, hierarchy.sectionsById),
+        minutes: 0, timedOps: 0, totalOps: 0, jobCount: 0,
+      }
+      addInto(row, { minutes: j.minutes, timedOps: j.timedOps, totalOps: j.totalOps, jobCount: 1 })
+      byKey.set(key, row)
+    }
+    // The line's sequence: sort_order alone, then name (lib/sections' compareSections, the same
+    // comparator as the Labour Matrix and every section pane). No team step, so Quality's
+    // end-of-line Gate/Rework sections land last where their numbers put them. "No section" (a
+    // job with no section_id) is last of all.
+    return [...byKey.values()].sort((a, b) => {
+      if (!a.section || !b.section) return a.section ? -1 : b.section ? 1 : 0
+      return compareSections(a.section, b.section)
+    })
+  }, [hierarchy, summaryJobs])
+
+  /**
+   * Teams, summed from sectionRollup. ORDER: alphabetical by team name ("No team" last, id as the
+   * tie-break). Teams carry no sort_order of their own, and nothing else on the row says which
+   * team comes first in production — the Labour Matrix's Team grain falls back to the name for
+   * the same reason, so this matches it.
+   */
+  const teamRollup: RollupRow[] = useMemo(() => {
+    const byKey = new Map<string, RollupRow>()
+    for (const sec of sectionRollup) {
+      const key = sec.teamId ?? NO_TEAM_KEY
+      const row = byKey.get(key) ?? {
+        key, name: teamNameOf(sec.teamId) ?? 'No team', teamId: sec.teamId, section: null,
+        minutes: 0, timedOps: 0, totalOps: 0, jobCount: 0,
+      }
+      addInto(row, sec)
+      byKey.set(key, row)
+    }
+    return [...byKey.values()].sort((a, b) => {
+      if ((a.teamId === null) !== (b.teamId === null)) return a.teamId === null ? 1 : -1
+      const byName = a.name.localeCompare(b.name)
+      return byName !== 0 ? byName : a.key.localeCompare(b.key)
+    })
+  }, [sectionRollup, teamNameOf])
+
+  /**
+   * ── The breakdown tree: Line → Team → Section → Job ───────────────────────────────────
+   *
+   * What the screen, the "Not yet timed" list and the blank / Operations / Job sheets all
+   * render. The leaves are jobGroups and untimedJobGroups — the same two arrays as summaryJobs,
+   * already scoped by the Show filter — and ./breakdownTree only groups and sums them, so no
+   * figure here is a second derivation of anything.
+   *
+   * A hierarchy read for an older job set is still used while the new one is in flight (an
+   * unlink only ever shrinks the set, so the old read covers it); the print buttons wait for
+   * the current one.
+   */
+  const jobNodes: JobNode[] = useMemo(() => [
+    ...jobGroups.map((g) => ({
+      jobId: g.jobId, jobName: g.jobName, lineId: g.lineId, rows: g.rows, missing: g.missing,
+      minutes: g.subtotal, timedOps: g.rows.length, totalOps: g.rows.length + g.missing.length, operatorIds: g.operatorIds,
+    })),
+    ...untimedJobGroups.map((g) => ({
+      jobId: g.jobId, jobName: g.jobName, lineId: g.lineId, rows: [], missing: g.operations,
+      minutes: 0, timedOps: 0, totalOps: g.operations.length, operatorIds: g.operatorIds,
+    })),
+  ], [jobGroups, untimedJobGroups])
+
+  const tree = useMemo(() => buildBreakdownTree({
+    jobs: jobNodes, split: lineSplit, teamName: teamNameOf,
+    sectionIdOfJob: hierarchy?.sectionIdOfJob ?? NO_SECTION_IDS, sectionsById: hierarchy?.sectionsById ?? NO_SECTIONS,
+  }), [jobNodes, hierarchy, teamNameOf, lineSplit])
+
+  /** The same tree, narrowed to the jobs that still have an untimed operation. */
+  const gapTree = useMemo(() => buildBreakdownTree({
+    jobs: jobNodes.filter((j) => j.missing.length > 0), split: lineSplit, teamName: teamNameOf,
+    sectionIdOfJob: hierarchy?.sectionIdOfJob ?? NO_SECTION_IDS, sectionsById: hierarchy?.sectionsById ?? NO_SECTIONS,
+  }), [jobNodes, hierarchy, teamNameOf, lineSplit])
+
+  const totals = useMemo(() => treeRollup(tree), [tree])
+  const sectionKeys = useMemo(
+    () => tree.flatMap((l) => l.teams.flatMap((t) => t.sections.map((s) => `${l.key}|${s.key}`))),
+    [tree],
+  )
+  /** Sections where nothing at all is timed — the most actionable thing on the page. */
+  const untouchedSections = useMemo(
+    () => tree.reduce((n, l) => n + l.teams.reduce((m, t) => m + t.sections.filter((s) => s.timedOps === 0).length, 0), 0),
+    [tree],
   )
 
   /** The current selection as a short noun, for the stat-card labels and the grand-total row.
@@ -938,10 +1119,27 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
   )
 
   const [expandedJobs, setExpandedJobs] = useState<Set<string>>(new Set())
-  useEffect(() => { setExpandedJobs(new Set()) }, [productId])
+  /** Sections are OPEN unless listed here: the screen exists to show the gaps, and a closed
+   * section hides them. Keyed `line|section`, as BreakdownTable keys them. */
+  const [collapsedSections, setCollapsedSections] = useState<Set<string>>(new Set())
+  useEffect(() => { setExpandedJobs(new Set()); setCollapsedSections(new Set()) }, [productId])
   function toggleJob(jobId: string) {
     setExpandedJobs((prev) => { const next = new Set(prev); if (next.has(jobId)) next.delete(jobId); else next.add(jobId); return next })
   }
+  function toggleSection(key: string) {
+    setCollapsedSections((prev) => { const next = new Set(prev); if (next.has(key)) next.delete(key); else next.add(key); return next })
+  }
+  /** Opens the whole breakdown to one level. 'jobs' is how the page loads. */
+  function openTo(level: Depth) {
+    setCollapsedSections(level === 'sections' ? new Set(sectionKeys) : new Set())
+    setExpandedJobs(level === 'operations' ? new Set(jobNodes.map((j) => j.jobId)) : new Set())
+  }
+  /** Which segment is lit: only when the breakdown is exactly at that level. */
+  const depth: Depth | null =
+    collapsedSections.size === 0 && expandedJobs.size === 0 ? 'jobs'
+      : collapsedSections.size === 0 && jobNodes.length > 0 && jobNodes.every((j) => expandedJobs.has(j.jobId)) ? 'operations'
+        : sectionKeys.length > 0 && sectionKeys.every((k) => collapsedSections.has(k)) ? 'sections'
+          : null
 
   /**
    * ── Edit-times drill-in ────────────────────────────────────────────────────────────────
@@ -1105,41 +1303,28 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
   }
 
   // ── Printable collection sheet ──────────────────────────────────────────────────────────
-  /**
-   * The to-collect list: every job with at least one untimed operation for this model, with only
-   * its untimed operations beneath it. Both halves of the on-screen breakdown feed it — jobs with
-   * nothing timed at all (untimedJobGroups, where every operation is missing) and partially timed
-   * jobs (jobGroups, contributing just their `missing` rows) — so the sheet can't list an
-   * operation the page considers timed, or omit one it shows as a gap. Fully-timed jobs are
-   * dropped entirely: this is a work list, not a report. Jobs A–Z.
-   */
-  const printJobs = useMemo(() => {
-    const groups: { jobId: string; jobName: string; operations: MissingOpRow[] }[] = []
-    for (const g of untimedJobGroups) groups.push({ jobId: g.jobId, jobName: g.jobName, operations: g.operations })
-    for (const g of jobGroups) {
-      if (g.missing.length === 0) continue
-      groups.push({ jobId: g.jobId, jobName: g.jobName, operations: g.missing })
-    }
-    return groups.sort((a, b) => a.jobName.localeCompare(b.jobName))
-  }, [jobGroups, untimedJobGroups])
-
-  const printOperationCount = printJobs.reduce((sum, g) => sum + g.operations.length, 0)
+  /** The to-collect list is gapTree — the on-screen "Not yet timed" list, printed. So the sheet
+   * can't list an operation the page considers timed, or omit one it shows as a gap. */
+  const printOperationCount = untimedCount(totals)
 
   /**
    * ── The page's printouts ────────────────────────────────────────────────────────────────
    *
    *   'blank'   — the collection sheet: everything still to collect, with ruled blanks to write
    *               minutes into. A field document, unchanged.
-   *   'times'   — DETAILED: every job with its operations beneath it, each operation showing its
-   *               minutes. What the screen currently shows, as a document.
-   *   'summary' — JOB SUMMARY: the same jobs, one line each — job name and the job's total.
+   *   'times'   — OPERATIONS DETAIL: every job with its operations beneath it, each operation
+   *               showing its minutes. What the screen currently shows, as a document.
+   *   'summary' — JOB DETAIL: the same jobs, one line each — job name and the job's total.
    *               Nothing beneath them, and nothing beside them.
+   *   'section' — SECTION DETAIL: one line per section, the sum of its jobs, in production order.
+   *   'team'    — TEAM DETAIL: one line per team, the sum of its sections.
    *
-   * The last two are ONE document at two depths. They share TimesSheetHead, they read the same
-   * timedLineGroups, and a job's figure on either is that job's `subtotal` — the same object,
-   * not two additions that happen to agree. Only the rows under a job differ.
+   * The last four are ONE document at four grains. They share TimesSheetHead, and each grain is
+   * the grain below it summed (see "The roll-up" above): a job's figure is its `subtotal`, a
+   * section's is sectionRollup, a team's is teamRollup — never a second derivation that happens
+   * to agree.
    *
-   * Only ONE is mounted at a time. All three are `.print-sheet`, which is the class the print
+   * Only ONE is mounted at a time. Every sheet is `.print-sheet`, which is the class the print
    * rule keys off to hide the rest of the page, so having two in the DOM would print both; the
    * mode decides which exists rather than which is visible.
    */
@@ -1148,7 +1333,11 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
   // Stamped when Print is pressed rather than at render: this component server-renders too, and
   // a date evaluated during render would differ between server and client markup.
   const [printedAt, setPrintedAt] = useState<string | null>(null)
+  // Every sheet on this page prints on A4 portrait, wherever else the tab has been. The same rule
+  // as ./print.css; see lib/usePageSetup for why print.css alone isn't enough.
+  const pinPageSetup = usePageSetup(MODEL_TOTAL_PAGE_CSS)
   function handlePrint(mode: PrintMode) {
+    pinPageSetup()
     setPrintMode(mode)
     setPrintedAt(new Date().toLocaleDateString('en-AU', { day: 'numeric', month: 'short', year: 'numeric' }))
     // Two frames so the chosen sheet is mounted and painted before the print dialog snapshots
@@ -1218,14 +1407,14 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
             record. They are deliberately not three buttons in a row — that reads as three
             equivalent choices, and the first one isn't.
 
-            The record is one document at two depths, so it is one labelled control with two
-            segments rather than a dropdown. A menu to reach one of two items is a click that
-            buys nothing (the same reason the breakdown rows lost their "…" overflow menu), and
-            a dropdown would also hide the fact that a job-summary sheet exists at all. */}
+            The record is one document at four grains — Operation → Job → Section → Team, the
+            Labour Matrix's grain selector — so it is one labelled control with four segments
+            rather than a dropdown. A menu would hide the fact that the coarser sheets exist at
+            all (the same reason the breakdown rows lost their "…" overflow menu). */}
         <button
           type="button"
           className="btn-ghost"
-          disabled={!productId}
+          disabled={!productId || !hierarchyReady}
           title={productId ? 'Print a blank sheet of everything still to collect for this model, with room to write' : 'Select a model first'}
           onClick={() => handlePrint('blank')}
         >
@@ -1238,20 +1427,48 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
             <button
               type="button"
               className="btn-ghost mt-print-seg-btn"
-              disabled={!productId}
+              disabled={!productId || !hierarchyReady}
               title={productId ? `Every job with its operations beneath it, each showing its minutes — ${filterPhrase.toLowerCase()}, exactly as shown below` : 'Select a model first'}
               onClick={() => handlePrint('times')}
             >
-              Detailed
+              Operations Detail
             </button>
             <button
               type="button"
               className="btn-ghost mt-print-seg-btn"
-              disabled={!productId}
+              disabled={!productId || !hierarchyReady}
               title={productId ? `One line per job — job name and its total minutes, nothing else — ${filterPhrase.toLowerCase()}` : 'Select a model first'}
               onClick={() => handlePrint('summary')}
             >
-              Job summary
+              Job Detail
+            </button>
+            <button
+              type="button"
+              className="btn-ghost mt-print-seg-btn"
+              disabled={!productId || !hierarchyReady}
+              title={
+                !productId ? 'Select a model first'
+                  : hierarchyError ? `Could not load sections and teams — ${hierarchyError}`
+                    : !hierarchyReady ? 'Loading sections…'
+                      : `One line per section, in production order — the sum of its jobs' totals — ${filterPhrase.toLowerCase()}`
+              }
+              onClick={() => handlePrint('section')}
+            >
+              Section Detail
+            </button>
+            <button
+              type="button"
+              className="btn-ghost mt-print-seg-btn"
+              disabled={!productId || !hierarchyReady}
+              title={
+                !productId ? 'Select a model first'
+                  : hierarchyError ? `Could not load sections and teams — ${hierarchyError}`
+                    : !hierarchyReady ? 'Loading teams…'
+                      : `One line per team — the sum of its sections' totals — ${filterPhrase.toLowerCase()}`
+              }
+              onClick={() => handlePrint('team')}
+            >
+              Team Detail
             </button>
           </div>
         </div>
@@ -1351,7 +1568,7 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
           )}
 
           {/* ── Breakdown ────────────────────────────────────────────── */}
-          <div className="card" style={{ overflow: 'hidden' }}>
+          <div className="card" style={{ marginBottom: 16 }}>
             {/* ── Labour source ─────────────────────────────────────────────────────────
                 The real filter. Sits directly above the breakdown it narrows, not up with the
                 model selects, because it answers a different question from them: those choose
@@ -1383,259 +1600,113 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
                     No pre-assembly area has a job linked to this model.
                   </span>
                 ) : (
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-                    <button
-                      type="button"
-                      aria-pressed={!areaLineId}
-                      className={'labour-chip' + (!areaLineId ? ' labour-chip-on' : '')}
-                      onClick={() => setAreaLineId('')}
-                    >
-                      All areas
-                    </button>
-                    {/* Only the areas this model actually has work on — so a chip always narrows
-                        to something. A team under an area (Running Gear, under Chassis) is not a
-                        chip of its own: the line is what labour is attributed to. */}
-                    {preAssemblyAreas.map((a) => (
-                      <button
-                        key={a.id}
-                        type="button"
-                        aria-pressed={areaLineId === a.id}
-                        className={'labour-chip' + (areaLineId === a.id ? ' labour-chip-on' : '')}
-                        onClick={() => setAreaLineId(a.id)}
-                      >
-                        {a.name}
-                      </button>
-                    ))}
-                  </div>
+                  // Only the areas this model actually has work on — so a chip always narrows
+                  // to something. A team under an area (Running Gear, under Chassis) is not a
+                  // chip of its own: the line is what labour is attributed to.
+                  <AreaChips areas={preAssemblyAreas} value={areaLineId} onChange={setAreaLineId} />
                 )
               )}
             </div>
 
-            <div style={{ padding: '14px 20px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+            <div style={{ padding: '14px 20px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
               <div>
-                <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>Breakdown by Job</span>
+                <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>Breakdown by team and section</span>
                 <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '2px 0 0' }}>
-                  Grouped by production line, jobs A–Z{scopeLabel && <> · {scopeLabel} only</>}
+                  Team, then section in line order, jobs A–Z{scopeLabel && <> · {scopeLabel} only</>}
                 </p>
+                {/* The gap, stated — not left for the reader to subtract or scroll for. */}
+                {jobNodes.length > 0 && (
+                  <p style={{ fontSize: 12, margin: '6px 0 0', color: 'var(--text-mid)' }}>
+                    {untimedCount(totals) === 0 ? (
+                      <span className="badge badge-green">Every applicable operation is timed</span>
+                    ) : (
+                      <>
+                        <strong className="mt-untimed">{plural(untimedCount(totals), 'operation')} not yet timed</strong>
+                        {' '}of {totals.totalOps}
+                        {untouchedSections > 0 && <> · <strong className="mt-untimed">{plural(untouchedSections, 'section')}</strong> with nothing timed</>}
+                        {' · '}<a href="#not-yet-timed" style={{ color: 'var(--blue)', fontWeight: 600 }}>See the list ↓</a>
+                      </>
+                    )}
+                  </p>
+                )}
               </div>
-              {(jobGroups.length > 0 || untimedJobGroups.length > 0) && (
-                <div style={{ display: 'flex', gap: 10, flexShrink: 0 }}>
-                  <button
-                    type="button"
-                    onClick={() => setExpandedJobs(new Set([...jobGroups, ...untimedJobGroups].map((g) => g.jobId)))}
-                    style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-mid)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'inherit' }}
-                  >
-                    Expand all
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setExpandedJobs(new Set())}
-                    style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-mid)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'inherit' }}
-                  >
-                    Collapse all
-                  </button>
+              {jobNodes.length > 0 && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+                  <span style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)' }}>Open to</span>
+                  <div className="labour-seg" role="group" aria-label="How far the breakdown is opened">
+                    {DEPTHS.map((d) => (
+                      <button
+                        key={d.key} type="button" title={d.hint}
+                        aria-pressed={depth === d.key}
+                        className={'labour-seg-btn' + (depth === d.key ? ' labour-seg-btn-on' : '')}
+                        onClick={() => openTo(d.key)}
+                      >
+                        {d.label}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               )}
             </div>
-
-            {jobGroups.length === 0 && untimedJobGroups.length === 0 ? (
-              <p style={EMPTY}>
-                {loading ? 'Loading…'
-                  : scopeLabel ? `No ${scopeLabel.toLowerCase()} jobs for this model — switch Show back to All to see the rest.`
-                    : 'No jobs require this model yet'}
-              </p>
-            ) : (
-              <div style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {/* Column header — same GRID_COLS template as every job card and the grand
-                    total below, so MINS/HISTORY line up card-to-card no matter which jobs are
-                    expanded (a job card's own width never depends on its neighbours' content). */}
-                <div style={{ display: 'grid', gridTemplateColumns: GRID_COLS, gap: GRID_GAP, padding: '0 14px' }}>
-                  <span style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)' }}>Operation</span>
-                  <span style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', textAlign: 'right' }}>Mins</span>
-                  {/* Was RUNS, when the figure was their average. The figure is one record now,
-                      so what matters beside it is how much it replaced. */}
-                  <span style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', textAlign: 'right' }}>History</span>
-                  {/* ACTIONS — empty in the header, but the column is declared so the three
-                      figure columns above every row line up with the ones below. */}
-                  <span />
-                </div>
-
-                {untimedJobGroups.length > 0 && (
-                  <>
-                    <div style={{ padding: '4px 14px 0', fontSize: 12, fontWeight: 700, color: 'var(--text)' }}>
-                      Not yet timed <span style={{ fontWeight: 400, color: 'var(--text-muted)' }}>({untimedJobGroups.length})</span>
-                    </div>
-                    {untimedLineGroups.map((lg) => (
-                      <div key={lg.lineId ?? 'no-line'} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                        {/* No minutes on this heading: every job under it is untimed, so a
-                            subtotal here would only ever be 0m. */}
-                        <LineHeading name={lg.lineName} jobCount={lg.jobs.length} subtotal={0} showSubtotal={false} />
-                        {lg.jobs.map((g) => {
-                          const isOpen = expandedJobs.has(g.jobId)
-                          const operatorLabel = operatorLabelFor(g.operatorIds)
-                          return (
-                            <div key={g.jobId} style={{ border: '1px solid var(--border)', borderRadius: 10, background: 'var(--surface)', overflow: 'hidden' }}>
-                              <BreakdownRow
-                                variant="header"
-                                expanded={isOpen}
-                                onClick={() => toggleJob(g.jobId)}
-                                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleJob(g.jobId) } }}
-                                label={
-                                  <JobLabel name={g.jobName} open={isOpen} operatorLabel={operatorLabel}>
-                                    <button
-                                      type="button"
-                                      onClick={(e) => { e.stopPropagation(); openAddTime(g.jobId, g.jobName) }}
-                                      style={{ fontSize: 11, fontWeight: 600, color: 'var(--blue)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'inherit', padding: 0 }}
-                                    >
-                                      Add Time
-                                    </button>
-                                  </JobLabel>
-                                }
-                                minutes="0m"
-                                minutesStyle={{ fontWeight: 700, color: 'var(--red)' }}
-                                onUnlink={() => unlinkJob(g.jobId, g.jobName)}
-                                unlinkTitle={`${UNLINK_LABEL} — remove ${g.jobName} from ${selectedProduct?.model ?? 'this model'}. The job, its operations and every recorded time are kept.`}
-                              />
-
-                              {isOpen && (
-                                <div style={{ borderTop: '1px solid var(--border)' }}>
-                                  {g.operations.map((op) => (
-                                    <BreakdownRow
-                                      key={op.operationId}
-                                      style={{ color: 'var(--text-muted)' }}
-                                      label={
-                                        <>
-                                          <span>{op.operationName}</span> <span style={{ fontSize: 11 }}>· not timed</span>{' '}
-                                          <button
-                                            type="button"
-                                            onClick={() => openAddTime(g.jobId, g.jobName, op.operationId)}
-                                            style={{ fontSize: 11, fontWeight: 600, color: 'var(--blue)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'inherit', padding: 0 }}
-                                          >
-                                            Add Time
-                                          </button>
-                                        </>
-                                      }
-                                      minutes="—"
-                                      history="0"
-                                      onUnlink={() => unlinkOperation(g.jobId, g.jobName, op.operationId, op.operationName)}
-                                      unlinkTitle={`${UNLINK_LABEL} — remove ${op.operationName} from ${selectedProduct?.model ?? 'this model'}. The operation itself is not deleted.`}
-                                    />
-                                  ))}
-                                </div>
-                              )}
-                            </div>
-                          )
-                        })}
-                      </div>
-                    ))}
-                    <div style={{ padding: '4px 14px 0', fontSize: 12, fontWeight: 700, color: 'var(--text)' }}>
-                      Timed <span style={{ fontWeight: 400, color: 'var(--text-muted)' }}>({jobGroups.length})</span>
-                    </div>
-                  </>
-                )}
-
-                {timedLineGroups.map((lg) => (
-                  <div key={lg.lineId ?? 'no-line'} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                    <LineHeading name={lg.lineName} jobCount={lg.jobs.length} subtotal={lg.subtotal} showSubtotal />
-                    {lg.jobs.map((g) => {
-                      const isOpen = expandedJobs.has(g.jobId)
-                      const operatorLabel = operatorLabelFor(g.operatorIds)
-                      return (
-                        <div key={g.jobId} style={{ border: '1px solid var(--border)', borderRadius: 10, background: 'var(--surface)', overflow: 'hidden' }}>
-                          <BreakdownRow
-                            variant="header"
-                            expanded={isOpen}
-                            onClick={() => toggleJob(g.jobId)}
-                            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleJob(g.jobId) } }}
-                            label={<JobLabel name={g.jobName} open={isOpen} operatorLabel={operatorLabel} />}
-                            minutes={`${fmtMinutes(g.subtotal)}m`}
-                            minutesStyle={{ fontWeight: 700, color: 'var(--blue)' }}
-                            onUnlink={() => unlinkJob(g.jobId, g.jobName)}
-                            unlinkTitle={`${UNLINK_LABEL} — remove ${g.jobName} from ${selectedProduct?.model ?? 'this model'}. The job, its operations and every recorded time are kept.`}
-                          />
-
-                          {isOpen && (
-                            <div style={{ borderTop: '1px solid var(--border)' }}>
-                              {/* A timed row drills into its records. The whole row is the target —
-                                  its average IS those records, so "open what this number is made of"
-                                  is the natural thing a click here means. */}
-                              {g.rows.map((r) => (
-                                <BreakdownRow
-                                  key={r.operationId}
-                                  style={{ color: 'var(--text-mid)' }}
-                                  title={`Current time for this model — ${historyLabel({ minutes: r.minutes, currentId: '', archived: r.archived })}. Open to edit or promote an earlier record.`}
-                                  onClick={() => setEditTimesTarget({ operationId: r.operationId, operationName: r.operationName })}
-                                  onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setEditTimesTarget({ operationId: r.operationId, operationName: r.operationName }) } }}
-                                  label={
-                                    <>
-                                      <span>{r.operationName}</span>{' '}
-                                      {copiedSourceByOperation[r.operationId] && (
-                                        <span
-                                          title={`Copied from ${copiedSourceByOperation[r.operationId]} — this figure was copied from another model, not measured on this one.`}
-                                          style={{
-                                            fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em',
-                                            color: 'var(--text-muted)', border: '1px solid var(--border)', borderRadius: 4,
-                                            padding: '1px 4px', marginRight: 4, whiteSpace: 'nowrap',
-                                          }}
-                                        >
-                                          copied
-                                        </span>
-                                      )}
-                                      <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--blue)' }}>Edit times</span>
-                                    </>
-                                  }
-                                  minutes={`${fmtMinutes(r.minutes)}m`}
-                                  history={r.archived === 0 ? 'current' : `+${r.archived}`}
-                                  onUnlink={() => unlinkOperation(g.jobId, g.jobName, r.operationId, r.operationName)}
-                                  unlinkTitle={`${UNLINK_LABEL} — remove ${r.operationName} from ${selectedProduct?.model ?? 'this model'}. Its recorded times are kept, they just stop counting for this model.`}
-                                />
-                              ))}
-                              {g.missing.map((m) => (
-                                <BreakdownRow
-                                  key={m.operationId}
-                                  style={{ color: 'var(--text-muted)' }}
-                                  label={
-                                    <>
-                                      <span>{m.operationName}</span> <span style={{ fontSize: 11 }}>· not timed</span>{' '}
-                                      <button
-                                        type="button"
-                                        onClick={() => openAddTime(g.jobId, g.jobName, m.operationId)}
-                                        style={{ fontSize: 11, fontWeight: 600, color: 'var(--blue)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'inherit', padding: 0 }}
-                                      >
-                                        Add Time
-                                      </button>
-                                    </>
-                                  }
-                                  minutes="—"
-                                  history="0"
-                                  onUnlink={() => unlinkOperation(g.jobId, g.jobName, m.operationId, m.operationName)}
-                                  unlinkTitle={`${UNLINK_LABEL} — remove ${m.operationName} from ${selectedProduct?.model ?? 'this model'}. The operation itself is not deleted.`}
-                                />
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                      )
-                    })}
-                  </div>
-                ))}
-
-                {/* Grand total — same GRID_COLS template again; must equal the headline. */}
-                <div style={{ display: 'grid', gridTemplateColumns: GRID_COLS, gap: GRID_GAP, padding: '12px 14px', borderTop: '2px solid var(--border)' }}>
-                  <span style={{ fontWeight: 700, color: 'var(--text)' }}>
-                    Grand total{scopeLabel && <span style={{ fontWeight: 400, color: 'var(--text-muted)' }}> · {scopeLabel}</span>}
-                  </span>
-                  <span style={{ fontWeight: 700, color: 'var(--blue)', textAlign: 'right' }}>{fmtMinutes(visibleTotalMinutes)}m</span>
-                  <span />
-                  <span />
-                </div>
-              </div>
-            )}
           </div>
+
+          {hierarchyError && (
+            <p style={{ margin: '0 0 16px', padding: '9px 12px', borderRadius: 8, background: 'var(--red-bg)', border: '1px solid #fecaca', color: 'var(--red)', fontSize: 12 }}>
+              Could not load sections and teams — {hierarchyError}. The jobs below are listed without their grouping.
+            </p>
+          )}
+
+          {jobNodes.length === 0 ? (
+            <p style={EMPTY}>
+              {loading ? 'Loading…'
+                : scopeLabel ? `No ${scopeLabel.toLowerCase()} jobs for this model — switch Show back to All to see the rest.`
+                  : 'No jobs require this model yet'}
+            </p>
+          ) : !hierarchy && !hierarchyError ? (
+            <p style={EMPTY}>Loading sections…</p>
+          ) : (
+            <>
+              <BreakdownTable
+                lines={tree}
+                showLineHeadings={tree.length > 1 || labourSource === 'all'}
+                modelName={selectedProduct?.model ?? 'this model'}
+                total={totals}
+                totalLabel={<>Grand total{scopeLabel && <span style={{ fontWeight: 400, color: 'var(--text-muted)' }}> · {scopeLabel}</span>}</>}
+                collapsedSections={collapsedSections}
+                onToggleSection={toggleSection}
+                expandedJobs={expandedJobs}
+                onToggleJob={toggleJob}
+                operatorLabelFor={operatorLabelFor}
+                copiedSourceByOperation={copiedSourceByOperation}
+                onAddTime={openAddTime}
+                onEditTimes={(operationId, operationName) => setEditTimesTarget({ operationId, operationName })}
+                onUnlinkJob={unlinkJob}
+                onUnlinkOperation={unlinkOperation}
+              />
+
+              {/* ── Not yet timed ────────────────────────────────────────
+                  The same tree narrowed to the jobs with a gap, listing only their untimed
+                  operations — the on-screen twin of "Print blank sheet", which prints this
+                  very list. */}
+              <div id="not-yet-timed" style={{ margin: '28px 0 12px', scrollMarginTop: 72 }}>
+                <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>
+                  Not yet timed <span style={{ fontWeight: 400, color: 'var(--text-muted)' }}>({plural(untimedCount(totals), 'operation')})</span>
+                </span>
+                <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '2px 0 0' }}>
+                  Every operation that applies to this model and has no recorded time, by team and section{scopeLabel && <> · {scopeLabel} only</>}
+                </p>
+              </div>
+              {gapTree.length === 0 ? (
+                <p style={EMPTY}>Nothing left to time — every operation that applies to this model has a recorded time.</p>
+              ) : (
+                <NotYetTimedTable lines={gapTree} showLineHeadings={gapTree.length > 1 || labourSource === 'all'} onAddTime={openAddTime} />
+              )}
+            </>
+          )}
         </>
       )}
 
-      {/* ── Printable recorded-times sheet · DETAILED ───────────────────────────────────
+      {/* ── Printable recorded-times sheet · OPERATIONS DETAIL ──────────────────────────
           The screen's filtered view as a document, jobs with their operations beneath them. It
           reads the SAME derived values the page renders — timedLineGroups, untimedLineGroups,
           visibleTotalMinutes, jobsTimed — rather than re-deriving anything, so a filtered sheet
@@ -1650,7 +1721,7 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
       {productId && printMode === 'times' && (
         <div className="print-sheet rp-doc mt-times-sheet">
           <TimesSheetHead
-            variantLabel="Detailed"
+            variantLabel="Operations Detail"
             model={selectedProduct?.model ?? '—'}
             productCode={selectedProduct?.product_code ?? null}
             lineName={printLineName}
@@ -1662,119 +1733,90 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
             printedAt={printedAt}
           />
 
-          {timedLineGroups.length === 0 ? (
-            <p className="rp-meta">No timed jobs in this selection.</p>
+          {tree.length === 0 ? (
+            <p className="rp-meta">No jobs apply to this model in this selection.</p>
           ) : (
-            <table className="rp-table mt-times-table">
-              <thead>
-                <tr>
-                  <th className="mt-col-name">Production line · job · operation</th>
-                  <th className="mt-col-mins rp-num">Mins</th>
-                </tr>
-              </thead>
-              {/* A tbody per line for its heading, then A TBODY PER JOB — because tbody is the
-                  only element inside a table that `break-inside: avoid` can be hung on, and a
-                  job's block (its heading, its operations, its untimed gaps) is what must not be
-                  torn across two sheets. A job longer than a sheet still splits; the browser
-                  falls back rather than leaving a blank page, which is the right failure. */}
-              {timedLineGroups.map((lg) => (
-                <Fragment key={lg.lineId ?? 'no-line'}>
-                  <tbody>
-                    <tr className="rp-group">
-                      <td>{lg.lineName} <span style={{ fontWeight: 400 }}>· {plural(lg.jobs.length, 'job')}</span></td>
-                      <td className="rp-num">{fmtMinutes(lg.subtotal)}m</td>
-                    </tr>
-                  </tbody>
-                  {lg.jobs.map((g) => (
-                    <tbody key={g.jobId} className="mt-times-jobblock">
-                      {/* rp-subhead: a job heading is never the last thing on a sheet, so a job
-                          and its first operation are not split by a page break. */}
-                      {/* A partially timed job is marked HERE, not left to the reader to notice
-                          from the "· not timed" rows below it — the heading's figure is what
-                          gets copied off the sheet, and on its own it reads as the whole job. */}
-                      <tr className="rp-subhead">
-                        <td className={`mt-times-job${rowClass(g.rows.length, g.rows.length + g.missing.length)}`}>
-                          {g.jobName}
-                          <JobStatusNote timedOps={g.rows.length} totalOps={g.rows.length + g.missing.length} />
-                        </td>
-                        <td className={`rp-num mt-times-job${rowClass(g.rows.length, g.rows.length + g.missing.length)}`}>
-                          {jobFigure(g.subtotal, g.rows.length, g.rows.length + g.missing.length)}
-                        </td>
-                      </tr>
-                      {g.rows.map((r) => (
-                        <tr key={r.operationId}>
-                          <td className="mt-times-op">{r.operationName}</td>
-                          <td className="rp-num">{fmtMinutes(r.minutes)}m</td>
-                        </tr>
+            <>
+              {/* Line → Team → ONE TABLE PER SECTION, the same tree the screen renders. A table
+                  per section because its <thead> is what a browser repeats on every sheet the
+                  section runs onto — so it names the team AND the section, and both come back at
+                  the top of each page. */}
+              {tree.map((line) => (
+                <Fragment key={line.key}>
+                  <SheetGroupHead level="line" name={line.lineName} r={line} />
+                  {line.teams.map((team) => (
+                    <Fragment key={team.key}>
+                      <SheetGroupHead level="team" name={`${team.name} · ${plural(team.sectionCount, 'section')}`} r={team} />
+                      {team.sections.map((section) => (
+                        <table key={section.key} className="rp-table mt-times-table mt-sec-table">
+                          <thead>
+                            <tr>
+                              <th className="mt-col-name mt-sec-head">{team.name} · {sectionLabel(section)}</th>
+                              <th className="mt-col-mins rp-num">Mins</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            <tr className="rp-group">
+                              <td className={rowClass(section.timedOps, section.totalOps).trim()}>
+                                {section.timedOps === 0 && 'NOTHING TIMED — '}{rollupPhrase(section)}
+                              </td>
+                              <td className={`rp-num${rowClass(section.timedOps, section.totalOps)}`}>
+                                {jobFigure(section.minutes, section.timedOps, section.totalOps)}
+                              </td>
+                            </tr>
+                          </tbody>
+                          {/* A TBODY PER JOB — tbody is the only element inside a table that
+                              `break-inside: avoid` can be hung on, and a job's block (its heading,
+                              its operations, its untimed gaps) is what must not be torn across two
+                              sheets. A job longer than a sheet still splits. */}
+                          {section.jobs.map((g) => (
+                            <tbody key={g.jobId} className="mt-times-jobblock">
+                              {/* rp-subhead: a job heading is never the last thing on a sheet. A
+                                  partly timed job is marked HERE — the heading's figure is what
+                                  gets copied off the sheet, and alone it reads as the whole job. */}
+                              <tr className="rp-subhead">
+                                <td className={`mt-times-job${rowClass(g.timedOps, g.totalOps)}`}>
+                                  {g.jobName}
+                                  <JobStatusNote timedOps={g.timedOps} totalOps={g.totalOps} />
+                                </td>
+                                <td className={`rp-num mt-times-job${rowClass(g.timedOps, g.totalOps)}`}>
+                                  {jobFigure(g.minutes, g.timedOps, g.totalOps)}
+                                </td>
+                              </tr>
+                              {g.rows.map((r) => (
+                                <tr key={r.operationId}>
+                                  <td className="mt-times-op">{r.operationName}</td>
+                                  <td className="rp-num">{fmtMinutes(r.minutes)}m</td>
+                                </tr>
+                              ))}
+                              {/* Untimed operations. Italic, not grey: the screen greys them and
+                                  grey does not survive a mono printer. */}
+                              {g.missing.map((m) => (
+                                <tr key={m.operationId}>
+                                  <td className="mt-times-op mt-times-untimed">{m.operationName} · not timed</td>
+                                  <td className="rp-num mt-times-untimed">—</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          ))}
+                        </table>
                       ))}
-                      {/* Untimed operations inside an otherwise-timed job. Italic, not grey:
-                          the screen greys them and grey does not survive a mono printer. */}
-                      {g.missing.map((m) => (
-                        <tr key={m.operationId}>
-                          <td className="mt-times-op mt-times-untimed">{m.operationName} · not timed</td>
-                          <td className="rp-num mt-times-untimed">—</td>
-                        </tr>
-                      ))}
-                    </tbody>
+                    </Fragment>
                   ))}
                 </Fragment>
               ))}
-              <tbody>
-                {/* The total is unchanged — the sum of every current record in scope, with an
-                    untimed operation contributing 0. The asterisk doesn't alter it; it says the
-                    figure is not the model's full labour content, which the coverage in the
-                    header quantifies. */}
-                <tr className="mt-times-grand">
-                  <td className="mt-times-total">Total · {filterPhrase}</td>
-                  <td className="rp-num mt-times-total">
-                    {fmtMinutes(visibleTotalMinutes)}m{anyIncomplete ? '*' : ''}
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          )}
-
-          {untimedLineGroups.length > 0 && (
-            <>
-              <p className="mt-times-heading">
-                Not yet timed ({untimedJobGroups.length}) — contributing {fmtMinutes(0)}m
-              </p>
-              <table className="rp-table mt-times-table">
-                <thead>
-                  <tr>
-                    <th className="mt-col-name">Production line · job · operation</th>
-                    <th className="mt-col-mins rp-num">Mins</th>
+              {/* The total is the sum of every current record in scope, an untimed operation
+                  contributing 0. The asterisk doesn't alter it; it says the figure is not the
+                  model's full labour content, which the counts beside it quantify. */}
+              <table className="rp-table mt-times-table mt-sec-table">
+                <tbody>
+                  <tr className="mt-times-grand">
+                    <td className="mt-col-name mt-times-total">Total · {filterPhrase} · {rollupPhrase(totals)}</td>
+                    <td className="mt-col-mins rp-num mt-times-total">
+                      {fmtMinutes(visibleTotalMinutes)}m{anyIncomplete ? '*' : ''}
+                    </td>
                   </tr>
-                </thead>
-                {untimedLineGroups.map((lg) => (
-                  <Fragment key={lg.lineId ?? 'no-line'}>
-                    <tbody>
-                      <tr className="rp-group">
-                        <td>{lg.lineName} <span style={{ fontWeight: 400 }}>· {plural(lg.jobs.length, 'job')}</span></td>
-                        <td className="rp-num">{fmtMinutes(0)}m</td>
-                      </tr>
-                    </tbody>
-                    {lg.jobs.map((g) => (
-                      <tbody key={g.jobId} className="mt-times-jobblock">
-                        <tr className="rp-subhead">
-                          <td className={`mt-times-job${rowClass(0, g.operations.length)}`}>
-                            {g.jobName}
-                            <JobStatusNote timedOps={0} totalOps={g.operations.length} />
-                          </td>
-                          <td className={`rp-num mt-times-job${rowClass(0, g.operations.length)}`}>
-                            {jobFigure(0, 0, g.operations.length)}
-                          </td>
-                        </tr>
-                        {g.operations.map((op) => (
-                          <tr key={op.operationId}>
-                            <td className="mt-times-op mt-times-untimed">{op.operationName}</td>
-                            <td className="rp-num mt-times-untimed">—</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    ))}
-                  </Fragment>
-                ))}
+                </tbody>
               </table>
             </>
           )}
@@ -1788,7 +1830,7 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
         </div>
       )}
 
-      {/* ── Printable recorded-times sheet · JOB SUMMARY ────────────────────────────────
+      {/* ── Printable recorded-times sheet · JOB DETAIL ─────────────────────────────────
           The same document as the detailed sheet above, at one level less depth: one line per
           job, the job's name and the job's total minutes. No operations, no operator, no run
           counts — the header says what this is a total of, and anything else here would make it
@@ -1807,7 +1849,7 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
       {productId && printMode === 'summary' && (
         <div className="print-sheet rp-doc mt-times-sheet">
           <TimesSheetHead
-            variantLabel="Job summary"
+            variantLabel="Job Detail"
             model={selectedProduct?.model ?? '—'}
             productCode={selectedProduct?.product_code ?? null}
             lineName={printLineName}
@@ -1819,43 +1861,129 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
             printedAt={printedAt}
           />
 
-          {summaryLineGroups.length === 0 ? (
+          {tree.length === 0 ? (
+            <p className="rp-meta">No jobs apply to this model in this selection.</p>
+          ) : (
+            <>
+              {/* Line → Team → ONE TABLE PER SECTION, the same tree the screen renders. A table
+                  per section because its <thead> is what a browser repeats on every sheet the
+                  section runs onto — so it names the team AND the section, and both come back at
+                  the top of each page. */}
+              {tree.map((line) => (
+                <Fragment key={line.key}>
+                  <SheetGroupHead level="line" name={line.lineName} r={line} />
+                  {line.teams.map((team) => (
+                    <Fragment key={team.key}>
+                      <SheetGroupHead level="team" name={`${team.name} · ${plural(team.sectionCount, 'section')}`} r={team} />
+                      {team.sections.map((section) => (
+                        <table key={section.key} className="rp-table mt-times-table mt-sec-table">
+                          <thead>
+                            <tr>
+                              <th className="mt-col-name mt-sec-head">{team.name} · {sectionLabel(section)}</th>
+                              <th className="mt-col-mins rp-num">Mins</th>
+                            </tr>
+                          </thead>
+                          {/* A job IS one row here, and a row is already unbreakable (.rp-table tr). */}
+                          <tbody>
+                            <tr className="rp-group">
+                              <td className={rowClass(section.timedOps, section.totalOps).trim()}>
+                                {section.timedOps === 0 && 'NOTHING TIMED — '}{rollupPhrase(section)}
+                              </td>
+                              <td className={`rp-num${rowClass(section.timedOps, section.totalOps)}`}>
+                                {jobFigure(section.minutes, section.timedOps, section.totalOps)}
+                              </td>
+                            </tr>
+                            {section.jobs.map((j) => (
+                              <tr key={j.jobId}>
+                                <td className={`mt-times-op${rowClass(j.timedOps, j.totalOps)}`}>
+                                  {j.jobName}
+                                  <JobStatusNote timedOps={j.timedOps} totalOps={j.totalOps} />
+                                </td>
+                                {/* 0.0m, never blank: a job that applies and has no recorded time
+                                    contributes exactly zero, and the row shows what it contributes. */}
+                                <td className={`rp-num${rowClass(j.timedOps, j.totalOps)}`}>
+                                  {jobFigure(j.minutes, j.timedOps, j.totalOps)}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      ))}
+                    </Fragment>
+                  ))}
+                </Fragment>
+              ))}
+              {/* The total is the sum of every current record in scope, an untimed operation
+                  contributing 0. The asterisk doesn't alter it; it says the figure is not the
+                  model's full labour content, which the counts beside it quantify. */}
+              <table className="rp-table mt-times-table mt-sec-table">
+                <tbody>
+                  <tr className="mt-times-grand">
+                    <td className="mt-col-name mt-times-total">Total · {filterPhrase} · {rollupPhrase(totals)}</td>
+                    <td className="mt-col-mins rp-num mt-times-total">
+                      {fmtMinutes(visibleTotalMinutes)}m{anyIncomplete ? '*' : ''}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </>
+          )}
+
+          <p className="rp-foot">
+            {selectedProduct?.model ?? '—'} · {filterPhrase} · every job that applies to this
+            model is listed; each figure is the sum of that job's operations' current recorded
+            times, and superseded runs are kept but never counted. Print Operations Detail for
+            the operations behind each job.
+            {anyIncomplete && <><br />{INCOMPLETE_NOTE}</>}
+          </p>
+        </div>
+      )}
+
+      {/* ── Printable recorded-times sheet · SECTION DETAIL ──────────────────────────────
+          Job Detail one grain up: one flat row per section, in the line's sequence — sort_order
+          alone, then name (lib/sections' compareSections, shared with the Labour Matrix). Each row is
+          sectionRollup — the section's summaryJobs rows summed. Nothing is read or re-derived
+          here, so the rows sum to the total in the header and to every other sheet. */}
+      {productId && printMode === 'section' && (
+        <div className="print-sheet rp-doc mt-times-sheet">
+          <TimesSheetHead
+            variantLabel="Section Detail"
+            model={selectedProduct?.model ?? '—'}
+            productCode={selectedProduct?.product_code ?? null}
+            lineName={printLineName}
+            seriesName={printSeriesName}
+            filterPhrase={filterPhrase}
+            totalMinutes={visibleTotalMinutes}
+            jobsTimed={jobsTimed}
+            jobsRequired={jobsRequired}
+            printedAt={printedAt}
+          />
+
+          {sectionRollup.length === 0 ? (
             <p className="rp-meta">No jobs apply to this model in this selection.</p>
           ) : (
             <table className="rp-table mt-times-table">
               <thead>
                 <tr>
-                  <th className="mt-col-name">Production line · job</th>
+                  <th className="mt-col-name">Section</th>
                   <th className="mt-col-mins rp-num">Mins</th>
                 </tr>
               </thead>
-              {/* One tbody per line, and no per-job tbody: a job IS one row here, and a row is
-                  already unbreakable (.rp-table tr). The line grouping is kept because it is the
-                  grouping the screen and the detailed sheet both use — under "All", a model's
-                  build-line jobs and the pre-assembly areas feeding it are in the same list, and
-                  only the grouping tells them apart. */}
-              {summaryLineGroups.map((lg) => (
-                <tbody key={lg.lineId ?? 'no-line'}>
-                  <tr className="rp-group">
-                    <td>{lg.lineName} <span style={{ fontWeight: 400 }}>· {plural(lg.jobs.length, 'job')}</span></td>
-                    <td className="rp-num">{fmtMinutes(lg.subtotal)}m</td>
+              {/* One flat list in the line's sequence — no team rows, no team subtotals and no
+                  team influence on the order; Team Detail is the sheet for teams. */}
+              <tbody>
+                {sectionRollup.map((sec) => (
+                  <tr key={sec.key}>
+                    <td className={`mt-times-op${rowClass(sec.timedOps, sec.totalOps)}`}>
+                      {sec.name} <span style={{ fontWeight: 400 }}>· {plural(sec.jobCount, 'job')}</span>
+                      <JobStatusNote timedOps={sec.timedOps} totalOps={sec.totalOps} />
+                    </td>
+                    <td className={`rp-num${rowClass(sec.timedOps, sec.totalOps)}`}>
+                      {jobFigure(sec.minutes, sec.timedOps, sec.totalOps)}
+                    </td>
                   </tr>
-                  {lg.jobs.map((j) => (
-                    <tr key={j.jobId}>
-                      <td className={`mt-times-op${rowClass(j.timedOps, j.totalOps)}`}>
-                        {j.jobName}
-                        <JobStatusNote timedOps={j.timedOps} totalOps={j.totalOps} />
-                      </td>
-                      {/* 0.0m, never blank and never an em dash: a job that applies to this model
-                          and has no recorded time contributes exactly zero to the total above,
-                          and the row has to show the figure it contributes. */}
-                      <td className={`rp-num${rowClass(j.timedOps, j.totalOps)}`}>
-                        {jobFigure(j.minutes, j.timedOps, j.totalOps)}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              ))}
+                ))}
+              </tbody>
               <tbody>
                 <tr className="mt-times-grand">
                   <td className="mt-times-total">Total · {filterPhrase}</td>
@@ -1868,10 +1996,72 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
           )}
 
           <p className="rp-foot">
-            {selectedProduct?.model ?? '—'} · {filterPhrase} · every job that applies to this
-            model is listed; each figure is the sum of that job's operations' current recorded
-            times, and superseded runs are kept but never counted. Print the detailed sheet for
-            the operations behind each job.
+            {selectedProduct?.model ?? '—'} · {filterPhrase} · each section's figure is the sum of
+            its jobs' totals, each job's the sum of its operations' current recorded times;
+            superseded runs are kept but never counted. Print Job Detail for the jobs behind each
+            section.
+            {anyIncomplete && <><br />{INCOMPLETE_NOTE}</>}
+          </p>
+        </div>
+      )}
+
+      {/* ── Printable recorded-times sheet · TEAM DETAIL ─────────────────────────────────
+          One row per team, alphabetical (teams carry no production order of their own), "No
+          team" last. Each row is teamRollup — the team's sectionRollup rows summed — so it is the
+          same figure as that team's heading on the Section Detail sheet. */}
+      {productId && printMode === 'team' && (
+        <div className="print-sheet rp-doc mt-times-sheet">
+          <TimesSheetHead
+            variantLabel="Team Detail"
+            model={selectedProduct?.model ?? '—'}
+            productCode={selectedProduct?.product_code ?? null}
+            lineName={printLineName}
+            seriesName={printSeriesName}
+            filterPhrase={filterPhrase}
+            totalMinutes={visibleTotalMinutes}
+            jobsTimed={jobsTimed}
+            jobsRequired={jobsRequired}
+            printedAt={printedAt}
+          />
+
+          {teamRollup.length === 0 ? (
+            <p className="rp-meta">No jobs apply to this model in this selection.</p>
+          ) : (
+            <table className="rp-table mt-times-table">
+              <thead>
+                <tr>
+                  <th className="mt-col-name">Team</th>
+                  <th className="mt-col-mins rp-num">Mins</th>
+                </tr>
+              </thead>
+              <tbody>
+                {teamRollup.map((t) => (
+                  <tr key={t.key}>
+                    <td className={`mt-times-op${rowClass(t.timedOps, t.totalOps)}`}>
+                      {t.name} <span style={{ fontWeight: 400 }}>· {plural(t.jobCount, 'job')}</span>
+                      <JobStatusNote timedOps={t.timedOps} totalOps={t.totalOps} />
+                    </td>
+                    <td className={`rp-num${rowClass(t.timedOps, t.totalOps)}`}>
+                      {jobFigure(t.minutes, t.timedOps, t.totalOps)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+              <tbody>
+                <tr className="mt-times-grand">
+                  <td className="mt-times-total">Total · {filterPhrase}</td>
+                  <td className="rp-num mt-times-total">
+                    {fmtMinutes(visibleTotalMinutes)}m{anyIncomplete ? '*' : ''}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          )}
+
+          <p className="rp-foot">
+            {selectedProduct?.model ?? '—'} · {filterPhrase} · each team's figure is the sum of its
+            sections' totals — a job's team is its section's team. Superseded runs are kept but
+            never counted. Print Section Detail for the sections behind each team.
             {anyIncomplete && <><br />{INCOMPLETE_NOTE}</>}
           </p>
         </div>
@@ -1907,28 +2097,67 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
             </p>
           </div>
 
-          {printJobs.length === 0 ? (
+          {gapTree.length === 0 ? (
             <p>Nothing to collect — every operation required for this model has a recorded time.</p>
           ) : (
-            printJobs.map((g) => (
-              <div key={g.jobId} className="print-job">
-                <h2 className="print-job-name">
-                  {g.jobName} ({g.operations.length} to collect)
-                </h2>
-                {g.operations.map((op) => (
-                  <div key={op.operationId} className="print-op">
-                    <div className="print-op-name">
-                      <span className="print-checkbox" />
-                      {op.operationName}
-                    </div>
-                    <div className="print-fields">
-                      Operator:<span className="print-blank print-blank-operator" />
-                      Minutes:<span className="print-blank print-blank-minutes" />
-                      Notes:<span className="print-blank print-blank-notes" />
-                    </div>
-                  </div>
+            // Line → Team → ONE TABLE PER SECTION. The table is what makes the heading come back:
+            // a <thead> is the only thing a browser repeats at the top of each sheet a block runs
+            // onto, so every section's names its team and section, and a sheet picked up off the
+            // floor says whose work it lists without the sheet before it.
+            gapTree.map((line) => (
+              <Fragment key={line.key}>
+                <p className="print-line-name">
+                  {line.lineName} · {untimedCount(line)} to collect
+                </p>
+                {line.teams.map((team) => (
+                  <Fragment key={team.key}>
+                    <h2 className="print-team-name">
+                      {team.name} · {plural(team.sectionCount, 'section')} · {untimedCount(team)} to collect
+                    </h2>
+                    {team.sections.map((section) => (
+                      <table key={section.key} className="print-sec-table">
+                        <thead>
+                          <tr>
+                            <th>
+                              {team.name} · {sectionLabel(section)}
+                              <span className="print-sec-count"> ({untimedCount(section)} to collect)</span>
+                            </th>
+                          </tr>
+                        </thead>
+                        {/* A tbody per job: the only element in a table a break can be kept out of. */}
+                        {section.jobs.map((job) => (
+                          <tbody key={job.jobId} className="print-job">
+                            <tr>
+                              <td>
+                                <h3 className="print-job-name">
+                                  {job.jobName} ({job.missing.length} to collect)
+                                </h3>
+                              </td>
+                            </tr>
+                            {job.missing.map((op) => (
+                              <tr key={op.operationId}>
+                                <td>
+                                  <div className="print-op">
+                                    <div className="print-op-name">
+                                      <span className="print-checkbox" />
+                                      {op.operationName}
+                                    </div>
+                                    <div className="print-fields">
+                                      Operator:<span className="print-blank print-blank-operator" />
+                                      Minutes:<span className="print-blank print-blank-minutes" />
+                                      Notes:<span className="print-blank print-blank-notes" />
+                                    </div>
+                                  </div>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        ))}
+                      </table>
+                    ))}
+                  </Fragment>
                 ))}
-              </div>
+              </Fragment>
             ))
           )}
 
