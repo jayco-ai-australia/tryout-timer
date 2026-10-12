@@ -4,9 +4,11 @@ import { useCallback, useMemo, useState } from 'react'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import ConfirmDialog from './ConfirmDialog'
 import { plural } from '@/lib/format'
+import SectionMergeSummary from './SectionMergeSummary'
 import {
-  mergeSections, preflightSectionMerge, strandedSectionMergeMessage,
-} from '@/lib/sections'
+  SectionActionError, mergeSectionsInto, preflightSectionMergeInto, type SectionMergePlan,
+} from '@/lib/sectionManager'
+import { resetLineTopologyCache } from '@/lib/lines'
 import { mergeJobs, preflightJobMerge } from '@/lib/jobs'
 import {
   blockedMergeMessage, mergeOperations, preflightMerge, strandedMergeMessage,
@@ -69,7 +71,12 @@ export interface MergeRow<T> {
 }
 
 type MergeModeConfig =
-  | { level: 'section'; supabase: SupabaseClient; rows: MergeRow<Section>[]; onMerged: (message: string) => Promise<void> | void }
+  | {
+      level: 'section'
+      supabase: SupabaseClient
+      rows: MergeRow<Section>[]
+      onMerged: (message: string) => Promise<void> | void
+    }
   | {
       level: 'job'
       supabase: SupabaseClient
@@ -79,6 +86,12 @@ type MergeModeConfig =
        * needs to know who is asking.
        */
       userId: string
+      /**
+       * Skips the time-ownership guard. Set by a host that has already gated merging to manager
+       * or admin (lib/permissions' canEditStructure) — the tier that may act on other people's
+       * recorded work. Left unset, the guard applies as it always did.
+       */
+      canMoveOthersTimes?: boolean
       rows: MergeRow<Job>[]
       onMerged: (message: string) => Promise<void> | void
     }
@@ -87,6 +100,8 @@ type MergeModeConfig =
       supabase: SupabaseClient
       /** Whose merge this is — the operation-level ownership guard needs to know who is asking. */
       userId: string
+      /** See the job level. */
+      canMoveOthersTimes?: boolean
       rows: MergeRow<Operation>[]
       onMerged: (message: string) => Promise<void> | void
     }
@@ -101,7 +116,7 @@ const LEVEL_META: Record<MergeLevel, {
   /** How rows are constrained — said out loud when a row is disabled. */
   scope: string
 }> = {
-  section: { noun: 'section', childNoun: 'job', childPane: 'Jobs', scope: 'the same team' },
+  section: { noun: 'section', childNoun: 'job', childPane: 'Jobs', scope: 'the same production line' },
   job: { noun: 'job', childNoun: 'operation', childPane: 'Operations', scope: 'the same section' },
   operation: { noun: 'operation', childNoun: null, childPane: null, scope: 'the same job' },
 }
@@ -115,6 +130,12 @@ interface MergePlan {
   movingNoun: string
   /** Extra sentence for a level that moves more than one kind of thing. */
   extraNote: string | null
+  /**
+   * Section level only: lib/sectionManager's full plan — how many jobs move, which will sit beside
+   * a same-named job, and how many recorded times go with them. Rendered by SectionMergeSummary, the same summary
+   * /config's merge dialog shows.
+   */
+  sectionPlan?: SectionMergePlan | null
   /** Child names that will sit side by side in the keeper, needing a merge one level down.
    * Section level only — a job merge fuses same-named operations rather than stacking them. */
   duplicateNames: string[]
@@ -255,17 +276,22 @@ export function useMergeMode(config: MergeModeConfig): MergeModeState {
       if (config.level === 'section') {
         const keeper = keeperRow.subject as Section
         const merged = mergedRows.map((r) => r.subject as Section)
-        const pre = await preflightSectionMerge(config.supabase, { keeper, merged })
+        const pre = await preflightSectionMergeInto(config.supabase, {
+          destinationId: keeper.id, sourceIds: merged.map((s) => s.id),
+        })
+        const crossing = merged.filter((s) => s.team_id !== keeper.team_id)
         next = {
           keeperName: keeperRow.name,
           retiredNames,
-          movingCount: pre.visibleJobs.length,
+          movingCount: pre.movingJobs.filter((j) => j.is_active !== false).length,
           movingNoun: 'job',
-          extraNote: pre.operationCount > 0
-            ? `${plural(pre.operationCount, 'operation')} ride along with those jobs — nothing about them is written.`
+          extraNote: crossing.length > 0
+            ? `${crossing.map((s) => `"${s.name}"`).join(', ')} ${crossing.length === 1 ? 'is' : 'are'} on a DIFFERENT TEAM from "${keeper.name}". ` +
+              'Every job merged from there changes team, and its recorded times are re-stamped to match.'
             : null,
-          duplicateNames: pre.duplicateNames,
+          duplicateNames: [],
           combining: null,
+          sectionPlan: pre,
         }
       } else if (config.level === 'job') {
         const keeper = keeperRow.subject as Job
@@ -273,13 +299,13 @@ export function useMergeMode(config: MergeModeConfig): MergeModeState {
         const pre = await preflightJobMerge(config.supabase, { keeper, merged, userId: config.userId })
         // Refusable at this level now, for the same reason the operation level is: a fold moves
         // recorded times. Stop before offering a confirmation — there is nothing to confirm.
-        if (pre.blockers.length > 0) { setError(blockedMergeMessage(pre.blockers)); return }
+        if (!config.canMoveOthersTimes && pre.blockers.length > 0) { setError(blockedMergeMessage(pre.blockers)); return }
         next = {
           keeperName: keeperRow.name,
           retiredNames,
           movingCount: pre.visibleOperations.length,
           movingNoun: 'operation',
-          extraNote: 'Recorded times, notes and model links ride along with their operation — nothing about them is written.',
+          extraNote: 'Recorded times, notes and model links ride along with their operation.',
           duplicateNames: [],
           combining: pre.combining.length === 0 ? null : {
             count: pre.visibleCombiningCount,
@@ -293,7 +319,7 @@ export function useMergeMode(config: MergeModeConfig): MergeModeState {
         const pre = await preflightMerge(config.supabase, merged, config.userId)
         // The one level that can be refused outright. Stop before offering a confirmation:
         // there is nothing to confirm, and the message names what is holding it up.
-        if (pre.blockers.length > 0) { setError(blockedMergeMessage(pre.blockers)); return }
+        if (!config.canMoveOthersTimes && pre.blockers.length > 0) { setError(blockedMergeMessage(pre.blockers)); return }
         next = {
           keeperName: keeperRow.name,
           retiredNames,
@@ -325,18 +351,26 @@ export function useMergeMode(config: MergeModeConfig): MergeModeState {
       let strandedMessage: string
 
       if (config.level === 'section') {
-        const result = await mergeSections(config.supabase, {
-          keeper: keeperRow.subject as Section,
-          merged: mergedRows.map((r) => r.subject as Section),
+        // lib/sectionManager's merge — the one section merge in the app. Jobs MOVE; nothing is
+        // fused, and every recorded time under a moved job is re-stamped.
+        const outcome = await mergeSectionsInto(config.supabase, {
+          destinationId: (keeperRow.subject as Section).id,
+          sourceIds: mergedRows.map((r) => (r.subject as Section).id),
         })
-        summary = mergeMessage('section', keeperRow.name, retired, result.movedJobs, 'job', result.duplicateNames, 'job', 'Jobs')
-        stranded = result.stranded
-        strandedMessage = strandedSectionMergeMessage(result.stranded)
+        const ran = outcome.plan
+        summary =
+          `${plural(retired.length, 'section')} merged into "${keeperRow.name}": ${plural(ran.movingJobs.length, 'job')} moved, nothing combined.` +
+          (ran.sameNameJobCount > 0
+            ? ` ${plural(ran.sameNameJobCount, 'job')} now ${ran.sameNameJobCount === 1 ? 'sits' : 'sit'} alongside a job of the same name (${ran.sameNameJobNames.join(', ')}) — merge them from the Jobs column if they are the same work.`
+            : '')
+        stranded = []
+        strandedMessage = ''
       } else if (config.level === 'job') {
         const result = await mergeJobs(config.supabase, {
           keeper: keeperRow.subject as Job,
           merged: mergedRows.map((r) => r.subject as Job),
           userId: config.userId,
+          allowForeignTimes: config.canMoveOthersTimes,
         })
         summary = mergeMessage('job', keeperRow.name, retired, result.movedOperations, 'operation', [], null, null)
         if (result.combinedOperations > 0) {
@@ -353,12 +387,16 @@ export function useMergeMode(config: MergeModeConfig): MergeModeState {
           keeper: keeperRow.subject as Operation,
           dups: mergedRows.map((r) => r.subject as Operation),
           userId: config.userId,
+          allowForeignTimes: config.canMoveOthersTimes,
         })
         summary = mergeMessage('operation', keeperRow.name, retired, null, null, [], null, null)
         stranded = result.stranded
         strandedMessage = strandedMergeMessage(result.stranded)
       }
 
+      // A merge can change which team or line work sits under; the Labour Matrix and Model Total
+      // read line topology through lib/lines' cache.
+      resetLineTopologyCache()
       setPlan(null)
       if (stranded.length > 0) {
         // A partial result is reported as an error, not a success: something the user asked for
@@ -376,7 +414,12 @@ export function useMergeMode(config: MergeModeConfig): MergeModeState {
       }
     } catch (err) {
       setPlan(null)
-      setError(err instanceof Error ? err.message : 'Merge failed')
+      // A section merge that stopped part-way says which steps had already landed.
+      setError(
+        err instanceof SectionActionError
+          ? `${err.message} ${err.completed.length === 0 ? 'Nothing had been written.' : `Already completed, and not undone — check the data before retrying: ${err.completed.join('; ')}.`}`
+          : err instanceof Error ? err.message : 'Merge failed'
+      )
       // The list is reloaded either way — a merge that threw part-way through has still left the
       // rows that did move where they moved to, and showing stale ones would be worse.
       await onMerged('')
@@ -456,10 +499,20 @@ const BTN: React.CSSProperties = { padding: '6px 11px', fontSize: 12 }
  * button, in the same place, always: only its state changes. All three levels get this, because
  * all three mount this component.
  */
-export function MergeFooter({ merge }: { merge: MergeModeState }) {
+export function MergeFooter({ merge, lockedReason }: {
+  merge: MergeModeState
+  /** Set when this person may not merge (lib/permissions' canEditStructure). The button stays in
+   * place, disabled, with this on hover. */
+  lockedReason?: string | null
+}) {
   const meta = LEVEL_META[merge.level]
 
   if (!merge.active) {
+    if (lockedReason) {
+      return (
+        <button type="button" className="btn-ghost" style={BTN} disabled title={lockedReason}>Merge</button>
+      )
+    }
     // Two rows is the floor, and they must be rows that could ever be partners — a pane holding
     // one section and its tray has two rows and still nothing to merge (see `offerable`).
     const blockedReason = merge.offerable ? null : `Needs at least two ${meta.noun}s to merge`
@@ -633,14 +686,16 @@ export function MergeConfirm({ merge, detail }: {
         `"${plan.keeperName}" is KEPT. ` +
         `${plural(plan.movingCount, plan.movingNoun)} move onto it, and ` +
         `${plan.retiredNames.length === 1 ? 'the other is' : `the other ${plan.retiredNames.length} are`} ` +
-        `retired — they stop appearing across the app. Nothing is DELETED: retiring sets ` +
-        `is_active = false, so every row and everything pointing at it survives and an admin can ` +
-        `bring it back in the database. There is no un-merge on this screen, though — what moved ` +
-        `stays moved.`
+        (plan.sectionPlan
+          ? `deleted once ${plan.retiredNames.length === 1 ? 'it is' : 'they are'} empty. Jobs only change section: none is combined, ` +
+            `and no job, operation or recorded time is deleted. There is no un-merge, though — what moved stays moved.`
+          : `retired — they stop appearing across the app. Nothing is DELETED: retiring sets ` +
+            `is_active = false, so every row and everything pointing at it survives and can be ` +
+            `restored. There is no un-merge on this screen, though — what moved stays moved.`)
       }
       confirmLabel={merge.busy ? 'Merging…' : 'Merge & retire'}
       danger
-      maxWidth={520}
+      maxWidth={plan.sectionPlan ? 620 : 520}
       onConfirm={() => { if (!merge.busy) merge._runMerge() }}
       onCancel={() => { if (!merge.busy) merge._closePlan() }}
     >
@@ -653,10 +708,12 @@ export function MergeConfirm({ merge, detail }: {
           {plan.retiredNames.map((name) => <li key={name}>{name}</li>)}
         </ul>
         {plan.extraNote && (
-          <p style={{ margin: '10px 0 0', fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.55 }}>
+          <p style={{ margin: '10px 0 0', fontSize: 12, color: plan.sectionPlan ? '#92400e' : 'var(--text-muted)', lineHeight: 1.55 }}>
             {plan.extraNote}
           </p>
         )}
+        {/* Section level: what moves, and which jobs will sit beside a same-named one. */}
+        {plan.sectionPlan && <SectionMergeSummary plan={plan.sectionPlan} />}
         {/* Job level: the collision, named BEFORE it happens. This is the one part of a merge
             that moves recorded times between rows, and the one part with no way back. */}
         {plan.combining && (

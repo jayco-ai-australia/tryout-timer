@@ -1,5 +1,8 @@
 'use client'
 
+import SelectAllControl from '@/components/SelectAllControl'
+import type { RangeableQuery } from '@/lib/supabaseRead'
+import { type TimeParentFlags, isRetiredTime } from '@/lib/operationTimes'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import Modal from '@/components/Modal'
@@ -8,16 +11,19 @@ import ModelLinker, { ModelSeriesPicker } from '@/components/ModelLinker'
 import BulkModelLinkDrawer, { DRAWER_WIDTH, useSlideOverDrawer } from '@/components/BulkModelLinkDrawer'
 import JobEditDrawer from '@/components/JobEditDrawer'
 import DuplicateJobsDrawer from '@/components/DuplicateJobsDrawer'
-import JobFormModal from '@/components/JobFormModal'
 import OperationEditDrawer from '@/components/OperationEditDrawer'
 import OperatorAssign from '@/components/OperatorAssign'
 import {
-  currentForOperation, fetchOperationTimeNotes, historyLabel, operationProductKey, type OperationTimeStat,
+  TIME_FLAG_COLUMNS, currentForOperation, fetchOperationTimeNotes, historyLabel, onlyCountedTimes, operationProductKey,
+  type OperationTimeStat,
 } from '@/lib/operationTimes'
 import { fmtDate, fmtMinutes } from '@/lib/format'
 import { findSectionTray, setJobSection, sortSections, teamForJob } from '@/lib/sections'
+import { STRUCTURE_LOCKED_REASON, canDeleteSection, canEditStructure } from '@/lib/permissions'
+import { createJob, renameJob, retireJob } from '@/lib/jobs'
+import RetiredItemsDialog from '@/components/RetiredItemsDialog'
 import { logSupabaseError } from '@/lib/supabaseRead'
-import { createOperation, setOperationJob } from '@/lib/operations'
+import { createOperation, retireOperation, setOperationJob } from '@/lib/operations'
 import {
   JobsPane, Pane, RenameButton, ROW_INPUT, SectionsPane, UNSECTIONED_KEY, plural, teamNameForJob,
   type SectionEntry,
@@ -35,6 +41,8 @@ import { modelsForLine } from '@/lib/lines'
 import { usePersistedFilter } from '@/lib/useLocalStorage'
 import { NO_SETUP_FOCUS, type SetupFocus } from '@/lib/setupLinks'
 import type { Job, Operation, OperationTimeNote, Product, ProductionLine, Section, Team, UserRole } from '@/lib/types'
+import { TimeExclusionBadges } from '@/components/HiddenTimeBadge'
+import { computeOperationCoverage, type OperationCoverage } from '@/lib/coverage'
 
 interface Props {
   lines: ProductionLine[]
@@ -84,53 +92,8 @@ interface RawJobOption { id: string; name: string; section_id: string | null }
  * "how much fits in one PostgREST call".  */
 
 // ── Operation-level model coverage ─────────────────────────────────────────────────────────
-/**
- * Per-operation coverage: of the models linked to THIS operation via model_operations, how many
- * have at least one recorded operation_time. Deliberately simpler than lib/coverage.ts, which
- * rolls the same three junctions up to (job × model) combos — here the unit is one operation, so
- * a job's two operations covering different halves of the same model set each report their own
- * gap instead of cancelling each other out.
- *
- * "Timed" follows lib/coverage.ts' definition — the *existence* of an operation_time linked to
- * the model via operation_time_models — not whether that time has a total_minutes value, so an
- * in-progress capture still counts as collected. Coverage is deliberately unmoved by the
- * current-record rule: a superseded time is still a time that was collected, so a pair with
- * nothing but archived records still counts as timed here. (The FIGURES shown in pane 4 come
- * from the shared currentForOperation, which takes the current record and skips null minutes.)
- */
-interface OperationCoverage { timed: number; total: number }
-
-function computeOperationCoverage(input: {
-  operationIds: string[]
-  modelOperations: { operation_id: string; product_id: string }[]
-  operationTimes: { id: string; operation_id: string }[]
-  operationTimeModels: { operation_time_id: string; product_id: string }[]
-}): Record<string, OperationCoverage> {
-  const { operationIds, modelOperations, operationTimes, operationTimeModels } = input
-
-  const linkedByOp = new Map<string, Set<string>>()
-  for (const mo of modelOperations) {
-    let set = linkedByOp.get(mo.operation_id)
-    if (!set) { set = new Set(); linkedByOp.set(mo.operation_id, set) }
-    set.add(mo.product_id)
-  }
-
-  const opByTimeId = new Map(operationTimes.map((t) => [t.id, t.operation_id]))
-  const timedPairs = new Set<string>()
-  for (const tm of operationTimeModels) {
-    const opId = opByTimeId.get(tm.operation_time_id)
-    if (opId) timedPairs.add(operationProductKey(opId, tm.product_id))
-  }
-
-  const result: Record<string, OperationCoverage> = {}
-  for (const opId of operationIds) {
-    const linked = linkedByOp.get(opId)
-    let timed = 0
-    if (linked) for (const productId of linked) if (timedPairs.has(operationProductKey(opId, productId))) timed += 1
-    result[opId] = { timed, total: linked?.size ?? 0 }
-  }
-  return result
-}
+// computeOperationCoverage lives in lib/coverage beside the job×model definition, so it drops
+// hidden records the same way (it used to be computed here, on its own).
 
 /** green = every linked model timed, amber = partly timed, red = none timed, grey = no models
  * linked yet (nothing declared, which is a different thing from a 0% gap). */
@@ -236,7 +199,6 @@ export default function SetupClient({ lines, role, userId, initialFocus = NO_SET
 
   const [pageError, setPageError] = useState<string | null>(null)
 
-  const [jobModal, setJobModal] = useState<{ mode: 'add' | 'edit'; job?: Job } | null>(null)
   // The job edit/reassign slide-over. Holds the job row itself, not its id: a save can move the
   // job out of the current filter entirely, and the drawer still has to render its own subject
   // while it animates closed.
@@ -264,8 +226,10 @@ export default function SetupClient({ lines, role, userId, initialFocus = NO_SET
    * not another step of the Section → Job → Operation drill the panes exist for. */
   const [duplicatesOpen, setDuplicatesOpen] = useState(false)
 
-  const [blockedDeleteJob, setBlockedDeleteJob] = useState<string | null>(null)
-  const [blockedDeleteOperation, setBlockedDeleteOperation] = useState<string | null>(null)
+  const [retiredOpen, setRetiredOpen] = useState(false)
+  /** Manager or admin — the ONE gate on every structure control on this screen. */
+  const canEdit = canEditStructure(role)
+  const lockedReason = canEdit ? null : STRUCTURE_LOCKED_REASON
   const [confirmDeleteJob, setConfirmDeleteJob] = useState<Job | null>(null)
   const [confirmDeleteOperation, setConfirmDeleteOperation] = useState<Operation | null>(null)
 
@@ -468,11 +432,13 @@ export default function SetupClient({ lines, role, userId, initialFocus = NO_SET
         // pair whose only records are archived has still been timed. Filtering here would move
         // coverage as a side effect of the labour-content rule, which is exactly what must not
         // happen. It reads no minutes at all — see lib/coverage.ts.
-        const operationTimes = await fetchAllChunked<{ id: string; operation_id: string }>(
+        // Retired and hidden records are filtered at the query (onlyCountedTimes) — this read only
+        // feeds badges — and computeOperationCoverage applies the same rule again.
+        const operationTimes = await fetchAllChunked<{ id: string; operation_id: string; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null }>(
           loadedOperationIds, READ_CHUNK,
-          (chunk) => supabase
-            .from('operation_times').select('id, operation_id').in('operation_id', chunk)
-            .order('id'),
+          (chunk) => onlyCountedTimes(supabase
+            .from('operation_times').select(`id, operation_id, ${TIME_FLAG_COLUMNS}`).in('operation_id', chunk))
+            .order('id') as unknown as RangeableQuery<{ id: string; operation_id: string; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null }>,
           { table: 'operation_times' }
         )
 
@@ -725,6 +691,9 @@ export default function SetupClient({ lines, role, userId, initialFocus = NO_SET
     level: 'operation',
     supabase,
     userId,
+    // Merging is manager or admin here (the footer is locked otherwise), and that tier may act
+    // on other people's recorded work — so the ownership guard is not applied.
+    canMoveOthersTimes: canEdit,
     rows: opMergeRows,
     onMerged: async () => {
       await refreshAll()
@@ -835,8 +804,7 @@ export default function SetupClient({ lines, role, userId, initialFocus = NO_SET
     const trimmed = name.trim()
 
     if (trimmed && trimmed !== job.name) {
-      const { error } = await supabase.from('jobs').update({ name: trimmed }).eq('id', job.id)
-      if (error) throw new Error(error.message)
+      await renameJob(supabase, job.id, trimmed)
     }
 
     const currentSectionId = job.section_id ?? null
@@ -873,56 +841,71 @@ export default function SetupClient({ lines, role, userId, initialFocus = NO_SET
     // Adding under the virtual bucket still lands the job in the line's real tray, so a job is
     // never created with a null section_id where a tray exists to hold it.
     const section = activeSectionEntry.section ?? noSectionTray
+    // The shared writer wherever there is a section to file under: lib/jobs' createJob takes the
+    // job's team and line FROM the section, exactly as /line-config's add does.
+    if (section) {
+      try {
+        const created = await createJob(supabase, { name: trimmed, section })
+        await refreshAll()
+        selectJob(created.id)
+      } catch (err) {
+        setPageError(err instanceof Error ? err.message : 'Could not add that job')
+      }
+      return
+    }
     const { data, error } = await supabase.from('jobs').insert({
       name: trimmed,
       production_line_id: scopeLineId || null,
-      // The SECTION owns the team — the same rule setJobSection enforces on a move. A job added
-      // to the unsorted tray gets no team, because unsorted work isn't anybody's yet.
-      team_id: section?.team_id ?? null,
-      section_id: section?.id ?? null,
+      // Only reached when there is no section at all to file under (a line with no sections
+      // and no single tray): the job lands unsectioned, with no team, as it always did.
+      team_id: null,
+      section_id: null,
+      is_active: true,
     }).select('id').single()
     if (error) { setPageError(error.message); return }
     await refreshAll()
     if (data?.id) selectJob(data.id)
   }
 
-  async function requestDeleteJob(job: Job) {
+  /**
+   * "Delete" on a job or an operation is RETIRE — is_active = false through lib/jobs' retireJob
+   * and lib/operations' retireOperation, the same two writers /line-config uses. Nothing is
+   * removed: the row, its recorded times and its model links are all kept, and Retired items
+   * (the toolbar) is the way back. The hard delete this screen used to have is gone; removing a
+   * row for good is Delete permanently, offered only on a retired, empty one.
+   */
+  function requestDeleteJob(job: Job) {
     setPageError(null)
-    // Deliberately counts retired operations too (no is_active filter, unlike pane 3):
-    // operations.job_id cascades on delete, and operation_times.operation_id cascades from
-    // there, so letting a job be deleted because its only remaining operations are hidden would
-    // destroy their history rather than just hide it.
-    const { count } = await supabase.from('operations').select('id', { count: 'exact', head: true }).eq('job_id', job.id)
-    if ((count ?? 0) > 0) { setBlockedDeleteJob(job.name); return }
     setConfirmDeleteJob(job)
   }
 
   async function handleDeleteJob(job: Job) {
-    const { error } = await supabase.from('jobs').delete().eq('id', job.id)
     setConfirmDeleteJob(null)
-    if (error) { setPageError(error.message); return }
+    try {
+      await retireJob(supabase, job.id)
+    } catch (err) {
+      setPageError(err instanceof Error ? err.message : 'Could not retire that job'); return
+    }
     setJobId(''); setOperationId('')
+    setJobNotice(`"${job.name}" retired. Its operations, recorded times and model links are kept — restore it from Retired items.`)
     await refreshAll()
   }
 
   // ── Operation writes (pane 3) ──────────────────────────────────────────────────────────
-  async function requestDeleteOperation(op: Operation) {
+  function requestDeleteOperation(op: Operation) {
     setPageError(null)
-    // Counts every time, on purpose. Deleting the operation cascade-deletes its
-    // operation_times rows, so this guard has to see all of them or it waves through a
-    // delete that takes recorded history with it.
-    const { count } = await supabase.from('operation_times').select('id', { count: 'exact', head: true }).eq('operation_id', op.id)
-    if ((count ?? 0) > 0) { setBlockedDeleteOperation(op.name); return }
     setConfirmDeleteOperation(op)
   }
 
   async function handleDeleteOperation(op: Operation) {
-    // model_operations rows for this operation cascade-delete automatically at the DB level
-    // (operation_id ... on delete cascade) — nothing to clean up here beyond the operation row.
-    const { error } = await supabase.from('operations').delete().eq('id', op.id)
     setConfirmDeleteOperation(null)
-    if (error) { setPageError(error.message); return }
+    try {
+      await retireOperation(supabase, op.id)
+    } catch (err) {
+      setPageError(err instanceof Error ? err.message : 'Could not retire that operation'); return
+    }
     setOperationId('')
+    setJobNotice(`"${op.name}" retired. Its recorded times and model links are kept — restore it from Retired items.`)
     await refreshAll()
   }
 
@@ -1011,13 +994,24 @@ export default function SetupClient({ lines, role, userId, initialFocus = NO_SET
           <button
             type="button"
             className="btn-ghost"
-            disabled={!scopeLineId}
-            title={scopeLineId
+            disabled={!scopeLineId || !canEdit}
+            title={!canEdit ? STRUCTURE_LOCKED_REASON : scopeLineId
               ? 'Find job names that appear more than once on this line, with the operations and recorded times behind each copy'
               : 'Pick a single production line first — duplicate names are only meaningful within one'}
             onClick={() => setDuplicatesOpen(true)}
           >
             Duplicate jobs
+          </button>
+          <button
+            type="button"
+            className="btn-ghost"
+            disabled={!activeSectionEntry?.section}
+            title={activeSectionEntry?.section
+              ? `Retired jobs and operations in ${activeSectionEntry.section.name} — restore one, or permanently delete an empty one`
+              : 'Pick a section first'}
+            onClick={() => setRetiredOpen(true)}
+          >
+            Retired items
           </button>
           {filtersActive && (
             <button
@@ -1096,8 +1090,13 @@ export default function SetupClient({ lines, role, userId, initialFocus = NO_SET
           productionLineName={scopeLineName}
           teams={scopeTeams}
           selectedKey={activeSectionKey}
-          // Section merge, the same control /tryouts and /collect get — one component, one lib.
-          allowMerge
+          // Every structure control on this pane — add, rename, reorder, move, merge, delete —
+          // is manager or admin (lib/permissions' canEditStructure). Navigation stays open.
+          readOnly={!canEdit}
+          allowMerge={canEdit}
+          canMoveTeam={canEdit}
+          canDelete={canDeleteSection(role)}
+          onMovedTeam={setJobNotice}
           onSelect={selectSection}
           onChanged={afterSectionChange}
         />
@@ -1120,11 +1119,12 @@ export default function SetupClient({ lines, role, userId, initialFocus = NO_SET
             onOpen: openJobModels,
           }}
           autoStartMergeJobId={initialFocus.merge === 'job' ? initialFocus.jobId : undefined}
-          canDelete={role === 'admin'}
+          canDelete={canEdit}
+          lockedReason={lockedReason}
+          canMoveOthersTimes={canEdit}
           onSelect={selectJob}
           onAdd={addJob}
-          onEdit={openJobDrawer}
-          onEditLine={(job) => setJobModal({ mode: 'edit', job })}
+          onEdit={canEdit ? openJobDrawer : undefined}
           onDeleteRequest={requestDeleteJob}
         />
 
@@ -1136,7 +1136,8 @@ export default function SetupClient({ lines, role, userId, initialFocus = NO_SET
           loadingCoverage={loadingCoverage}
           selectedOperationId={activeOperationId}
           operators={allActiveOperators}
-          canDelete={role === 'admin'}
+          canDelete={canEdit}
+          lockedReason={lockedReason}
           mode={opMode}
           selection={opSelection}
           merge={opMerge}
@@ -1165,18 +1166,6 @@ export default function SetupClient({ lines, role, userId, initialFocus = NO_SET
         />
       </div>
 
-      {jobModal && (
-        <JobFormModal
-          mode={jobModal.mode}
-          job={jobModal.job}
-          defaultLineId={lineId}
-          lines={lines}
-          sections={allSections}
-          supabase={supabase}
-          onClose={() => setJobModal(null)}
-          onSaved={refreshAll}
-        />
-      )}
 
       {operationModal && (
         <OperationFormModal
@@ -1199,44 +1188,37 @@ export default function SetupClient({ lines, role, userId, initialFocus = NO_SET
         />
       )}
 
-      {blockedDeleteOperation && (
-        <ConfirmDialog
-          title="Can't delete this operation"
-          message={`"${blockedDeleteOperation}" has recorded operation times. Remove those times in Admin first, then delete the operation here.`}
-          confirmLabel="Got it"
-          cancelLabel="Close"
-          onConfirm={() => setBlockedDeleteOperation(null)}
-          onCancel={() => setBlockedDeleteOperation(null)}
-        />
-      )}
-      {blockedDeleteJob && (
-        <ConfirmDialog
-          title="Can't delete this job"
-          message={`"${blockedDeleteJob}" still has operations. Delete or move them to another job first — this includes any retired (merged) operations, which are hidden from the list above.`}
-          confirmLabel="Got it"
-          cancelLabel="Close"
-          onConfirm={() => setBlockedDeleteJob(null)}
-          onCancel={() => setBlockedDeleteJob(null)}
-        />
-      )}
       {confirmDeleteOperation && (
         <ConfirmDialog
-          title="Delete Operation"
-          message={`Delete "${confirmDeleteOperation.name}"? This also removes its model links. This cannot be undone.`}
-          confirmLabel="Delete"
+          title={`Retire "${confirmDeleteOperation.name}"`}
+          message={`"${confirmDeleteOperation.name}" stops appearing across the app. Nothing is deleted: its recorded times and model links are kept, and it can be restored from Retired items.`}
+          confirmLabel="Retire operation"
           danger
+          maxWidth={480}
           onConfirm={() => handleDeleteOperation(confirmDeleteOperation)}
           onCancel={() => setConfirmDeleteOperation(null)}
         />
       )}
       {confirmDeleteJob && (
         <ConfirmDialog
-          title="Delete Job"
-          message={`Delete "${confirmDeleteJob.name}"? This cannot be undone.`}
-          confirmLabel="Delete"
+          title={`Retire "${confirmDeleteJob.name}"`}
+          message={`"${confirmDeleteJob.name}" stops appearing across the app, along with the operations under it. Nothing is deleted: the operations, their recorded times and their model links are kept, and the job can be restored from Retired items.`}
+          confirmLabel="Retire job"
           danger
+          maxWidth={480}
           onConfirm={() => handleDeleteJob(confirmDeleteJob)}
           onCancel={() => setConfirmDeleteJob(null)}
+        />
+      )}
+      {retiredOpen && activeSectionEntry?.section && (
+        <RetiredItemsDialog
+          supabase={supabase}
+          userId={userId}
+          role={role}
+          sectionId={activeSectionEntry.section.id}
+          sectionName={activeSectionEntry.section.name}
+          onClose={() => setRetiredOpen(false)}
+          onChanged={() => { refreshAll() }}
         />
       )}
       {/* The operation-merge confirmation — the same component the Sections and Jobs panes use,
@@ -1343,8 +1325,8 @@ export default function SetupClient({ lines, role, userId, initialFocus = NO_SET
  * Rename a job and move it to another section — including a section belonging to a different team,
  * which is the case the old footer dropdown couldn't express safely.
  *
- * The section list is grouped by team via <optgroup>, because "Fit-out 3" means nothing without
- * knowing whose Fit-out 3 it is, and picking one silently changes the job's team (see
+ * The section list is one list in the line's sequence, each option labelled with its team, because
+ * "Fit-out 3" means nothing without knowing whose Fit-out 3 it is, and picking one changes the job's team (see
  * sections.ts' setJobSection). That consequence is stated in the confirm rather than discovered
  * afterwards, and the confirm also says what rides along: the job's operations and their
  * recorded times, which need no migration because they hang off job_id/operation_id.
@@ -1367,7 +1349,7 @@ export default function SetupClient({ lines, role, userId, initialFocus = NO_SET
  */
 function OperationsPane({
   job, operations, loading, coverageByOp, loadingCoverage, selectedOperationId, selectedOperation,
-  operators, canDelete, mode, selection, merge, mergeRows, operatorsOpen,
+  operators, canDelete, lockedReason, mode, selection, merge, mergeRows, operatorsOpen,
   onSelect, onEdit, onAdd, onMove, onDeleteRequest, onEnterMode, onToggleSelection,
   onSetAllSelection, onOpenBulkDrawer, onToggleOperators, onOperatorChange,
 }: {
@@ -1380,6 +1362,9 @@ function OperationsPane({
   selectedOperation: Operation | null
   operators: OperatorOption[]
   canDelete: boolean
+  /** Set when this person may not change structure: add, rename, move, merge and retire are
+   * disabled with this on hover. Bulk link and operator assignment stay open. */
+  lockedReason: string | null
   mode: 'normal' | 'bulk'
   selection: Set<string>
   /** The shared merge flow, owned by the screen so it survives this pane's re-renders. */
@@ -1401,7 +1386,6 @@ function OperationsPane({
   onOperatorChange: () => void
 }) {
   const selectedCount = operations.filter((o) => selection.has(o.id)).length
-  const allSelected = operations.length > 0 && selectedCount === operations.length
   const inSelectMode = mode !== 'normal'
 
   const subtitle = !job
@@ -1422,18 +1406,9 @@ function OperationsPane({
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, width: '100%' }}>
             {merge.active ? <MergeFooter merge={merge} /> : mode === 'bulk' ? (
               <>
-                <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-                  <button
-                    type="button"
-                    className="finder-row-action"
-                    onClick={() => onSetAllSelection(!allSelected)}
-                  >
-                    {allSelected ? 'Clear selection' : 'Select all'}
-                  </button>
-                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{selectedCount} of {operations.length}</span>
-                </div>
+                <SelectAllControl noun="operation" total={operations.length} selected={selectedCount} onSetAll={onSetAllSelection} />
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                  <button className="btn-primary" style={{ padding: '6px 11px', fontSize: 12 }} disabled={selectedCount === 0} onClick={onOpenBulkDrawer}>
+                  <button className="btn-primary" style={{ padding: '6px 11px', fontSize: 12 }} disabled={selectedCount === 0} title={selectedCount === 0 ? 'Tick at least one operation first' : undefined} onClick={onOpenBulkDrawer}>
                     Link models ({selectedCount})
                   </button>
                   <button className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12 }} onClick={() => onEnterMode('bulk')}>Done</button>
@@ -1442,24 +1417,22 @@ function OperationsPane({
             ) : (
               <>
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                  <button className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12 }} onClick={onAdd}>+ Add operation</button>
+                  <button className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12 }} disabled={Boolean(lockedReason)} title={lockedReason ?? undefined} onClick={onAdd}>+ Add operation</button>
                   {operations.length > 1 && (
                     <button className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12 }} onClick={() => onEnterMode('bulk')}>Bulk link</button>
                   )}
                   {/* The one merge affordance, in the one place it lives on every pane. */}
-                  <MergeFooter merge={merge} />
+                  <MergeFooter merge={merge} lockedReason={lockedReason} />
                 </div>
 
                 {selectedOperation && (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 8, borderTop: '1px solid var(--border)', paddingTop: 8 }}>
                     <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)' }}>{selectedOperation.name}</span>
                     <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-                      <button className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12 }} onClick={() => onMove(selectedOperation)}>Move to job</button>
-                      {canDelete && (
-                        <button className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12, color: 'var(--red)' }} onClick={() => onDeleteRequest(selectedOperation)}>
-                          Delete
-                        </button>
-                      )}
+                      <button className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12 }} disabled={Boolean(lockedReason)} title={lockedReason ?? undefined} onClick={() => onMove(selectedOperation)}>Move to job</button>
+                      <button className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12, color: canDelete ? 'var(--red)' : undefined }} disabled={!canDelete} title={lockedReason ?? 'Hide this operation everywhere — its times and model links are kept, and it can be restored'} onClick={() => onDeleteRequest(selectedOperation)}>
+                        Retire
+                      </button>
                     </div>
                     <button
                       type="button"
@@ -1554,7 +1527,7 @@ function OperationsPane({
                 </span>
               </span>
               <span className="finder-row-actions">
-                {!inSelectMode && <RenameButton title="Edit operation" onClick={() => onEdit(op)} />}
+                {!inSelectMode && !lockedReason && <RenameButton title="Edit operation" onClick={() => onEdit(op)} />}
                 <CoverageBadge coverage={coverageByOp[op.id]} loading={loadingCoverage} />
                 <span className="finder-chevron">›</span>
               </span>
@@ -1618,6 +1591,10 @@ interface CollectedTimeRow {
   /** null = this is the current record for its model; set = archived behind that record. Drives
    * the badge on each row, so history reads as history rather than as more of the same. */
   supersededBy: string | null
+  /** Listed, marked, and not counted — see HiddenTimeBadge. */
+  isHidden: boolean
+  /** is_active = false. Listed, marked, and not counted — see RetiredTimeBadge. */
+  isRetired: boolean
   /** operations_times.operator_id → name. Context only: "who was timed". Nothing on this
    * screen requires an operation to have a primary/secondary operator set, and this is not
    * that — it's whoever the recorded run was captured against. */
@@ -1664,7 +1641,7 @@ function OperationCoverageTimesPanel({
           // the figure and so each row can say which one it is.
           supabase
             .from('operation_times')
-            .select('id, total_minutes, created_at, operator_id, superseded_by')
+            .select(`id, total_minutes, created_at, operator_id, superseded_by, ${TIME_FLAG_COLUMNS}`)
             .eq('operation_id', operationId)
             .order('created_at', { ascending: false }),
         ])
@@ -1672,7 +1649,7 @@ function OperationCoverageTimesPanel({
         if (timeError) throw new Error(timeError.message)
 
         const linkedIds = new Set((linkRows ?? []).map((r) => r.product_id as string))
-        const times = (timeRows ?? []) as { id: string; total_minutes: number | null; created_at: string; operator_id: string | null; superseded_by: string | null }[]
+        const times = (timeRows ?? []) as unknown as { id: string; total_minutes: number | null; created_at: string; operator_id: string | null; superseded_by: string | null; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null }[]
         const timeIds = times.map((t) => t.id)
 
         // Which model(s) each time belongs to — operation_times carries no product_id of its
@@ -1725,6 +1702,8 @@ function OperationCoverageTimesPanel({
           totalMinutes: t.total_minutes,
           createdAt: t.created_at,
           supersededBy: t.superseded_by,
+          isHidden: t.is_hidden,
+          isRetired: isRetiredTime(t),
           operatorName: t.operator_id ? operatorNameById.get(t.operator_id) ?? null : null,
           notes: notesByTime.get(t.id) ?? [],
         }]))
@@ -1734,7 +1713,7 @@ function OperationCoverageTimesPanel({
         const stats = currentForOperation(
           times.map((t) => ({
             id: t.id, operation_id: operationId, total_minutes: t.total_minutes,
-            superseded_by: t.superseded_by, created_at: t.created_at,
+            superseded_by: t.superseded_by, is_active: t.is_active, is_hidden: t.is_hidden, operations: t.operations, created_at: t.created_at,
           })),
           timeModels
         )
@@ -1765,14 +1744,23 @@ function OperationCoverageTimesPanel({
         // this panel is for), then any timed-but-unlinked leftovers.
         nextGroups.sort((a, b) => {
           if (a.linked !== b.linked) return a.linked ? -1 : 1
-          if (a.linked && (a.times.length === 0) !== (b.times.length === 0)) return a.times.length === 0 ? -1 : 1
+          const aUntimed = !a.times.some((t) => !t.isHidden && !t.isRetired)
+          const bUntimed = !b.times.some((t) => !t.isHidden && !t.isRetired)
+          if (a.linked && aUntimed !== bUntimed) return aUntimed ? -1 : 1
           return (a.product?.model ?? '').localeCompare(b.product?.model ?? '')
         })
 
-        const timedLinked = [...linkedIds].filter((id) => (timesByProduct.get(id) ?? []).length > 0).length
+        // The shared per-operation coverage rule, over this pane's own rows — so the badge here and
+        // the one on the operation row in pane 3 cannot disagree (and hidden records don't count).
+        const paneCoverage = computeOperationCoverage({
+          operationIds: [operationId],
+          modelOperations: [...linkedIds].map((productId) => ({ operation_id: operationId, product_id: productId })),
+          operationTimes: times.map((t) => ({ id: t.id, operation_id: operationId, is_active: t.is_active, is_hidden: t.is_hidden, operations: t.operations })),
+          operationTimeModels: timeModels,
+        })[operationId]
 
         setGroups(nextGroups)
-        setCoverage({ timed: timedLinked, total: linkedIds.size })
+        setCoverage(paneCoverage)
         setUnlinkedTimes(times.filter((t) => !claimedTimeIds.has(t.id)).map((t) => rowById.get(t.id)!))
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : 'Could not load collected times')
@@ -1849,13 +1837,14 @@ function OperationCoverageTimesPanel({
                             style={{ padding: '7px 9px', borderRadius: 6, background: 'var(--surface)', border: '1px solid var(--border)' }}
                           >
                             <div style={{ display: 'flex', gap: 10, alignItems: 'baseline', flexWrap: 'wrap' }}>
-                              <span style={{ fontSize: 13, fontWeight: 700, color: time.supersededBy ? 'var(--text-muted)' : 'var(--text)' }}>{fmtMinutes(time.totalMinutes)}m</span>
+                              <span style={{ fontSize: 13, fontWeight: 700, color: time.supersededBy || time.isHidden || time.isRetired ? 'var(--text-muted)' : 'var(--text)', textDecoration: time.isHidden || time.isRetired ? 'line-through' : undefined }}>{fmtMinutes(time.totalMinutes)}m</span>
                               {/* Which of these rows IS the figure above. Without it the list
                                   reads as several equally-live numbers, which is what the
                                   averaging rule used to make them. */}
                               {time.supersededBy
                                 ? <span className="badge badge-grey">archived</span>
-                                : <span className="badge badge-green">current</span>}
+                                : !time.isHidden && !time.isRetired && <span className="badge badge-green">current</span>}
+                              <TimeExclusionBadges hidden={time.isHidden} retired={time.isRetired} />
                               <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
                                 Timed: {time.operatorName ?? 'Unknown operator'}
                               </span>

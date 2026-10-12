@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from 'react'
 import ConfirmDialog from '@/components/ConfirmDialog'
-import { teamForJob } from '@/lib/sections'
+import { sortSections, teamForJob } from '@/lib/sections'
 import type { Job, Section, Team } from '@/lib/types'
 
 /**
@@ -68,18 +68,11 @@ export default function JobEditDrawer({
 
   /** Sections grouped under their team, teams in name order, sections left in walk order within
    * each — the grouping is the only thing that makes a cross-team target legible. */
-  const sectionGroups = useMemo(() => {
-    const byTeam = new Map<string, Section[]>()
-    for (const section of sections) {
-      const key = section.team_id ?? ''
-      const list = byTeam.get(key)
-      if (list) list.push(section)
-      else byTeam.set(key, [section])
-    }
-    return [...byTeam.entries()]
-      .map(([teamId, group]) => ({ teamId, teamName: teamNameById.get(teamId) ?? 'No team', sections: group }))
-      .sort((a, b) => a.teamName.localeCompare(b.teamName))
-  }, [sections, teamNameById])
+  /** The picker's options: ONE list in the line's sequence (lib/sections' sortSections), not
+   * grouped under team headings. It used to be <optgroup>s sorted by team name, which put Quality's
+   * end-of-line steps above CHASSIS PREP. The team still rides on every option's label, because
+   * picking a section changes the job's team and "Fit-out 3" means nothing without knowing whose. */
+  const sectionOptions = useMemo(() => sortSections(sections), [sections])
 
   // In nameOnly mode the section is never offered, so it is never a change: the target is the
   // job's own section, whatever that is. Without this, a caller passing a `sections` list that
@@ -180,10 +173,8 @@ export default function JobEditDrawer({
                 onChange={(e) => setSectionId(e.target.value)}
               >
                 <option value="">— No section —</option>
-                {sectionGroups.map((group) => (
-                  <optgroup key={group.teamId || 'no-team'} label={group.teamName}>
-                    {group.sections.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-                  </optgroup>
+                {sectionOptions.map((s) => (
+                  <option key={s.id} value={s.id}>{s.name} · {teamNameById.get(s.team_id ?? '') ?? 'No team'}</option>
                 ))}
               </select>
               <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '8px 0 0', lineHeight: 1.5 }}>

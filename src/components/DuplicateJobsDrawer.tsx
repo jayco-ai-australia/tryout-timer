@@ -515,7 +515,9 @@ function DuplicateGroupCard({ group, sections, supabase, userId, busy, onResolve
     [group.copies],
   )
 
-  const merge = useMergeMode({ level: 'job', supabase, userId, rows, onMerged: onResolved })
+  // Both hosts open this drawer for manager or admin only (lib/permissions' canEditStructure) —
+  // the tier that may act on other people's recorded work — so the ownership guard is not applied.
+  const merge = useMergeMode({ level: 'job', supabase, userId, canMoveOthersTimes: true, rows, onMerged: onResolved })
 
   const copyById = useMemo(() => new Map(group.copies.map((c) => [c.jobId, c])), [group.copies])
 

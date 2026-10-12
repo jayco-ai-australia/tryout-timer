@@ -63,12 +63,39 @@ export function canAccessAdminArea(role: UserRole | null): boolean {
 }
 
 /**
+ * May this person CHANGE THE LINE'S STRUCTURE — add, rename, reorder, move, merge or retire a
+ * section, a job or an operation.
+ *
+ * Manager or admin, and it is ONE answer for every one of those actions on every screen that
+ * offers them: the same act is gated the same way wherever it appears. Viewing, collecting times,
+ * linking models and assigning operators are not structure and stay open to everyone.
+ *
+ * A structure change re-files recorded labour (moves and merges re-stamp operation_times), which
+ * is why it sits with the tier that may act on other people's recorded work.
+ */
+export function canEditStructure(role: UserRole | null): boolean {
+  return role === 'manager' || role === 'admin'
+}
+
+/** The sentence a disabled structure control shows on hover. One wording, every screen. */
+export const STRUCTURE_LOCKED_REASON = 'Structure changes need a manager or admin'
+
+/**
+ * May this person PERMANENTLY DELETE a retired, empty job or operation. Admin only: it is the
+ * one act on structure that removes a row for good.
+ */
+export function canDeletePermanently(role: UserRole | null): boolean {
+  return role === 'admin'
+}
+
+/**
  * ── Structure: who may delete a section ────────────────────────────────────────────────────
  *
  * Admin only, and it is the ONE role check on /line-config and /setup's Sections pane — because
  * it is the one structural act in the app that is a real DELETE. Everything else structural is
  * either reversible (a rename, a move) or a soft delete that keeps every row (retiring a job or an
- * operation, merging either), and all of those are offered to every signed-in user.
+ * operation, merging either), and all of those are offered to every signed-in user — except
+ * moving a section to another team, which re-teams its jobs and is manager+ (below).
  *
  * Stated here rather than as `role === 'admin'` inside a component, per the note at the top of this
  * file: the UI's copy of an RLS rule belongs in one place, and a screen that spells it out inline
@@ -82,6 +109,21 @@ export function canDeleteSection(role: UserRole | null): boolean {
 }
 
 /**
+ * ── Structure: who may move a section to another team ──────────────────────────────────────
+ *
+ * Manager or admin. Unlike a rename or a reorder, this re-teams every job in the section at once
+ * (a job's team IS its section's team), which changes whose walk, coverage and labour figures
+ * that work shows up under — a decision about the line's organisation, not a tidy-up. A plain
+ * user can still move a single job to another team's section from its ✎ drawer.
+ *
+ * Its own function rather than canManageTimes, for the same reason canDeleteSection is: the day
+ * one of these rules changes, the other must not move with it.
+ */
+export function canMoveSectionToTeam(role: UserRole | null): boolean {
+  return role === 'manager' || role === 'admin'
+}
+
+/**
  * ── …and who may bring a retired job back ──────────────────────────────────────────────────
  *
  * Everyone who can retire one, which on /line-config is every signed-in user. This exists as a
@@ -91,7 +133,8 @@ export function canDeleteSection(role: UserRole | null): boolean {
  * narrowed, retireJob's caller has to be narrowed in the same commit — see lib/jobs' restoreJob.
  */
 export function canRestoreJob(role: UserRole | null): boolean {
-  return role !== null
+  // Restoring is the way back from Retire, so it is gated exactly as Retire is.
+  return canEditStructure(role)
 }
 
 /**

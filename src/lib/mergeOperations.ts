@@ -1,6 +1,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { READ_CHUNK, chunked, fetchLinksForOperations, linkOperationsToModels } from './modelOperations'
 import { fetchAllRows } from './supabaseRead'
+import { restampTimesForOperation } from './operationTimes'
 
 /**
  * The least an operation has to be for this module to fold it away. Deliberately NOT the full
@@ -194,12 +195,22 @@ export interface MergeResult {
  */
 export async function mergeOperations(
   supabase: SupabaseClient,
-  { keeper, dups, userId }: { keeper: MergeableOperation; dups: MergeableOperation[]; userId: string }
+  { keeper, dups, userId, allowForeignTimes = false }: {
+    keeper: MergeableOperation; dups: MergeableOperation[]; userId: string
+    /** Skips the ownership guard — for a caller already gated to manager or admin (lib/permissions'
+     * canEditStructure), the tier that may act on other people's recorded work. /setup,
+     * /line-config and /config pass it; the collection screens do not. Only the app-level refusal is skipped: the database's
+     * own policy still decides, and the post-move re-count below still catches whatever it
+     * declined to move. */
+    allowForeignTimes?: boolean
+  }
 ): Promise<MergeResult> {
   if (dups.length === 0) return { stranded: [], reversals: [] }
 
-  const preflight = await preflightMerge(supabase, dups, userId)
-  if (preflight.blockers.length > 0) throw new Error(blockedMergeMessage(preflight.blockers))
+  if (!allowForeignTimes) {
+    const preflight = await preflightMerge(supabase, dups, userId)
+    if (preflight.blockers.length > 0) throw new Error(blockedMergeMessage(preflight.blockers))
+  }
 
   const stranded: string[] = []
   const reversals: OperationMergeReversal[] = []
@@ -227,6 +238,12 @@ export async function mergeOperations(
       stranded.push(`${dup.name} (${count} time${count === 1 ? '' : 's'} left behind)`)
       continue
     }
+
+    // The times that just arrived carry the team and line of the job they were recorded under.
+    // They belong to the keeper now, so they take the keeper's — see the re-stamping note in
+    // lib/operationTimes. Usually a no-op (an operation merge is within one job); it is what
+    // keeps a fold across sections, teams or lines from leaving labour banked where it was.
+    await restampTimesForOperation(supabase, keeper.id)
 
     // ── Model links: UNIONED onto the keeper, then cleared off the duplicate ──────────────
     // Clearing alone (which is all this did) loses applicability the merge had no business

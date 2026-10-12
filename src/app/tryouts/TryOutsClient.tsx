@@ -1,5 +1,6 @@
 'use client'
 
+import { type TimeParentFlags, TIME_FLAG_COLUMNS, isRetiredTime, LIVE_PARENTS } from '@/lib/operationTimes'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { selectIn } from '@/lib/chunkedIn'
@@ -45,6 +46,7 @@ import {
   fetchOperators, operatorsForLine, type OperatorOption,
 } from '@/lib/operators'
 import OperatorSelect from '@/components/OperatorSelect'
+import { TimeExclusionBadges } from '@/components/HiddenTimeBadge'
 import type { Job, Operation, OperationTimeNote, Section, Team, UserRole } from '@/lib/types'
 
 /**
@@ -207,6 +209,10 @@ interface VanTime {
   /** null = the current record for its model; set = archived behind that one. Carried so the
    * van log can pick the figure through the shared helper and label the rest as history. */
   supersededBy: string | null
+  /** Listed and marked, never counted — the shared helper drops it from the figure. */
+  isHidden: boolean
+  /** is_active = false. Listed and marked, never counted — dropped by the same helper. */
+  isRetired: boolean
 }
 
 /** Which operation a drawer is pointing at. Carries its labels rather than looking them up
@@ -627,11 +633,11 @@ export default function TryOutsClient({ userId, role }: Props) {
     // it feeds shows history. superseded_by is selected so currentByOperation can pick the figure.
     const { data: timeRows, error: timesError } = await supabase
       .from('operation_times')
-      .select('id, operation_id, operator_id, total_minutes, created_at, superseded_by, collected_by')
+      .select(`id, operation_id, operator_id, total_minutes, created_at, superseded_by, ${TIME_FLAG_COLUMNS}, collected_by`)
       .eq('chassis_id', context.chassisId)
       .order('created_at', { ascending: false })
     if (timesError) { setVanError(timesError.message); setLoadingVan(false); return }
-    const times = (timeRows ?? []) as { id: string; operation_id: string; operator_id: string | null; total_minutes: number | null; created_at: string; superseded_by: string | null; collected_by: string | null }[]
+    const times = (timeRows ?? []) as unknown as { id: string; operation_id: string; operator_id: string | null; total_minutes: number | null; created_at: string; superseded_by: string | null; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null; collected_by: string | null }[]
 
     const operatorIds = [...new Set(times.map((t) => t.operator_id).filter((id): id is string => !!id))]
     const operatorNameById = new Map<string, string>()
@@ -649,6 +655,8 @@ export default function TryOutsClient({ userId, role }: Props) {
       totalMinutes: t.total_minutes,
       createdAt: t.created_at,
       supersededBy: t.superseded_by,
+      isHidden: t.is_hidden,
+      isRetired: isRetiredTime(t),
       collectedBy: t.collected_by,
       operatorName: t.operator_id ? operatorNameById.get(t.operator_id) ?? null : null,
     })))
@@ -774,7 +782,7 @@ export default function TryOutsClient({ userId, role }: Props) {
   const vanStatByOperation = useMemo(
     () => currentByOperation(vanTimes.map((t) => ({
       id: t.id, operation_id: t.operationId, total_minutes: t.totalMinutes,
-      superseded_by: t.supersededBy, created_at: t.createdAt,
+      superseded_by: t.supersededBy, is_active: !t.isRetired, is_hidden: t.isHidden, operations: LIVE_PARENTS, created_at: t.createdAt,
     }))),
     [vanTimes]
   )
@@ -2207,9 +2215,13 @@ function VanOperationsPane({
                     onClick={() => job && onOpenTimes(op, job)}
                     title={`View, edit or delete this van's recorded times — ${times.map((t) => `${fmtMinutes(t.totalMinutes)}m · ${t.operatorName ?? 'no operator'} · ${fmtDate(t.createdAt)}`).join(', ')}`}
                   >
+                    {/* No stat and every record retired or hidden: recorded, but nothing counts. Said so
+                        rather than showing a hidden record's minutes as if it were the figure. */}
                     ✓ {stat
                       ? `${fmtMinutes(stat.minutes)}m${stat.archived > 0 ? ` · +${stat.archived} archived` : ''}`
-                      : `${fmtMinutes(times[0].totalMinutes)}m`} on this van
+                      : times.every((t) => t.isHidden || t.isRetired)
+                        ? `${plural(times.length, 'retired or hidden record')}, not counted,`
+                        : `${fmtMinutes(times[0].totalMinutes)}m`} on this van
                     <PencilIcon />
                   </button>
                 )}
@@ -2441,6 +2453,7 @@ function TimeDetailPanel({
             <div key={t.id} style={{ border: '1px solid var(--border)', borderRadius: 10, padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 10 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }}>
                 <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)' }}>{t.operatorName ?? 'Unknown operator'}</span>
+                <TimeExclusionBadges hidden={t.isHidden} retired={t.isRetired} />
                 <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>{fmtDate(t.createdAt)}</span>
               </div>
 
@@ -2538,6 +2551,10 @@ interface TimedLogRow {
   totalMinutes: number | null
   createdAt: string
   notes: string[]
+  /** Listed and marked; left out of the drawer's minutes total. */
+  isHidden: boolean
+  /** is_active = false. Listed and marked; left out of the drawer's minutes total. */
+  isRetired: boolean
 }
 
 interface TimedLogData {
@@ -2573,11 +2590,11 @@ async function fetchTimedLog(
 ): Promise<TimedLogData> {
   interface RawTime {
     id: string; operation_id: string; operator_id: string | null; chassis_id: string | null
-    total_minutes: number | null; created_at: string; superseded_by: string | null
+    total_minutes: number | null; created_at: string; superseded_by: string | null; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null
   }
   // Unfiltered by superseded_by throughout this function, deliberately: the timed log IS the
   // history. The column is selected so the figure below can be picked by the shared helper.
-  const TIME_COLUMNS = 'id, operation_id, operator_id, chassis_id, total_minutes, created_at, superseded_by'
+  const TIME_COLUMNS = `id, operation_id, operator_id, chassis_id, total_minutes, created_at, superseded_by, ${TIME_FLAG_COLUMNS}`
 
   let times: RawTime[] = []
   /** The (time, product) links behind the model scope — kept because currentForOperation is
@@ -2591,7 +2608,7 @@ async function fetchTimedLog(
       .eq('chassis_id', van.chassisId)
       .order('created_at', { ascending: false })
     if (error) throw new Error(error.message)
-    times = (data ?? []) as RawTime[]
+    times = (data ?? []) as unknown as RawTime[]
   } else {
     if (!van.productId) return EMPTY_TIMED_LOG
     // operation_times carries no product_id — which model a run counts for lives entirely in
@@ -2609,7 +2626,7 @@ async function fetchTimedLog(
     for (const batch of chunked(timeIds, READ_CHUNK)) {
       const { data, error } = await supabase.from('operation_times').select(TIME_COLUMNS).in('id', batch)
       if (error) throw new Error(error.message)
-      times.push(...((data ?? []) as RawTime[]))
+      times.push(...((data ?? []) as unknown as RawTime[]))
     }
     // Sorted here rather than by the query: the rows arrive one batch at a time, so ordering
     // per batch would interleave into something that only looks sorted.
@@ -2700,6 +2717,8 @@ async function fetchTimedLog(
       totalMinutes: t.total_minutes,
       createdAt: t.created_at,
       notes: notesByTimeId.get(t.id) ?? [],
+      isHidden: t.is_hidden,
+      isRetired: isRetiredTime(t),
     }
   })
 
@@ -2793,7 +2812,8 @@ function TimedLogPanel({
     return rows.filter((r) => r.teamId === teamFilter)
   }, [rows, teamFilter])
 
-  const totalMinutes = visibleRows.reduce((sum, r) => sum + (r.totalMinutes ?? 0), 0)
+  // Retired and hidden records are listed below but are not minutes anybody counts — left out of the sum.
+  const totalMinutes = visibleRows.reduce((sum, r) => sum + (r.isHidden || r.isRetired ? 0 : r.totalMinutes ?? 0), 0)
   const operationCount = new Set(visibleRows.map((r) => r.operationId)).size
   const modelLabel = van.model ?? 'this model'
   const teamLabel = teamOptions.find((o) => o.key === teamFilter)?.label ?? null
@@ -2923,7 +2943,7 @@ function TimedLogPanel({
                         {scope === 'model' && <> · {row.chassisNumber ?? 'No van'}</>}
                       </span>
                     </div>
-                    <span className="badge badge-blue" style={{ flexShrink: 0 }}>{fmtMinutes(row.totalMinutes)}m</span>
+                    <span className={'badge ' + (row.isHidden || row.isRetired ? 'badge-grey' : 'badge-blue')} style={{ flexShrink: 0, textDecoration: row.isHidden || row.isRetired ? 'line-through' : undefined }}>{fmtMinutes(row.totalMinutes)}m</span>
                   </div>
 
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center', fontSize: 12, color: 'var(--text-mid)' }}>
@@ -2931,6 +2951,7 @@ function TimedLogPanel({
                       Timed: {row.operatorName ?? 'No operator recorded'}
                     </span>
                     <span style={{ color: 'var(--text-muted)' }}>{fmtDateTime(row.createdAt)}</span>
+                    <TimeExclusionBadges hidden={row.isHidden} retired={row.isRetired} />
                     {/* Which record is the live figure, and how much sits behind it. Only worth
                         showing once this pair has more than the one record. */}
                     {stat && stat.archived > 0 && (
@@ -3018,6 +3039,7 @@ function CapturePanel({
             {existing.map((t) => (
               <span key={t.id} style={{ fontSize: 12, color: 'var(--text-mid)' }}>
                 {fmtMinutes(t.totalMinutes)}m · {t.operatorName ?? 'Unknown operator'} · {fmtDate(t.createdAt)}
+                {(t.isHidden || t.isRetired) && <> · <TimeExclusionBadges hidden={t.isHidden} retired={t.isRetired} /></>}
               </span>
             ))}
           </div>

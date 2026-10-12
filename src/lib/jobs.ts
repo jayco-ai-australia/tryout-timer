@@ -2,12 +2,13 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 import { READ_CHUNK, chunked } from './modelOperations'
 import { fetchAllChunked, fetchAllRows } from './supabaseRead'
 import { plural } from './format'
-import { operationNameKey, reactivateOperation, retireOperation, setOperationJob } from './operations'
+import { operationNameKey, reactivateOperation, renameOperation, retireOperation, setOperationJob } from './operations'
 import {
   blockedMergeMessage, mergeOperations, preflightMerge, reverseOperationMerge,
   type MergeBlocker, type OperationMergeReversal,
 } from './mergeOperations'
 import { isUniqueViolation, setJobSection } from './sections'
+import { SectionActionError } from './sectionManager'
 import type { Job, Section } from './types'
 
 /**
@@ -109,6 +110,24 @@ export async function createJob(
 }
 
 /**
+ * The only function anywhere that updates jobs.name. Reads the row back so a rename rejected by
+ * RLS surfaces as an error rather than a list that quietly refreshes unchanged.
+ *
+ * No uniqueness is enforced here because the database enforces none: jobs carry a primary key
+ * and nothing else, so two jobs may share a name anywhere. A screen that wants to warn about a
+ * same-named job in the same section does so itself, before calling this.
+ */
+export async function renameJob(supabase: SupabaseClient, jobId: string, name: string): Promise<void> {
+  const trimmed = name.trim()
+  if (!trimmed) throw new Error('Job name must not be empty')
+  const { data, error } = await supabase.from('jobs').update({ name: trimmed }).eq('id', jobId).select('id')
+  if (error) throw new Error(error.message)
+  if (!data || data.length === 0) {
+    throw new Error('That job could not be renamed — the change was rejected by the database (check your permissions).')
+  }
+}
+
+/**
  * Retire a job — the soft delete. `is_active = false`, and nothing else is touched.
  *
  * The counterpart of what mergeJobs does to the jobs it folds away, exposed on its own so a
@@ -193,6 +212,15 @@ export async function restoreJob(supabase: SupabaseClient, jobId: string): Promi
  * skipped rather than issued to confirm a zero.
  */
 export async function deleteJobPermanently(supabase: SupabaseClient, jobId: string): Promise<void> {
+  // Only a job that has ALREADY been retired. A live job goes through Retire first, so the one
+  // irreversible act on a job is never the first thing that happens to it.
+  const { data: subject, error: subjectError } = await supabase
+    .from('jobs').select('id, name, is_active').eq('id', jobId).single()
+  if (subjectError || !subject) throw new Error(subjectError?.message ?? 'That job no longer exists')
+  if (subject.is_active !== false) {
+    throw new Error(`"${subject.name}" is a live job — retire it first. Only a retired, empty job can be deleted permanently.`)
+  }
+
   // Every operation ever filed here. countOperationsInJob is deliberately unfiltered by is_active
   // (see its note), which is exactly the count this guard needs.
   const operations = await fetchAllRows<{ id: string; name: string }>(
@@ -566,7 +594,12 @@ function failedJobMergeMessage(cause: string, rollbackFailures: string[]): strin
  */
 export async function mergeJobs(
   supabase: SupabaseClient,
-  { keeper, merged, userId }: { keeper: Job; merged: Job[]; userId: string }
+  { keeper, merged, userId, allowForeignTimes = false }: {
+    keeper: Job; merged: Job[]; userId: string
+    /** Skips the ownership guard on the folds — see mergeOperations. For a caller already gated
+     * to manager or admin, who may act on other people's recorded work. */
+    allowForeignTimes?: boolean
+  }
 ): Promise<JobMergeResult> {
   if (merged.length === 0) return { movedOperations: 0, combinedOperations: 0, combinedNames: [] }
   if (merged.some((j) => j.id === keeper.id)) throw new Error('A job can’t be merged into itself.')
@@ -587,7 +620,7 @@ export async function mergeJobs(
   // Re-read rather than trusting the preflight the confirmation was built from: the user may
   // have been looking at that dialog for a while, and this is the plan that actually runs.
   const preflight = await preflightJobMerge(supabase, { keeper, merged, userId })
-  if (preflight.blockers.length > 0) throw new Error(blockedMergeMessage(preflight.blockers))
+  if (!allowForeignTimes && preflight.blockers.length > 0) throw new Error(blockedMergeMessage(preflight.blockers))
 
   const undo: JobMergeUndo[] = []
   /** Folded-away shells: retired, emptied, and still sitting on the job they came from. They
@@ -608,6 +641,7 @@ export async function mergeJobs(
         keeper: { id: c.targetId, name: c.targetName },
         dups: [{ id: c.incomingId, name: c.incomingName, is_active: c.incomingIsActive }],
         userId,
+        allowForeignTimes,
       })
       // A strand is a failure here, not a partial success to report. The rest of this merge is
       // still to come, and finishing it around a half-folded operation is exactly the state
@@ -663,4 +697,97 @@ export async function mergeJobs(
     combinedOperations: preflight.visibleCombiningCount,
     combinedNames: preflight.combiningNames,
   }
+}
+
+// ── Move operations out of a job ───────────────────────────────────────────────────────────
+/**
+ * How one operation leaves its job for another:
+ *
+ *   move    it goes across as it is — nothing in the destination holds its name.
+ *   rename  the destination already has an operation of that name, and `operations` is UNIQUE on
+ *           (name, job_id), so it is renamed first and then moved. Nothing combines.
+ *   fuse    it is folded INTO the destination's operation of that name: its recorded times are
+ *           re-pointed, model links the destination lacks are copied, and it is retired.
+ *
+ * Fuse is always chosen per operation by a person. Nothing here decides it.
+ */
+export type OperationMoveChoice =
+  | { kind: 'move' }
+  | { kind: 'rename'; name: string }
+  | { kind: 'fuse'; targetId: string; targetName: string; targetIsActive: boolean }
+
+export interface OperationMove {
+  id: string
+  name: string
+  choice: OperationMoveChoice
+}
+
+/**
+ * Moves operations into another job, one at a time, through the same writers everything else
+ * uses — lib/operations' setOperationJob and renameOperation, lib/mergeOperations' mergeOperations.
+ * Each of those re-stamps the recorded times it moves with the destination job's team and line.
+ *
+ * `retireJobId`, when given, is retired at the end — and only once it is proved to hold no LIVE
+ * operation. That is the "move its operations, then retire the job" act as one call.
+ *
+ * No transaction, so it keeps a log: a failure stops there and throws a SectionActionError
+ * carrying every step that had already landed.
+ */
+export async function moveOperationsToJob(
+  supabase: SupabaseClient,
+  { moves, destinationJobId, destinationJobName, userId, retireJobId, retireJobName }: {
+    moves: OperationMove[]
+    destinationJobId: string
+    destinationJobName: string
+    userId: string
+    retireJobId?: string
+    retireJobName?: string
+  }
+): Promise<{ completed: string[] }> {
+  const completed: string[] = []
+  try {
+    for (const move of moves) {
+      const choice = move.choice
+      if (choice.kind === 'fuse') {
+        const result = await mergeOperations(supabase, {
+          keeper: { id: choice.targetId, name: choice.targetName },
+          dups: [{ id: move.id, name: move.name, is_active: true }],
+          userId,
+          // Manager or admin only (the screens gate it), the tier that may move others' times.
+          allowForeignTimes: true,
+        })
+        if (result.stranded.length > 0 || result.reversals.length === 0) {
+          throw new Error(`the database refused to move every recorded time off "${move.name}"`)
+        }
+        // A live operation folded into a retired one leaves current work behind a hidden row.
+        if (!choice.targetIsActive) await reactivateOperation(supabase, choice.targetId)
+        completed.push(`Fused "${move.name}" into "${choice.targetName}" in ${destinationJobName} (${plural(result.reversals[0].movedTimeIds.length, 'recorded time')} re-pointed)`)
+        continue
+      }
+      if (choice.kind === 'rename') {
+        await renameOperation(supabase, move.id, choice.name)
+        completed.push(`Renamed "${move.name}" to "${choice.name.trim()}"`)
+      }
+      await setOperationJob(supabase, move.id, destinationJobId)
+      completed.push(`Moved "${choice.kind === 'rename' ? choice.name.trim() : move.name}" to ${destinationJobName}`)
+    }
+
+    if (retireJobId) {
+      // Filtered here rather than in the query: `is_active <> false` drops NULLs in SQL, and a
+      // null is a live operation.
+      const left = (await fetchAllRows<{ id: string; is_active?: boolean | null }>(
+        () => supabase.from('operations').select('id, is_active').eq('job_id', retireJobId).order('id'),
+        { table: 'operations' }
+      )).filter((o) => o.is_active !== false).length
+      if (left > 0) {
+        throw new Error(`"${retireJobName ?? 'the job'}" still holds ${plural(left, 'live operation')}, so it was not retired`)
+      }
+      await retireJob(supabase, retireJobId)
+      completed.push(`Retired job "${retireJobName ?? ''}"`)
+    }
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : 'a write was rejected'
+    throw new SectionActionError(`It stopped part-way: ${detail}${detail.endsWith('.') ? '' : '.'}`, completed)
+  }
+  return { completed }
 }

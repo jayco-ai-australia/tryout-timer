@@ -3,13 +3,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import ConfirmDialog from './ConfirmDialog'
+import SectionTeamMoveDialog from './SectionTeamMoveDialog'
 import {
   MergeConfirm, MergeFooter, MergeNotices, MergeRowItem, useMergeMode, type MergeRow,
 } from './MergeMode'
 import { plural } from '@/lib/format'
 import {
   countJobsInSectionByState, createSection, deleteSection, isSectionTray, moveSection, renameSection,
-  sectionMergeGroupKey, teamForJob,
+  sectionMergeGroupKey, sortSections, teamForJob,
 } from '@/lib/sections'
 import { jobMergeGroupKey } from '@/lib/jobs'
 import type { Job, Operation, Section, Team } from '@/lib/types'
@@ -202,7 +203,8 @@ export function Pane({
 export function SectionsPane({
   supabase, entries, sections, productionLineId, productionLineName, teams, selectedKey,
   runningKeys, readOnly = false, allowAdd = false, allowMerge = false,
-  defaultTeamId = '', onSelect, onChanged,
+  defaultTeamId = '', canMoveTeam = false, canDelete = true,
+  onMovedTeam, onSelect, onChanged,
 }: {
   supabase: SupabaseClient
   entries: SectionEntry[]
@@ -243,10 +245,22 @@ export function SectionsPane({
    * the team select comes back and a section still can't be created without one.
    */
   defaultTeamId?: string
+  /**
+   * Offers "Team…" on each real section row: move the section, and every job in it, to another
+   * of the line's teams. The host decides with lib/permissions' canMoveSectionToTeam; the pane
+   * never reads a role. Ignored under `readOnly` like every other per-row edit.
+   */
+  canMoveTeam?: boolean
+  /** Whether the per-row Delete (a real delete of an EMPTY section) is offered. The host decides
+   * with lib/permissions' canDeleteSection. Ignored under `readOnly`. */
+  canDelete?: boolean
+  /** Told what moved, so the host can say so — the section usually drops out of a team filter. */
+  onMovedTeam?: (summary: string) => void
   onSelect: (key: string) => void
   onChanged: () => Promise<void>
 }) {
   const [error, setError] = useState<string | null>(null)
+  const [moveTeamTarget, setMoveTeamTarget] = useState<Section | null>(null)
   const [busySectionId, setBusySectionId] = useState<string | null>(null)
 
   const [addingOpen, setAddingOpen] = useState(false)
@@ -277,7 +291,10 @@ export function SectionsPane({
   /** What a new section will actually be created under: the inherited team, or the one picked here. */
   const createTeamId = pinnedTeamId || newTeamId
 
-  const sectionIndex = useMemo(() => new Map(sections.map((s, i) => [s.id, i])), [sections])
+  // Positions among the sections that can MOVE: trays never move and sort last (99), so the last
+  // real section's ▼ is disabled rather than offering a step past a tray that does nothing.
+  const movableSections = useMemo(() => sortSections(sections.filter((s) => !isSectionTray(s))), [sections])
+  const sectionIndex = useMemo(() => new Map(movableSections.map((s, i) => [s.id, i])), [movableSections])
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault()
@@ -544,9 +561,9 @@ export function SectionsPane({
                         ▲
                       </button>
                       <button
-                        type="button" title="Move down" disabled={isBusy || index === sections.length - 1}
+                        type="button" title="Move down" disabled={isBusy || index === movableSections.length - 1}
                         onClick={() => handleMove(editableSection, 1)}
-                        style={{ background: 'none', border: 'none', padding: 0, lineHeight: 1, fontSize: 10, cursor: index === sections.length - 1 ? 'default' : 'pointer', color: index === sections.length - 1 ? 'var(--border)' : 'var(--text-muted)' }}
+                        style={{ background: 'none', border: 'none', padding: 0, lineHeight: 1, fontSize: 10, cursor: index === movableSections.length - 1 ? 'default' : 'pointer', color: index === movableSections.length - 1 ? 'var(--border)' : 'var(--text-muted)' }}
                       >
                         ▼
                       </button>
@@ -593,11 +610,22 @@ export function SectionsPane({
                   {editableSection && editingId !== editableSection.id && (
                     <>
                       <RenameButton title="Rename section" onClick={() => { setEditingId(editableSection.id); setEditDraft(editableSection.name) }} />
+                      {canMoveTeam && teams.length > 1 && (
+                        <button
+                          type="button"
+                          className="finder-row-action"
+                          disabled={isBusy}
+                          title="Move this section, and its jobs, to another team"
+                          onClick={(e) => { e.stopPropagation(); setError(null); setMoveTeamTarget(editableSection) }}
+                        >
+                          Team…
+                        </button>
+                      )}
                       <button
                         type="button"
                         className="finder-row-action finder-row-action-danger"
-                        disabled={isBusy}
-                        title="Delete section"
+                        disabled={isBusy || !canDelete}
+                        title={canDelete ? 'Delete this section — only possible once it holds no jobs' : 'Deleting a section is admin-only'}
                         onClick={(e) => { e.stopPropagation(); requestDelete(editableSection) }}
                       >
                         {isBusy ? '…' : 'Delete'}
@@ -643,6 +671,20 @@ export function SectionsPane({
           danger
           onConfirm={() => handleDelete(confirmDelete)}
           onCancel={() => setConfirmDelete(null)}
+        />
+      )}
+      {moveTeamTarget && (
+        <SectionTeamMoveDialog
+          supabase={supabase}
+          section={moveTeamTarget}
+          teams={teams}
+          onChanged={() => { onChanged() }}
+          onClose={() => setMoveTeamTarget(null)}
+          onMoved={async (_result, summary) => {
+            setMoveTeamTarget(null)
+            await onChanged()
+            onMovedTeam?.(summary)
+          }}
         />
       )}
       {/* One confirmation, one lib, three screens — see components/MergeMode. */}
@@ -763,14 +805,20 @@ export interface JobApplicability {
  */
 export function JobsPane({
   supabase, userId, entry, jobs, loading, operationsByJob, selectedJobId, canDelete, runningJobIds, applicability,
-  sectionsById, teamNameById, autoStartMergeJobId, modelApplicability, editHint,
-  onSelect, onAdd, onEdit, onEditLine, onDeleteRequest, onChanged,
+  sectionsById, teamNameById, autoStartMergeJobId, modelApplicability, editHint, lockedReason = null, canMoveOthersTimes = false,
+  onSelect, onAdd, onEdit, onDeleteRequest, onChanged,
 }: {
   /** Needed by merge mode alone — the job-merge write path lives in lib/jobs. */
   supabase: SupabaseClient
   /** Needed by merge mode alone. A job merge folds same-named operations together and a fold
    * moves recorded times, so the operation-level ownership guard applies here. See lib/jobs. */
   userId: string
+  /** Set when this person may not change structure (lib/permissions' canEditStructure): "+ Add
+   * job" and "Merge" stay in place, disabled, with this on hover. The host also withholds
+   * onEdit / onEditLine / onDeleteRequest. Unset, the pane is exactly as it always was. */
+  lockedReason?: string | null
+  /** Passed to merge mode — see MergeMode's canMoveOthersTimes. */
+  canMoveOthersTimes?: boolean
   entry: SectionEntry | null
   jobs: Job[]
   loading: boolean
@@ -810,7 +858,6 @@ export function JobsPane({
   /** Opens the caller's edit/reassign slide-over. Distinct from onSelect so the row's click
    * can stay "show me this job's operations" — selecting and editing must not collide. */
   onEdit?: (job: Job) => void
-  onEditLine?: (job: Job) => void
   onDeleteRequest?: (job: Job) => void
   /** Reload the host screen's structure — called after a merge. */
   onChanged: () => Promise<void>
@@ -831,7 +878,7 @@ export function JobsPane({
   /** Looked up in the FULL list, not the filtered one: a job stays selected — and its footer
    * actions stay reachable — while a search that doesn't match it narrows the rows. */
   const selectedJob = jobs.find((j) => j.id === selectedJobId) ?? null
-  const hasJobActions = Boolean(onEdit || onEditLine || (canDelete && onDeleteRequest))
+  const hasJobActions = Boolean(onEdit || (canDelete && onDeleteRequest))
 
   /**
    * The rows merge mode may offer: every job the pane is showing, grouped by SECTION. The pane is
@@ -848,7 +895,7 @@ export function JobsPane({
     subject: job,
   })), [shownJobs])
 
-  const merge = useMergeMode({ level: 'job', supabase, userId, rows: mergeRows, onMerged: async () => { await onChanged() } })
+  const merge = useMergeMode({ level: 'job', supabase, userId, canMoveOthersTimes, rows: mergeRows, onMerged: async () => { await onChanged() } })
 
   /** Fires once, and only once the job is actually in `mergeRows` — merge.toggle looks the row
    * up by id and ignores one it can't find, so arming before the pane has loaded would open an
@@ -912,10 +959,10 @@ export function JobsPane({
             ) : (
               // The two bottom-of-pane actions, side by side — the one place a merge is started.
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                <button className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12 }} onClick={() => setAddingOpen(true)}>
+                <button className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12 }} disabled={Boolean(lockedReason)} title={lockedReason ?? undefined} onClick={() => setAddingOpen(true)}>
                   + Add job
                 </button>
-                <MergeFooter merge={merge} />
+                <MergeFooter merge={merge} lockedReason={lockedReason} />
               </div>
             )}
 
@@ -928,14 +975,9 @@ export function JobsPane({
                       Edit / reassign
                     </button>
                   )}
-                  {onEditLine && (
-                    <button className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12 }} onClick={() => onEditLine(selectedJob)}>
-                      Line
-                    </button>
-                  )}
                   {canDelete && onDeleteRequest && (
                     <button className="btn-ghost" style={{ padding: '6px 11px', fontSize: 12, color: 'var(--red)' }} onClick={() => onDeleteRequest(selectedJob)}>
-                      Delete job
+                      Retire job
                     </button>
                   )}
                 </div>

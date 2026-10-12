@@ -1,8 +1,9 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import ConfirmDialog from '@/components/ConfirmDialog'
+import SectionTeamMoveDialog from '@/components/SectionTeamMoveDialog'
 import BulkModelLinkDrawer, { DRAWER_WIDTH, useSlideOverDrawer } from '@/components/BulkModelLinkDrawer'
 import OperationEditDrawer from '@/components/OperationEditDrawer'
 import { JobModelBadge } from '@/components/FinderPanes'
@@ -19,7 +20,10 @@ import {
 } from '@/lib/sections'
 import DuplicateJobsDrawer from '@/components/DuplicateJobsDrawer'
 import { createJob, deleteJobPermanently, jobMergeGroupKey, restoreJob, retireJob } from '@/lib/jobs'
-import { canDeleteSection, canRestoreJob } from '@/lib/permissions'
+import {
+  STRUCTURE_LOCKED_REASON, canDeletePermanently, canDeleteSection, canEditStructure, canRestoreJob,
+} from '@/lib/permissions'
+import RetiredItemsDialog, { RetiredBadge } from '@/components/RetiredItemsDialog'
 import { modelsForLine } from '@/lib/lines'
 import {
   createOperation, createOperations, parseOperationNames, retireOperation, setOperationJob,
@@ -143,6 +147,13 @@ const EMPTY_STRUCTURE: StructureData = {
   contentsByJob: new Map(),
 }
 
+/**
+ * Why this viewer can't change structure, or null when they can (lib/permissions'
+ * canEditStructure — manager or admin). A context rather than a prop because the controls it
+ * disables sit three components down, in every column and card.
+ */
+const StructureLock = createContext<string | null>(null)
+
 export default function LineConfigClient({ lines, role, userId, defaultLineId }: {
   lines: ProductionLine[]
   role: UserRole
@@ -197,7 +208,7 @@ export default function LineConfigClient({ lines, role, userId, defaultLineId }:
   const [expandedJobIds, setExpandedJobIds] = useState<Set<string>>(new Set())
 
   /**
-   * ── "Show deleted jobs" ────────────────────────────────────────────────────────────────
+   * ── "Show retired jobs" ────────────────────────────────────────────────────────────────
    *
    * OFF by default and session-scoped, not persisted: a retired job is retired, and a remembered
    * ON would show the next person rows the rest of the app has agreed to hide, in a pane whose
@@ -320,7 +331,9 @@ export default function LineConfigClient({ lines, role, userId, defaultLineId }:
     return () => { cancelled = true }
   }, [supabase, filtersRestored, lineId, version])
 
-  /** The team's own walk, in sort_order with its unsorted tray pinned first (lib/sections). */
+  /** This team's sections, in the LINE's sequence (lib/sections' sortSections: sort_order, then
+   * name). The numbers are line-wide, so they have gaps here where other teams' steps fall. The
+   * team's tray sits last, at 99. */
   const teamSections = useMemo(
     () => sortSections(sections.filter((s) => s.team_id === teamId)),
     [sections, teamId]
@@ -465,10 +478,9 @@ export default function LineConfigClient({ lines, role, userId, defaultLineId }:
    *
    * A stored id from another team shows an empty column with no explanation, so it is discarded
    * rather than honoured. The fallback is the team's first REAL section, not simply its first:
-   * sortSections pins the unsorted tray to the front of every walk, so `teamSections[0]` is
-   * almost always "No Section" — usually empty — and the page opened on a blank Jobs column even
-   * when the team had a perfectly good walk one row below. The tray is only chosen when it is
-   * genuinely all this team has.
+   * the unsorted tray is usually empty, and opening on it would show a blank Jobs column. (Trays
+   * now sort last at sort_order 99, so this guards the case where a team has no other section,
+   * or an un-numbered tray.) The tray is only chosen when it is genuinely all this team has.
    */
   const activeSectionId = useMemo(() => {
     if (teamSections.some((s) => s.id === sectionId)) return sectionId
@@ -622,7 +634,7 @@ export default function LineConfigClient({ lines, role, userId, defaultLineId }:
     return counts
   }, [teamSections, jobsBySection])
 
-  /** The other half of the delete guard: how many DELETED jobs still point at each section. The
+  /** The other half of the delete guard: how many RETIRED jobs still point at each section. The
    * number that used to be invisible, and the whole reason a delete could be refused on a section
    * showing "0 jobs". */
   const retiredCountBySection = useMemo(() => {
@@ -684,9 +696,10 @@ export default function LineConfigClient({ lines, role, userId, defaultLineId }:
   const jobMerge = useMergeMode({
     level: 'job',
     supabase,
-    // A job merge folds same-named operations together, and a fold moves recorded times — the
-    // ownership guard applies at this level too. See lib/jobs.
     userId,
+    // Merging is manager or admin here, the tier that may act on other people's recorded work,
+    // so the ownership guard is not applied.
+    canMoveOthersTimes: canEditStructure(role),
     rows: jobMergeRows,
     onMerged: async () => {
       const keeper = jobKeeperRef.current
@@ -745,6 +758,7 @@ export default function LineConfigClient({ lines, role, userId, defaultLineId }:
     level: 'operation',
     supabase,
     userId,
+    canMoveOthersTimes: canEditStructure(role),
     rows: operationMergeRows,
     onMerged: async () => {
       const job = opKeeperJobRef.current
@@ -797,9 +811,9 @@ export default function LineConfigClient({ lines, role, userId, defaultLineId }:
       : null
     if (keeper && keeper.is_active === false) {
       setPageError(
-        `“${keeper.name}” is a deleted job, so it can’t be the one that survives — keeping it would `
+        `“${keeper.name}” is a retired job, so it can’t be the one that survives — keeping it would `
         + 'hide the live job and leave the deleted shell in its place. Tick “Keep this name” on the '
-        + 'live job instead; the deleted job’s operations and recorded times move onto it.'
+        + 'live job instead; the retired job’s operations and recorded times move onto it.'
       )
       return
     }
@@ -838,9 +852,18 @@ export default function LineConfigClient({ lines, role, userId, defaultLineId }:
   const [purgeJobTarget, setPurgeJobTarget] = useState<Job | null>(null)
   const [deleteOperationTarget, setDeleteOperationTarget] = useState<{ operation: Operation; jobName: string } | null>(null)
   const [deleteSectionTarget, setDeleteSectionTarget] = useState<Section | null>(null)
+  const [moveTeamSectionTarget, setMoveTeamSectionTarget] = useState<Section | null>(null)
   const [moveJobTarget, setMoveJobTarget] = useState<Job | null>(null)
   const [moveOperationTarget, setMoveOperationTarget] = useState<{ operation: Operation; jobName: string } | null>(null)
   const [busy, setBusy] = useState(false)
+  /** Manager or admin — the ONE gate on every structure control on this screen. Everyone else
+   * can read the structure and open the model panel, and nothing else. */
+  const canEdit = canEditStructure(role)
+  const lockedReason = canEdit ? null : STRUCTURE_LOCKED_REASON
+  /** What the columns take as `busy`: their edit controls are disabled while a write runs, and
+   * for a viewer who may not edit at all. */
+  const editBusy = busy || !canEdit
+  const [retiredOpen, setRetiredOpen] = useState(false)
 
   /** Every write goes through here: one place that clears the banner, reports the failure and
    * reloads, so no handler can forget one of the three. */
@@ -911,6 +934,7 @@ export default function LineConfigClient({ lines, role, userId, defaultLineId }:
     const drag = dragging
     endJobDrag()
     if (!drag) return
+    if (!canEdit) { setPageError(`${STRUCTURE_LOCKED_REASON}.`); return }
 
     const moving = structure.jobs.filter((j) => drag.jobIds.includes(j.id) && j.section_id !== target.id)
     if (moving.length === 0) return
@@ -1061,11 +1085,21 @@ export default function LineConfigClient({ lines, role, userId, defaultLineId }:
           <div className="lc-filter-field" style={{ justifyContent: 'flex-end' }}>
             <button
               type="button" className="btn-ghost" style={{ fontSize: 12 }}
-              disabled={!lineId}
-              title="Every job name that appears more than once on this line, with how much work hangs off each copy"
+              disabled={!lineId || !canEdit}
+              title={lockedReason ?? 'Every job name that appears more than once on this line, with how much work hangs off each copy'}
               onClick={() => setDuplicatesOpen(true)}
             >
               Duplicate jobs
+            </button>
+            <button
+              type="button" className="btn-ghost" style={{ fontSize: 12 }}
+              disabled={!activeSection}
+              title={activeSection
+                ? `Retired jobs and operations in ${activeSection.name} — restore one, or permanently delete an empty one`
+                : 'Pick a section first'}
+              onClick={() => setRetiredOpen(true)}
+            >
+              Retired items
             </button>
           </div>
           {(loadingLine || loadingStructure) && (
@@ -1098,10 +1132,10 @@ export default function LineConfigClient({ lines, role, userId, defaultLineId }:
               {conflictOffer === 'retired' && !showRetired && (
                 <button
                   type="button" className="btn-ghost" style={{ fontSize: 12 }}
-                  title="Reveal the deleted jobs still filed on this team's sections"
+                  title="Reveal the retired jobs still filed on this team's sections"
                   onClick={() => setShowRetired(true)}
                 >
-                  Show deleted jobs
+                  Show retired jobs
                 </button>
               )}
             </div>
@@ -1117,7 +1151,13 @@ export default function LineConfigClient({ lines, role, userId, defaultLineId }:
         </p>
       )}
 
-      <div className="lc-columns">
+      {lockedReason && (
+        <p style={{ padding: '10px 14px', borderRadius: 8, background: 'var(--blue-light)', border: '1px solid #bcdff2', color: 'var(--blue-dark)', fontSize: 13, marginBottom: 14 }}>
+          You can view this line’s structure and open a job’s models. {STRUCTURE_LOCKED_REASON} — adding, renaming, reordering, moving, merging and retiring are disabled.
+        </p>
+      )}
+      <StructureLock.Provider value={lockedReason}>
+      <div className="lc-columns" title={lockedReason ?? undefined}>
         <SectionsColumn
           sections={teamSections}
           activeSectionId={activeSectionId}
@@ -1127,7 +1167,11 @@ export default function LineConfigClient({ lines, role, userId, defaultLineId }:
           // lib/permissions, not `role === 'admin'` inline — that module is where the UI's copy of
           // every RLS rule lives, and a screen spelling one out itself is a screen that drifts.
           canDelete={canDeleteSection(role)}
-          busy={busy}
+          // Manager+: it re-teams every job in the section at once. Offered only when there is
+          // another team on the line to move to.
+          canMoveTeam={canEdit && lineTeams.length > 1}
+          onMoveTeamRequest={setMoveTeamSectionTarget}
+          busy={editBusy}
           emptyLabel={emptySectionsLabel}
           merge={sectionMerge}
           onRequestMerge={() => { sectionKeeperRef.current = sectionMerge.primaryId; sectionMerge._requestMerge() }}
@@ -1140,15 +1184,16 @@ export default function LineConfigClient({ lines, role, userId, defaultLineId }:
             if (!lineId || !teamId) throw new Error('Pick a line and a team first')
             const created = await createSection(supabase, { name, productionLineId: lineId, teamId })
             setSectionId(created.id)
-            return `Section "${created.name}" added to the end of this team’s walk.`
+            return `Section "${created.name}" added to the end of the line’s sequence.`
           })}
           onRename={(section, name) => run('Renaming the section', async () => {
             await renameSection(supabase, section.id, name)
             return `Section renamed to "${name.trim()}".`
           })}
           onMove={(section, direction) => run('Reordering the sections', async () => {
-            // Reorders within THIS TEAM's walk only — sort_order is per team (lib/sections), so
-            // handing it the line's whole list would renumber other teams' steps too.
+            // teamSections only says which section this one steps past (the next of THIS team's,
+            // up or down). moveSection reads the whole line and writes one line-wide sequence;
+            // it used to renumber just this list 1..n, which is what made sort_order per team.
             await moveSection(supabase, teamSections, section.id, direction)
           })}
           onDeleteRequest={setDeleteSectionTarget}
@@ -1164,7 +1209,7 @@ export default function LineConfigClient({ lines, role, userId, defaultLineId }:
             retiredEmptyCount={retiredSplit.empty.length}
             retiredHoldingCount={retiredSplit.holding.length}
             retiredUnknownCount={retiredSplit.unknown.length}
-            purgeBlockedReason={purgeBlockedReason}
+            purgeBlockedReason={(job) => (canDeletePermanently(role) ? purgeBlockedReason(job) : 'Deleting permanently is admin-only')}
             // THE count the row shows and the count the × turns on, as one value. Passing the entry
             // rather than a number keeps "not counted yet" (null) distinguishable from "counted, and
             // it is zero" — the distinction the guard text now makes.
@@ -1189,7 +1234,7 @@ export default function LineConfigClient({ lines, role, userId, defaultLineId }:
             timeCountByOperation={timeCountByOperation}
             jobTimeCounts={jobTimeCounts}
             loading={loadingStructure}
-            busy={busy}
+            busy={editBusy}
             jobMerge={jobMerge}
             operationMerge={operationMerge}
             onToggleExpanded={toggleExpanded}
@@ -1225,6 +1270,7 @@ export default function LineConfigClient({ lines, role, userId, defaultLineId }:
           />
         </div>
       </div>
+      </StructureLock.Provider>
 
       {/* Both merge confirmations are the shared one — it states the keeper, the retired rows,
           how much moves and (for a job merge) which operations will COMBINE with a same-named
@@ -1351,7 +1397,7 @@ export default function LineConfigClient({ lines, role, userId, defaultLineId }:
                 // reappears in one you aren't looking at is indistinguishable from it having gone
                 // for good — and the next step (the merge) happens where it landed.
                 setSectionId(target.id)
-                return `“${job.name}” moved to ${target.name}. It is still deleted — tick it and the live job there, keep the live one, and its operations and recorded times move across.`
+                return `“${job.name}” moved to ${target.name}. It is still retired — tick it and the live job there, keep the live one, and its operations and recorded times move across.`
               }
               return `"${job.name}" moved to ${target.name}.`
             })
@@ -1423,7 +1469,7 @@ export default function LineConfigClient({ lines, role, userId, defaultLineId }:
 
       {deleteJobTarget && (
         <ConfirmDialog
-          title={`Delete "${deleteJobTarget.name}"`}
+          title={`Retire "${deleteJobTarget.name}"`}
           message={deleteMessage(
             'job',
             deleteJobTarget.name,
@@ -1431,16 +1477,16 @@ export default function LineConfigClient({ lines, role, userId, defaultLineId }:
             'operation',
             jobTimeCounts.get(deleteJobTarget.id) ?? 0
           )}
-          confirmLabel={busy ? 'Deleting…' : 'Delete job'}
+          confirmLabel={busy ? 'Retiring…' : 'Retire job'}
           danger
           maxWidth={520}
           onConfirm={() => {
             const job = deleteJobTarget
             setDeleteJobTarget(null)
-            run('Deleting the job', async () => {
+            run('Retiring the job', async () => {
               await retireJob(supabase, job.id)
               setExpandedJobIds((prev) => { const n = new Set(prev); n.delete(job.id); return n })
-              return `"${job.name}" deleted. Its operations and their recorded times are kept and can be restored in the database.`
+              return `"${job.name}" retired. Its operations and their recorded times are kept — turn on “Show retired jobs” to restore it.`
             })
           }}
           onCancel={() => setDeleteJobTarget(null)}
@@ -1449,7 +1495,7 @@ export default function LineConfigClient({ lines, role, userId, defaultLineId }:
 
       {deleteOperationTarget && (
         <ConfirmDialog
-          title={`Delete "${deleteOperationTarget.operation.name}"`}
+          title={`Retire "${deleteOperationTarget.operation.name}"`}
           message={deleteMessage(
             'operation',
             deleteOperationTarget.operation.name,
@@ -1457,18 +1503,51 @@ export default function LineConfigClient({ lines, role, userId, defaultLineId }:
             null,
             timeCountByOperation.get(deleteOperationTarget.operation.id) ?? 0
           )}
-          confirmLabel={busy ? 'Deleting…' : 'Delete operation'}
+          confirmLabel={busy ? 'Retiring…' : 'Retire operation'}
           danger
           maxWidth={520}
           onConfirm={() => {
             const { operation } = deleteOperationTarget
             setDeleteOperationTarget(null)
-            run('Deleting the operation', async () => {
+            run('Retiring the operation', async () => {
               await retireOperation(supabase, operation.id)
-              return `"${operation.name}" deleted. Its recorded times and model links are kept and can be restored in the database.`
+              return `"${operation.name}" retired. Its recorded times and model links are kept — restore it from Retired items.`
             })
           }}
           onCancel={() => setDeleteOperationTarget(null)}
+        />
+      )}
+
+      {retiredOpen && activeSection && (
+        <RetiredItemsDialog
+          supabase={supabase}
+          userId={userId}
+          role={role}
+          sectionId={activeSection.id}
+          sectionName={activeSection.name}
+          onClose={() => setRetiredOpen(false)}
+          onChanged={reload}
+        />
+      )}
+
+      {moveTeamSectionTarget && (
+        <SectionTeamMoveDialog
+          supabase={supabase}
+          section={moveTeamSectionTarget}
+          // This line's teams only — nothing crosses a production line.
+          teams={lineTeams}
+          onChanged={reload}
+          onClose={() => setMoveTeamSectionTarget(null)}
+          onMoved={(result, summary) => {
+            setMoveTeamSectionTarget(null)
+            setPageError(null)
+            setNotice(summary)
+            // Follow it: the section has just left the team this column is showing, and the
+            // natural next look is at where it landed.
+            if (result.section.team_id) setTeamId(result.section.team_id)
+            setSectionId(result.section.id)
+            reload()
+          }}
         />
       )}
 
@@ -1491,7 +1570,7 @@ export default function LineConfigClient({ lines, role, userId, defaultLineId }:
               // team's pane still points at the section and would be orphaned by the delete.
               //
               // SPLIT by is_active, because the two cases are not the same problem. Live jobs are
-              // on screen and the user moves them. A DELETED job is on no screen in the app, and
+              // on screen and the user moves them. A RETIRED job is on no screen in the app, and
               // the old single count could only say "1 job still points at this section" about a
               // section showing none — true, unactionable, and the complaint that produced this
               // change. Now it names which kind and which control reveals it.
@@ -1514,18 +1593,18 @@ export default function LineConfigClient({ lines, role, userId, defaultLineId }:
                 // rescuing operations and recorded times would be about work that does not exist.
                 if (blockers.length > 0 && blockers.every((j) => isEmptyShell(j))) {
                   throw new Error(
-                    `${plural(retired, 'deleted job')} still ${retired === 1 ? 'points' : 'point'} at ` +
-                    `this section${named}, holding nothing at all. Turn on “Show deleted jobs” in the ` +
+                    `${plural(retired, 'retired job')} still ${retired === 1 ? 'points' : 'point'} at ` +
+                    `this section${named}, holding nothing at all. Turn on “Show retired jobs” in the ` +
                     `Jobs column and press × to delete ${retired === 1 ? 'it' : 'them'}, then delete ` +
                     'this section.'
                   )
                 }
                 throw new Error(
-                  `no live jobs are in this section, but ${plural(retired, 'DELETED job')} still ` +
+                  `no live jobs are in this section, but ${plural(retired, 'RETIRED job')} still ` +
                   `${retired === 1 ? 'points' : 'point'} at it${named}. ` +
                   `Deleting the section would leave ${retired === 1 ? 'that row' : 'those rows'} — and ` +
                   `every operation and recorded time under ${retired === 1 ? 'it' : 'them'} — filed ` +
-                  'against a section that no longer exists. Turn on “Show deleted jobs” in the Jobs ' +
+                  'against a section that no longer exists. Turn on “Show retired jobs” in the Jobs ' +
                   `column: from there ${retired === 1 ? 'it' : 'each one'} can be MERGED into the live ` +
                   'job that replaced it (which keeps the operations and recorded times), RESTORED as a ' +
                   'live job, or MOVED to another section on this team.'
@@ -1560,8 +1639,8 @@ function deleteMessage(
     : ' Nothing has been timed against it.'
   return (
     `"${name}" stops appearing anywhere in the app.${children}${times} ` +
-    `This is a soft delete — the ${noun} is marked inactive, not destroyed, and reactivating the ` +
-    'row in the database brings it back exactly as it was.'
+    `This is a retire, not a delete — the ${noun} is marked inactive, nothing is destroyed, and ` +
+    'restoring it brings it back exactly as it was.'
   )
 }
 
@@ -1577,7 +1656,7 @@ function deleteMessage(
  */
 function SectionsColumn({
   sections, activeSectionId, jobCountBySection, retiredCountBySection, retiredEmptyOnlySections,
-  canDelete, busy, emptyLabel,
+  canDelete, canMoveTeam, onMoveTeamRequest, busy, emptyLabel,
   merge, dragging, dragOverSectionId,
   onRequestMerge, onDragOverSection, onDropOnSection,
   onSelect, onAdd, onRename, onMove, onDeleteRequest,
@@ -1593,6 +1672,9 @@ function SectionsColumn({
    * than at a merge, because there is no work to weigh up. */
   retiredEmptyOnlySections: Set<string>
   canDelete: boolean
+  /** Manager+ (lib/permissions' canMoveSectionToTeam), and only with another team on the line. */
+  canMoveTeam: boolean
+  onMoveTeamRequest: (section: Section) => void
   busy: boolean
   /** "Cab has no sections yet on Camper Trailer." — built by the host, which is the only place
    * that knows both names. */
@@ -1722,7 +1804,7 @@ function SectionsColumn({
                   <span className="lc-section-count">
                     {plural(count, 'job')}
                     {retiredCount > 0 && (
-                      <span title={`${plural(retiredCount, 'deleted job')} still filed here — hidden until “Show deleted jobs” is on`}>
+                      <span title={`${plural(retiredCount, 'retired job')} still filed here — hidden until “Show retired jobs” is on`}>
                         {' · '}+{retiredCount} deleted
                       </span>
                     )}
@@ -1732,7 +1814,8 @@ function SectionsColumn({
                 <button
                   type="button" className="lc-icon-btn" aria-label={`Move ${section.name} up`}
                   title={trayReason ?? 'Move up the walk'}
-                  disabled={busy || tray || index === 0 || isSectionTray(sections[index - 1])}
+                  // Nothing to step past: no real section above (trays never move, and sit last).
+                  disabled={busy || tray || !sections.slice(0, index).some((s) => !isSectionTray(s))}
                   onClick={() => onMove(section, -1)}
                 >
                   ↑
@@ -1740,7 +1823,7 @@ function SectionsColumn({
                 <button
                   type="button" className="lc-icon-btn" aria-label={`Move ${section.name} down`}
                   title={trayReason ?? 'Move down the walk'}
-                  disabled={busy || tray || index === sections.length - 1}
+                  disabled={busy || tray || !sections.slice(index + 1).some((s) => !isSectionTray(s))}
                   onClick={() => onMove(section, 1)}
                 >
                   ↓
@@ -1753,6 +1836,18 @@ function SectionsColumn({
                 >
                   ✎
                 </button>
+                {canMoveTeam && (
+                  <button
+                    type="button" className="lc-icon-btn" aria-label={`Move ${section.name} to another team`}
+                    title={tray
+                      ? 'This is the team’s unsorted tray — every team has its own, so it can’t move between teams.'
+                      : 'Move this section, and its jobs, to another team'}
+                    disabled={busy || tray}
+                    onClick={() => onMoveTeamRequest(section)}
+                  >
+                    ⇄
+                  </button>
+                )}
                 <button
                   type="button" className="lc-icon-btn" aria-label={`Delete ${section.name}`}
                   // The disabled reason is the whole point of the control here — a section with
@@ -1763,14 +1858,14 @@ function SectionsColumn({
                       ?? (!canDelete ? 'Deleting a section is restricted to admins'
                         : count > 0 ? `"${section.name}" still holds ${plural(count, 'job')} — move them to another section first`
                           // The state that used to enable this button and then fail: no live jobs,
-                          // so the row reads "0 jobs", but a deleted job still points here. Said
+                          // so the row reads "0 jobs", but a retired job still points here. Said
                           // on the control rather than discovered after pressing it.
                           : retiredCount > 0
                             ? retiredEmptyOnlySections.has(section.id)
                               // Nothing under them, so the route out is one button and the tooltip
                               // says which one.
-                              ? `"${section.name}" holds no live jobs, but ${plural(retiredCount, 'deleted job')} still ${retiredCount === 1 ? 'points' : 'point'} at it, holding nothing — turn on “Show deleted jobs” in the Jobs column and press × to delete ${retiredCount === 1 ? 'it' : 'them'}`
-                              : `"${section.name}" holds no live jobs, but ${plural(retiredCount, 'deleted job')} still ${retiredCount === 1 ? 'points' : 'point'} at it — turn on “Show deleted jobs” in the Jobs column, where ${retiredCount === 1 ? 'it' : 'each one'} can be merged into the live job that replaced it, restored, or moved to another section`
+                              ? `"${section.name}" holds no live jobs, but ${plural(retiredCount, 'retired job')} still ${retiredCount === 1 ? 'points' : 'point'} at it, holding nothing — turn on “Show retired jobs” in the Jobs column and press × to delete ${retiredCount === 1 ? 'it' : 'them'}`
+                              : `"${section.name}" holds no live jobs, but ${plural(retiredCount, 'retired job')} still ${retiredCount === 1 ? 'points' : 'point'} at it — turn on “Show retired jobs” in the Jobs column, where ${retiredCount === 1 ? 'it' : 'each one'} can be merged into the live job that replaced it, restored, or moved to another section`
                             : 'Delete this section')
                   }
                   disabled={busy || tray || !canDelete || count > 0 || retiredCount > 0}
@@ -1923,8 +2018,8 @@ function JobsColumn({
               style={{ padding: '5px 9px', fontSize: 11 }}
               aria-pressed={showRetired}
               title={showRetired
-                ? 'Hide deleted jobs again'
-                : `${plural(retiredJobs.length, 'deleted job')} still filed in this section — they block a section delete and hold their name against this team, so they are worth seeing`}
+                ? 'Hide retired jobs again'
+                : `${plural(retiredJobs.length, 'retired job')} still filed in this section — they block a section delete and hold their name against this team, so they are worth seeing`}
               onClick={onToggleRetired}
             >
               {showRetired
@@ -1962,7 +2057,7 @@ function JobsColumn({
             {/* The sentence that used to be missing entirely: "no jobs" and "nothing points here"
                 are different claims, and only the second one lets the section be deleted. */}
             {retiredJobs.length > 0 && !showRetired && (
-              <> {plural(retiredJobs.length, 'deleted job')} still {retiredJobs.length === 1 ? 'points' : 'point'} at
+              <> {plural(retiredJobs.length, 'retired job')} still {retiredJobs.length === 1 ? 'points' : 'point'} at
                 it, which is enough to block deleting the section — press <strong>Show {retiredJobs.length} deleted</strong> above.</>
             )}
           </p>
@@ -2013,11 +2108,11 @@ function JobsColumn({
               // Neither claim made. The count has not arrived, so the row says so rather than
               // asserting there is work to rescue — the state that used to be indistinguishable.
               <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '0 0 8px', lineHeight: 1.55 }}>
-                Checking what {retiredUnknownCount === 1 ? 'this deleted job holds' : 'these deleted jobs hold'}…
+                Checking what {retiredUnknownCount === 1 ? 'this retired job holds' : 'these retired jobs hold'}…
               </p>
             ) : retiredHoldingCount === 0 ? (
               <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '0 0 8px', lineHeight: 1.55 }}>
-                <strong>{plural(retiredEmptyCount, 'deleted job')}</strong>, holding no operations and
+                <strong>{plural(retiredEmptyCount, 'retired job')}</strong>, holding no operations and
                 no recorded times. Nothing to rescue — press <strong>×</strong> to delete the row and
                 this section is clear.
                 {retiredUnknownCount > 0 && (
@@ -2026,7 +2121,7 @@ function JobsColumn({
               </p>
             ) : (
               <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '0 0 8px', lineHeight: 1.55 }}>
-                <strong>{plural(retiredHoldingCount, 'deleted job')}</strong> here still{' '}
+                <strong>{plural(retiredHoldingCount, 'retired job')}</strong> here still{' '}
                 {retiredHoldingCount === 1 ? 'holds' : 'hold'} operations or recorded times, which is
                 why {retiredHoldingCount === 1 ? 'it blocks' : 'they block'} deleting this section.
                 {' '}<strong>Merge</strong> folds that work onto the live job that replaced it — the
@@ -2131,6 +2226,7 @@ function MergeBar({ merge, noun, scopeLabel, onRequest }: {
   scopeLabel: string
   onRequest: () => void
 }) {
+  const lockedReason = useContext(StructureLock)
   if (merge.count < 2) return null
   const ready = merge.primaryId !== null
 
@@ -2148,8 +2244,8 @@ function MergeBar({ merge, noun, scopeLabel, onRequest }: {
       <button
         type="button"
         className="btn-danger"
-        disabled={merge.busy || !ready}
-        title={ready ? undefined : `Choose which ${noun} to keep first`}
+        disabled={merge.busy || !ready || Boolean(lockedReason)}
+        title={lockedReason ?? (ready ? undefined : `Choose which ${noun} to keep first`)}
         onClick={onRequest}
       >
         {merge.busy ? 'Checking…' : `Merge ${plural(merge.count, noun)}`}
@@ -2186,7 +2282,7 @@ function JobCard({
    * Why × may not destroy this retired row, or null when it may. Only read when `retired`: on a live
    * job × is the soft delete and is always offered.
    *
-   * The × on a retired row USED TO BE DISABLED outright ("Already deleted") — and the handler behind
+   * The × on a retired row USED TO BE DISABLED outright ("Already retired") — and the handler behind
    * it was the soft delete, which on an is_active = false row writes false over false and changes
    * nothing. Either way it was a dead control on the one row that had no other way out.
    */
@@ -2305,7 +2401,7 @@ function JobCard({
             {expanded ? '▾' : '▸'}
           </span>
           {job.name}
-          {retired && <span className="badge" style={{ marginLeft: 8, fontSize: 10 }}>Deleted</span>}
+          {retired && <span style={{ marginLeft: 8 }}><RetiredBadge /></span>}
         </button>
         <span className="lc-job-meta">
           {hasTimes && (
@@ -2337,7 +2433,7 @@ function JobCard({
           />
           {/* Restore sits FIRST on a retired row and is a worded button rather than a glyph: the
               other three tools are icons because their meaning is conventional, and "bring this
-              deleted job back" is not something an icon can say. Disabled with the reason when the
+              retired job back" is not something an icon can say. Disabled with the reason when the
               role can't, never hidden. */}
           {retired && (
             <button
@@ -2347,7 +2443,7 @@ function JobCard({
               disabled={busy || !canRestore}
               title={canRestore
                 ? 'Bring this job back as a live job — it can then be renamed, merged or re-filed like any other'
-                : 'Restoring a deleted job is not available to your role'}
+                : 'Restoring a retired job is not available to your role'}
               onClick={onRestore}
             >
               Restore
@@ -2356,7 +2452,7 @@ function JobCard({
           <button
             type="button" className="lc-icon-btn"
             title={retired
-              ? 'Move this deleted job to another section on this team — that is what clears the block on deleting this one'
+              ? 'Move this retired job to another section on this team — that is what clears the block on deleting this one'
               : 'Move to another section'}
             aria-label={`Move ${job.name}`} disabled={busy} onClick={onMove}
           >
@@ -2371,8 +2467,8 @@ function JobCard({
             className="lc-icon-btn"
             title={retired
               ? purgeBlockedReason ?? `Permanently delete the "${job.name}" row — it holds nothing, and this cannot be undone`
-              : 'Delete this job'}
-            aria-label={retired ? `Permanently delete ${job.name}` : `Delete ${job.name}`}
+              : 'Retire this job — hidden everywhere, with its operations and times kept'}
+            aria-label={retired ? `Permanently delete ${job.name}` : `Retire ${job.name}`}
             disabled={busy || (retired && Boolean(purgeBlockedReason))}
             onClick={retired ? onPurge : onDelete}
           >
@@ -2386,14 +2482,14 @@ function JobCard({
           ordering. */}
       {ticked && (
         <div style={{ padding: '0 12px 8px 12px' }}>
-          {/* A DELETED job may never be the survivor: a merge retires whatever it folds away, so
+          {/* A RETIRED job may never be the survivor: a merge retires whatever it folds away, so
               keeping this side would hide the live job and leave the shell standing — the exact
               inverse of the repair. Disabled here and re-checked before the preflight, because the
               UI is not the only way in. */}
           <label
             className={'lc-keeper' + (isKeeper ? ' lc-keeper-on' : '')}
             title={retired
-              ? 'A deleted job can’t be the one that survives — keep the live job instead'
+              ? 'A retired job can’t be the one that survives — keep the live job instead'
               : undefined}
             style={retired ? { opacity: 0.6 } : undefined}
           >
@@ -2405,7 +2501,7 @@ function JobCard({
               style={{ width: 18, height: 18, accentColor: 'var(--blue)', cursor: 'pointer' }}
               onChange={() => jobMerge.setPrimary(job.id)}
             />
-            {retired ? 'Can’t keep a deleted job' : 'Keep this name'}
+            {retired ? 'Can’t keep a retired job' : 'Keep this name'}
           </label>
         </div>
       )}
@@ -2469,8 +2565,8 @@ function JobCard({
                     type="button" className="lc-icon-btn"
                     // Already retired: retireOperation would write false over false and change
                     // nothing — the same dead-button shape the job-level × had.
-                    title={op.is_active === false ? 'Already deleted' : 'Delete this operation'}
-                    aria-label={`Delete ${op.name}`}
+                    title={op.is_active === false ? 'Already retired' : 'Retire this operation — hidden everywhere, with its times and model links kept'}
+                    aria-label={`Retire ${op.name}`}
                     disabled={busy || op.is_active === false}
                     onClick={() => onDeleteOperation(op)}
                   >

@@ -1,5 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { WRITE_CHUNK, chunked } from './modelOperations'
+import { restampTimesForOperation } from './operationTimes'
 import type { Operation } from './types'
 
 /**
@@ -104,8 +105,9 @@ export async function createOperations(
  * lib/jobs' mergeJobs both go through it, so re-filing an operation means the same thing however
  * it is reached.
  *
- * An operation's recorded times, notes and model links ride along untouched: they hang off
- * operation_id, not job_id, so nothing has to be migrated when the operation changes job.
+ * An operation's recorded times, notes and model links ride along: they hang off operation_id,
+ * not job_id. The one thing written on a time is its team/line stamp, which is re-stamped to the
+ * destination job's (lib/operationTimes' restampTimesForOperation).
  *
  * The row is read back because an update filtered out by RLS succeeds having changed nothing —
  * the failure mode that would let a merge retire a job with operations still pointing at it.
@@ -121,6 +123,17 @@ export async function setOperationJob(
   if (error) throw new Error(error.message)
   if (!data || data.length === 0) {
     throw new Error("That operation's job could not be changed — the change was rejected by the database (check your permissions).")
+  }
+
+  // Its recorded times follow it: the destination job may sit under another team or line, and
+  // the stamp on each time is a copy of that. See the re-stamping note in lib/operationTimes.
+  try {
+    await restampTimesForOperation(supabase, operationId)
+  } catch (err) {
+    throw new Error(
+      `The operation moved, but its recorded times could not all be re-stamped: ` +
+      `${err instanceof Error ? err.message : 'rejected'}. Move it again to retry.`
+    )
   }
 }
 
@@ -168,6 +181,43 @@ export async function reactivateOperation(supabase: SupabaseClient, operationId:
   if (error) throw new Error(error.message)
   if (!data || data.length === 0) {
     throw new Error('That operation could not be brought back — the change was rejected by the database (check your permissions).')
+  }
+}
+
+/**
+ * ── The only function anywhere that HARD-deletes an operation ──────────────────────────────
+ *
+ * Destroys the row. Not a retire — retireOperation is what every "Retire" does, and what keeps
+ * the work recoverable. This exists for one case: a RETIRED SHELL, an operation already retired
+ * that holds nothing at all — the row a merge leaves behind once its times and model links have
+ * moved to the keeper.
+ *
+ * The guard is counted here, at the moment of writing, rather than trusted from the caller:
+ * operation_times.operation_id and model_operations.operation_id both cascade, so deleting an
+ * operation that still held either would destroy it with no way back from a browser.
+ */
+export async function deleteOperationPermanently(supabase: SupabaseClient, operationId: string): Promise<void> {
+  const { data: subject, error: subjectError } = await supabase
+    .from('operations').select('id, name, is_active').eq('id', operationId).single()
+  if (subjectError || !subject) throw new Error(subjectError?.message ?? 'That operation no longer exists')
+  if (subject.is_active !== false) {
+    throw new Error(`"${subject.name}" is a live operation — retire it first. Only a retired, empty operation can be deleted permanently.`)
+  }
+  const [{ count: times, error: timesError }, { count: links, error: linksError }] = await Promise.all([
+    supabase.from('operation_times').select('id', { count: 'exact', head: true }).eq('operation_id', operationId),
+    supabase.from('model_operations').select('operation_id', { count: 'exact', head: true }).eq('operation_id', operationId),
+  ])
+  if (timesError || linksError) throw new Error(`Checking what this operation holds: ${(timesError ?? linksError)!.message}`)
+  if ((times ?? 0) > 0 || (links ?? 0) > 0) {
+    throw new Error(
+      `"${subject.name}" is not empty — it holds ${times ?? 0} recorded time${times === 1 ? '' : 's'} and ` +
+      `${links ?? 0} model link${links === 1 ? '' : 's'}, which a permanent delete would destroy. Restore it, or merge it into the operation that replaced it.`
+    )
+  }
+  const { data, error } = await supabase.from('operations').delete().eq('id', operationId).select('id')
+  if (error) throw new Error(error.message)
+  if (!data || data.length === 0) {
+    throw new Error('That operation could not be deleted — the database rejected it (check your permissions). Nothing was changed.')
   }
 }
 

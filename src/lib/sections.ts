@@ -1,6 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
-import { READ_CHUNK, chunked } from './modelOperations'
-import { fetchAllChunked, fetchAllRows } from './supabaseRead'
+import { restampTimesForJob } from './operationTimes'
+import { fetchAllRows } from './supabaseRead'
 import type { Section } from './types'
 import { selectIn } from './chunkedIn'
 
@@ -74,29 +74,69 @@ export function findSectionTray<T extends { name: string; production_line_id: st
   return trays.length === 1 ? trays[0] : null
 }
 
+/** The minimum of a section needed to place it in the line's sequence. */
+export interface SectionOrderRef { id: string; name: string; sort_order: number | null }
+
 /**
- * Walk order: unsorted trays first, then sort_order ascending with un-numbered sections last,
- * and name — then id — as tie-breaks so the list can never flip around between renders.
+ * THE section order — the one comparator every screen sorts sections with: sort_order ascending
+ * (un-numbered last), then name, then id so equal positions can never swap between loads.
  *
- * A tray is pinned to the front here rather than left to its sort_order — it is the inbox, and a
- * walk starts by clearing what hasn't been sorted yet. Pinning it in the comparator means it
- * lands first even if a row's sort_order was never set to 0.
+ * sort_order is ONE LINE-WIDE SEQUENCE, independent of team: Caravan runs 1 (CHASSIS PREP)
+ * through 25 (PRE ASSEMBLE), with retired sections and the "No Section" trays parked at 99. So
+ * nothing here looks at the team — not first, not as a group, not as a tie-break. It used to:
+ * sort_order was numbered per team, and screens ordered team-first (by team NAME), which put
+ * Quality's end-of-line Gate/Rework sections (21–23) above CHASSIS PREP (1). And the trays are no
+ * longer pinned to the front; they sit where their 99 puts them, at the end.
  *
- * An unfiltered line now yields SEVERAL trays, one per team, which every tie-break above ties on
- * (same name, same sort_order 0). The id tie-break is what keeps their order stable between
- * renders; the pane tells them apart by showing each tray's team.
+ * Used by sortSections below, and directly by /labour-matrix's Section grain and /model-total's
+ * Section Detail sheet, so no screen can order sections differently from another.
  */
-export function sortSections(sections: Section[]): Section[] {
-  return [...sections].sort((a, b) => {
-    const aTray = isSectionTray(a)
-    const bTray = isSectionTray(b)
-    if (aTray !== bTray) return aTray ? -1 : 1
-    const aOrder = a.sort_order ?? Number.MAX_SAFE_INTEGER
-    const bOrder = b.sort_order ?? Number.MAX_SAFE_INTEGER
-    if (aOrder !== bOrder) return aOrder - bOrder
-    const byName = a.name.localeCompare(b.name)
-    return byName !== 0 ? byName : a.id.localeCompare(b.id)
-  })
+export function compareSections(a: SectionOrderRef, b: SectionOrderRef): number {
+  const aOrder = a.sort_order ?? Number.MAX_SAFE_INTEGER
+  const bOrder = b.sort_order ?? Number.MAX_SAFE_INTEGER
+  if (aOrder !== bOrder) return aOrder - bOrder
+  const byName = a.name.localeCompare(b.name)
+  return byName !== 0 ? byName : a.id.localeCompare(b.id)
+}
+
+/** A sorted copy, in the line's sequence (compareSections). Every pane, picker and list of
+ * sections goes through this. */
+export function sortSections<T extends SectionOrderRef>(sections: T[]): T[] {
+  return [...sections].sort(compareSections)
+}
+
+/** One team's sections, in the line's sequence. `key` is the team id, '' for "no team". */
+export interface TeamSectionGroup<T> { key: string; teamId: string | null; name: string; sections: T[] }
+
+/**
+ * THE Team → Section grouping — /config's Sections table and /model-total's breakdown, so the
+ * same structure reads in the same order on both.
+ *
+ * Team FIRST, then the line's sequence within the team (compareSections). sort_order is one
+ * line-wide sequence, so sorting by it alone interleaves the teams and fragments each team's
+ * span; grouping first is what keeps a team's sections together. Between teams: by where each
+ * team first appears in that sequence (its first non-tray section — a tray is parked at 99 and
+ * says nothing about where the team works), then name. Teams carry no sort_order of their own.
+ */
+export function groupSectionsByTeam<T extends SectionOrderRef & { team_id: string | null }>(
+  sections: T[],
+  teamName: (teamId: string | null) => string
+): TeamSectionGroup<T>[] {
+  const byTeam = new Map<string, T[]>()
+  for (const section of sections) {
+    const key = section.team_id ?? ''
+    byTeam.set(key, [...(byTeam.get(key) ?? []), section])
+  }
+  return [...byTeam.entries()]
+    .map(([key, rows]) => {
+      const sorted = sortSections(rows)
+      return { key, teamId: key || null, name: teamName(key || null), sections: sorted, first: sorted.find((s) => !isSectionTray(s)) ?? sorted[0] }
+    })
+    .sort((a, b) => compareSections(
+      { id: a.key, name: a.name, sort_order: a.first.sort_order },
+      { id: b.key, name: b.name, sort_order: b.first.sort_order }
+    ))
+    .map(({ key, teamId, name, sections: rows }) => ({ key, teamId, name, sections: rows }))
 }
 
 /** The minimum of a job needed to work out whose team it is: which section it sits in. */
@@ -144,34 +184,21 @@ export async function fetchSectionsForLine(supabase: SupabaseClient, productionL
 }
 
 /**
- * Where a new section lands in that TEAM's walk: the end of it.
+ * Where a new section lands: the end of the LINE's sequence, whatever team it is on.
  *
- * Sort order is per team, not per line. Each team on the line numbers its own steps from 1 with
- * its tray at 0, so the max has to be read within the team as well as the line — scoped to the
- * line alone, a new section on a quiet team would inherit a number from the busiest team on the
- * line and land far past its own last step. (Scoping to the line was safe only while a line had
- * one tray and one walk; it has one walk per team now.)
+ * sort_order is one line-wide sequence (see compareSections), so the max is read across the
+ * whole line, not within the team. It used to be read per team, which gave a new section a
+ * number from its own team's short list and dropped it into the middle of the line.
  *
- * Reads the current max rather than counting rows, so a gap in sort_order (or a deleted section)
- * can't produce a duplicate.
- *
- * Deliberately NOT filtered to is_active: a retired section still holds its sort_order, and
- * ignoring it here would hand its number to a new section. Two rows sharing a number is exactly
- * the state reorderSections exists to repair, and a merged-away section could be reactivated in
- * the database at any time.
+ * The max is taken over ACTIVE, NON-TRAY sections only. Retired sections and the "No Section"
+ * trays are parked at 99, outside the sequence, and counting them would put every new section at
+ * 100, behind the trays. Reads the max rather than counting rows, so a gap in the sequence can't
+ * produce a duplicate.
  */
-export async function nextSectionSortOrder(
-  supabase: SupabaseClient, productionLineId: string, teamId: string
-): Promise<number> {
-  const { data, error } = await supabase
-    .from('sections')
-    .select('sort_order')
-    .eq('production_line_id', productionLineId)
-    .eq('team_id', teamId)
-    .order('sort_order', { ascending: false })
-    .limit(1)
-  if (error) throw new Error(error.message)
-  return ((data?.[0]?.sort_order as number | null) ?? 0) + 1
+export async function nextSectionSortOrder(supabase: SupabaseClient, productionLineId: string): Promise<number> {
+  const rows = await fetchSectionsForLine(supabase, productionLineId)
+  const numbers = rows.filter((r) => !isSectionTray(r)).map((r) => r.sort_order ?? 0)
+  return (numbers.length > 0 ? Math.max(...numbers) : 0) + 1
 }
 
 export interface CreateSectionInput {
@@ -193,7 +220,7 @@ export async function createSection(supabase: SupabaseClient, input: CreateSecti
     throw new Error(`"${NO_SECTION_NAME}" is the name of the team's unsorted tray — pick another name.`)
   }
 
-  const sortOrder = await nextSectionSortOrder(supabase, input.productionLineId, input.teamId)
+  const sortOrder = await nextSectionSortOrder(supabase, input.productionLineId)
 
   const { data, error } = await supabase
     .from('sections')
@@ -231,17 +258,24 @@ export async function renameSection(supabase: SupabaseClient, sectionId: string,
 }
 
 /**
- * Renumbers a line's sections to the given order, writing sort_order = 1..n. Only rows whose
- * number actually changes are written.
+ * Renumbers a line's sequence to the given order, writing sort_order = 1..n. Only rows whose
+ * number actually changes are written. Hand it the WHOLE line's active, non-tray sections —
+ * moveSection does; a subset (one team's) would be renumbered 1..n on top of everyone else's
+ * numbers, which is the per-team sequence this replaced.
  *
  * Renumbering the whole list — rather than swapping two rows' sort_order values — is deliberate:
  * existing data has sections with null or duplicated sort_order, and a value swap between two of
  * those is a no-op that silently leaves the order unchanged.
  */
-export async function reorderSections(supabase: SupabaseClient, orderedSections: Section[]): Promise<void> {
+export async function reorderSections(
+  supabase: SupabaseClient, orderedSections: Section[],
+  /** The numbers to hand out, in order, instead of 1..n. moveSection passes the line's existing
+   * numbers so a move keeps them (gaps included) and only re-deals them. */
+  numbers?: number[],
+): Promise<void> {
   for (let i = 0; i < orderedSections.length; i++) {
     const section = orderedSections[i]
-    const target = i + 1
+    const target = numbers?.[i] ?? i + 1
     if (section.sort_order === target) continue
     const { data, error } = await supabase
       .from('sections').update({ sort_order: target }).eq('id', section.id).select('id')
@@ -252,18 +286,46 @@ export async function reorderSections(supabase: SupabaseClient, orderedSections:
   }
 }
 
-/** Moves one section one place up or down the walk and writes the resulting order. Returns the
- * new order so a caller can render it without a re-fetch. */
-export async function moveSection(supabase: SupabaseClient, sections: Section[], sectionId: string, direction: -1 | 1): Promise<Section[]> {
-  const ordered = sortSections(sections)
-  const index = ordered.findIndex((s) => s.id === sectionId)
-  const target = index + direction
-  if (index < 0 || target < 0 || target >= ordered.length) return ordered
+/**
+ * Moves one section one place up or down and writes a LINE-WIDE sequence.
+ *
+ * `visibleSections` is the list the user is looking at, which may be one team's sections (Line
+ * Config, or a pane under a team filter). It decides only WHICH section this one moves past: the
+ * next one up or down IN THAT LIST, so a click always visibly does something. The write itself is
+ * computed from the whole line, read fresh here rather than trusted from the caller: the section
+ * is taken out of the line's sequence and put back immediately before (up) or after (down) that
+ * neighbour. Other teams' sections keep their relative order.
+ *
+ * The line's EXISTING numbers are dealt back out in the new order, so a move changes only the
+ * rows between the old and new positions, and the gaps and numbering people refer to ("Rework is
+ * 23") survive. Only when those numbers can't be reused (a null or a duplicate, the state
+ * reorderSections exists to repair) is the line renumbered 1..n.
+ *
+ * Trays never move and are never renumbered. They stay at 99, outside the sequence.
+ *
+ * It used to renumber whatever list it was handed. Line Config handed it one team's sections, so
+ * a single click rewrote that team's steps as 1..n and the line-wide sequence was gone.
+ */
+export async function moveSection(
+  supabase: SupabaseClient, visibleSections: Section[], sectionId: string, direction: -1 | 1
+): Promise<void> {
+  const moving = visibleSections.find((s) => s.id === sectionId)
+  if (!moving || isSectionTray(moving) || !moving.production_line_id) return
+  const visible = sortSections(
+    visibleSections.filter((s) => !isSectionTray(s) && s.production_line_id === moving.production_line_id)
+  )
+  const neighbour = visible[visible.findIndex((s) => s.id === sectionId) + direction]
+  if (!neighbour) return
 
-  const next = [...ordered]
-  ;[next[index], next[target]] = [next[target], next[index]]
-  await reorderSections(supabase, next)
-  return next.map((s, i) => ({ ...s, sort_order: i + 1 }))
+  const line = (await fetchSectionsForLine(supabase, moving.production_line_id)).filter((s) => !isSectionTray(s))
+  const self = line.find((s) => s.id === sectionId)
+  const rest = line.filter((s) => s.id !== sectionId)
+  const at = rest.findIndex((s) => s.id === neighbour.id)
+  if (!self || at < 0) throw new Error('The sections on this line changed since the list was loaded — reload and try again.')
+  rest.splice(direction < 0 ? at : at + 1, 0, self)
+  const existing = line.map((s) => s.sort_order)
+  const reusable = existing.every((n, i) => n != null && (i === 0 || n > (existing[i - 1] as number)))
+  await reorderSections(supabase, rest, reusable ? (existing as number[]) : undefined)
 }
 
 /** How many jobs point at this section — the guard a delete has to clear. Counted across every
@@ -346,6 +408,11 @@ export async function deleteSection(supabase: SupabaseClient, sectionId: string)
   }
 }
 
+// ── Move a section to another team ─────────────────────────────────────────────────────────
+// Lives in lib/sectionManager (preflightSectionMove / moveSectionAcrossTeams): one implementation
+// for every screen, which moves the section across teams AND lines and re-stamps the recorded
+// times under it. The same-line-only move that used to live here is gone.
+
 /**
  * The only function anywhere that writes jobs.section_id — every assignment and every move goes
  * through here, so "what does a job's team become?" has exactly one answer.
@@ -424,6 +491,16 @@ export function isUniqueViolation(error: { code?: string | null; message?: strin
 }
 
 export async function setJobSection(supabase: SupabaseClient, jobId: string, section: Section | null): Promise<void> {
+  // NOTHING CROSSES A PRODUCTION LINE. A job already on a line only moves between that line's
+  // sections; no screen offers anything else, and this is the check for every other way in. A job
+  // with no line yet (never filed) takes its line from the section, as it always has.
+  if (section?.production_line_id) {
+    const { data: current } = await supabase.from('jobs').select('name, production_line_id').eq('id', jobId).single()
+    if (current?.production_line_id && current.production_line_id !== section.production_line_id) {
+      throw new Error(`"${current.name}" is on a different production line from "${section.name}" — a job only moves between sections on its own line.`)
+    }
+  }
+
   const payload: Record<string, unknown> = { section_id: section?.id ?? null }
   // The section owns the team, so the job's redundant team_id is synced to whatever the section
   // says — a tray included, which now carries a real team of its own rather than null. Nothing
@@ -443,6 +520,21 @@ export async function setJobSection(supabase: SupabaseClient, jobId: string, sec
   }
   if (!data || data.length === 0) {
     throw new Error("That job's section could not be changed — the change was rejected by the database (check your permissions).")
+  }
+
+  // The job's recorded times carry their own copy of its team and line. Re-stamped here, in the
+  // single writer, so no caller can move a job and leave its labour banked where it used to be.
+  // After the job write on purpose: that is the write a constraint can refuse, and refusing it
+  // must leave the times untouched.
+  if (section) {
+    try {
+      await restampTimesForJob(supabase, jobId)
+    } catch (err) {
+      throw new Error(
+        `The job moved to "${section.name}", but its recorded times could not all be re-stamped: ` +
+        `${err instanceof Error ? err.message : 'rejected'}. Move it again to retry.`
+      )
+    }
   }
 }
 
@@ -501,249 +593,20 @@ async function describeJobNameConflict(
 }
 
 // ── Merge ──────────────────────────────────────────────────────────────────────────────────
-/**
- * Section merge: fold several sections' jobs into one keeper and retire the emptied ones.
- *
- * ONE primitive per level of the walk, and the user composes them. This one moves JOBS and
- * nothing else — it repoints jobs.section_id and stops. Operations, recorded times, notes and
- * model links all hang off job_id/operation_id rather than off the section, so they follow their
- * job with nothing to migrate, exactly as setJobSection's own note describes.
- *
- * NO TIME-OWNERSHIP GUARD, deliberately — and this is a change from how it used to work. An
- * earlier version ran lib/mergeOperations' preflightMerge over every time under the section and
- * refused the merge if any belonged to another user. That guard exists because an OPERATION
- * merge moves operation_times rows, and a time collected by somebody else is not ours to move. A
- * section merge never touches operation_times: it writes jobs.section_id and sections.is_active,
- * both of which are structure, not somebody's recorded work. Refusing to tidy two duplicate
- * sections because two collectors had timed work somewhere underneath them blocked exactly the
- * cleanup this exists for. The guard belongs one — in fact two — levels down, and stays there.
- *
- * It deliberately does NOT fuse same-named jobs. If both sections hold a "Fit Hatches", the
- * keeper ends up with two jobs called "Fit Hatches" sitting side by side, and the user folds
- * them together afterwards with a job merge. No name matching, no dedupe, no case-insensitive
- * comparison anywhere in the write path — guessing that two same-named jobs are the same work is
- * exactly the kind of silent decision this codebase makes the user take explicitly. The one place
- * names are compared at all is the preflight's `duplicateNames`, which exists solely so the
- * confirmation can warn that a follow-up job merge is coming, and it compares names literally.
- *
- * SAME TEAM ONLY. A section belongs to exactly one team and a job's team IS its section's team
- * (see teamForJob), so merging across teams would silently re-team every job that moved. The
- * pane's selection (built from sectionMergeGroupKey) never offers a cross-team row and
- * mergeSections refuses one
- * outright — the UI is not the only way in. Because the team can't change, jobs.team_id — legacy
- * and redundant, but still written by setJobSection — comes out of the merge holding the value it
- * went in with.
- *
- * The merged-away sections are SOFT-deleted (is_active = false), never dropped: sort_order,
- * created_at and the rows themselves survive, and reactivating one in the database brings it back
- * (empty — its jobs stay where the merge put them).
- */
-
-/** An unsorted tray can be neither side of a merge. Merging it away leaves its team with no
- * inbox for unsorted work; merging INTO it would file sorted work back as unsorted. Asked of the
- * shared predicate, so this can't drift from what the pane offers. */
-function assertMergeable(section: Section, role: 'keeper' | 'merged'): void {
-  if (isSectionTray(section)) {
-    throw new Error(
-      `"${NO_SECTION_NAME}" is a team's unsorted tray, not a step of the walk — it can't be ` +
-      (role === 'merged' ? 'merged away.' : 'merged into.')
-    )
-  }
-}
+// Lives in lib/sectionManager (preflightSectionMergeInto / mergeSectionsInto): one implementation
+// for every screen. It fuses same-named jobs and operations and re-stamps recorded times; the
+// move-jobs-only merge that used to live here is gone.
 
 /**
- * THE definition of "which sections may be merged together": two sections are valid partners
- * exactly when this returns the same non-null string for both.
+ * THE definition of "which sections may be ticked together for a merge": two sections are valid
+ * partners exactly when this returns the same non-null string for both — that is, when they are
+ * on the same production line. Team no longer matters: a merge re-stamps every recorded time it
+ * moves, so folding a section into another team's is a stated act rather than a silent drift.
  *
  * null means the section can be neither side of a merge — an unsorted tray (asked of the shared
- * predicate, never of team_id, which every tray now has), or a section with no team at all (a
- * job's team IS its section's team, so there would be nothing to preserve).
- *
- * One function, both sides of the fence: components/MergeMode builds each row's `groupKey` from
- * it and disables anything outside the ticked group, and mergeSections re-checks it before
- * writing. The UI is not the only way in, and the two cannot drift into different ideas of what
- * a legal merge is.
+ * predicate), or a section with no team at all.
  */
 export function sectionMergeGroupKey(section: Section): string | null {
   if (isSectionTray(section) || !section.team_id) return null
-  return `${section.team_id}:${section.production_line_id ?? ''}`
-}
-
-export interface SectionMergePreflight {
-  /**
-   * EVERY job that would move, retired ones included, with the section each currently belongs
-   * to. The write below moves all of them: `jobs.section_id` is not filtered by is_active, and
-   * leaving a retired job behind would strand it under a section about to be retired — which
-   * the post-move count would (rightly) refuse to complete.
-   */
-  movingJobs: { id: string; name: string; section_id: string | null; is_active?: boolean }[]
-  /** Of those, the ones a screen can actually show — what the confirmation counts and lists. A
-   * retired job is real work being re-filed, but naming it would name a row the user already
-   * merged away and can't see anywhere. */
-  visibleJobs: { id: string; name: string }[]
-  /** Active operations under those jobs. They move with their job; counted so the confirm can
-   * say how much work is being re-filed. */
-  operationCount: number
-  /**
-   * Job names that would appear TWICE in the keeper once the merge is done — the note that a
-   * follow-up job merge is needed. Compared literally (exact string equality: no trimming, no
-   * case folding), because the merge itself does no name matching and this warning must not
-   * imply a match the write path wouldn't make.
-   */
-  duplicateNames: string[]
-}
-
-/**
- * What a section merge would move. Reads only — safe to call while a confirmation is open, which
- * is where it belongs: the numbers it returns are what that dialog states.
- *
- * There is no `blockers` field and no user to check against, and that is the point — see the
- * guard note above. A section merge cannot be refused on ownership grounds because it never
- * touches a recorded time.
- *
- * Reads every job, retired ones included, because every one of them has to MOVE — see
- * movingJobs. Only the active ones are counted and listed.
- */
-export async function preflightSectionMerge(
-  supabase: SupabaseClient,
-  { keeper, merged }: { keeper: Section; merged: Section[] }
-): Promise<SectionMergePreflight> {
-  const movingJobs = await fetchAllChunked<{ id: string; name: string; section_id: string | null; is_active?: boolean }>(
-    merged.map((s) => s.id), READ_CHUNK,
-    (chunk) => supabase.from('jobs').select('id, name, section_id, is_active')
-      .in('section_id', chunk).order('id'),
-    { table: 'jobs' }
-  )
-  const visible = movingJobs.filter((j) => j.is_active !== false)
-  const keeperJobs = await fetchAllRows<{ id: string; name: string }>(
-    () => supabase.from('jobs').select('id, name')
-      .eq('section_id', keeper.id).eq('is_active', true).order('id'),
-    { table: 'jobs' }
-  )
-
-  // Literal equality, deliberately — see duplicateNames. Names repeated ACROSS the merged
-  // sections count too: two "Fit Hatches" arriving from two different sections collide in the
-  // keeper just as surely as one arriving alongside the keeper's own.
-  const seen = new Map<string, number>()
-  for (const job of keeperJobs) seen.set(job.name, (seen.get(job.name) ?? 0) + 1)
-  for (const job of visible) seen.set(job.name, (seen.get(job.name) ?? 0) + 1)
-  const duplicateNames = [...seen.entries()].filter(([, n]) => n > 1).map(([name]) => name).sort()
-
-  // Chunked, because a URL can only carry so many ids in one `.in(...)` filter — the same rule
-  // every bulk read in this app follows (see lib/supabaseRead). head:true so this costs a count
-  // and no rows: the confirmation only ever states the number.
-  let operationCount = 0
-  for (const chunk of chunked(visible.map((j) => j.id), READ_CHUNK)) {
-    const { count, error } = await supabase
-      .from('operations').select('id', { count: 'exact', head: true })
-      .in('job_id', chunk).eq('is_active', true)
-    if (error) throw new Error(`Checking what would move: ${error.message}`)
-    operationCount += count ?? 0
-  }
-
-  return {
-    movingJobs,
-    visibleJobs: [...visible].sort((a, b) => a.name.localeCompare(b.name)),
-    operationCount,
-    duplicateNames,
-  }
-}
-
-export interface SectionMergeResult {
-  movedJobs: number
-  /** Echoed from the preflight so a caller can repeat the "these need merging separately" line
-   * in its success message without re-reading anything. */
-  duplicateNames: string[]
-  /** Sections left ACTIVE because jobs were still on them after the move. Empty on a clean
-   * merge; never silently dropped. */
-  stranded: string[]
-}
-
-/**
- * The only function anywhere that merges sections. Many into one.
- *
- * Every job move goes through setJobSection — the only function anywhere that writes
- * jobs.section_id — rather than one bulk UPDATE, so a merge files a job exactly the way a manual
- * reassignment does, read-back check included. A section is a handful of jobs; the extra round
- * trips buy a guarantee that this path can't drift from the single-writer rule.
- *
- * All-or-nothing on its own writes: the rules are checked before anything is written, and each
- * merged section is only retired after its own jobs are confirmed moved.
- */
-export async function mergeSections(
-  supabase: SupabaseClient,
-  { keeper, merged }: { keeper: Section; merged: Section[] }
-): Promise<SectionMergeResult> {
-  if (merged.length === 0) return { movedJobs: 0, duplicateNames: [], stranded: [] }
-  if (merged.some((s) => s.id === keeper.id)) throw new Error('A section can’t be merged into itself.')
-  assertMergeable(keeper, 'keeper')
-  // Re-checked against the SAME rule the picker used — see sectionMergeGroupKey. The UI is not
-  // the only way in, and a section retimed or re-lined between opening the pane and confirming
-  // would otherwise slip through.
-  const keeperGroup = sectionMergeGroupKey(keeper)
-  if (!keeperGroup) {
-    throw new Error(`"${keeper.name}" has no team, so there is nothing that can safely be merged into it.`)
-  }
-  for (const section of merged) {
-    assertMergeable(section, 'merged')
-    if (sectionMergeGroupKey(section) !== keeperGroup) {
-      throw new Error(
-        `"${section.name}" and "${keeper.name}" are not on the same team and production line. A section ` +
-        'can only be merged into another section on the same team — moving jobs between teams is a ' +
-        'reassignment, not a merge.'
-      )
-    }
-  }
-
-  const preflight = await preflightSectionMerge(supabase, { keeper, merged })
-
-  const stranded: string[] = []
-  for (const section of merged) {
-    const moving = preflight.movingJobs.filter((j) => j.section_id === section.id)
-    for (const job of moving) {
-      try {
-        await setJobSection(supabase, job.id, keeper)
-      } catch (err) {
-        throw new Error(
-          `Moving "${job.name}" into "${keeper.name}" failed: ${err instanceof Error ? err.message : 'rejected'}. ` +
-          `"${section.name}" has been left active with whatever jobs remain on it — nothing is lost, and re-running the merge is safe.`
-        )
-      }
-    }
-
-    // The same shape mergeOperations uses: prove the move actually happened before retiring the
-    // row, or a job left behind ends up filed under a section no screen lists any more. Counts
-    // retired jobs too — the move above only shifted the active ones.
-    const left = await countJobsInSection(supabase, section.id)
-    if (left > 0) {
-      stranded.push(`${section.name} (${left === 1 ? '1 job' : `${left} jobs`} left behind)`)
-      continue
-    }
-
-    const { data: retired, error: retireError } = await supabase
-      .from('sections').update({ is_active: false }).eq('id', section.id).select('id')
-    if (retireError) throw new Error(`Retiring "${section.name}": ${retireError.message}`)
-    if (!retired || retired.length === 0) {
-      throw new Error(
-        `"${section.name}" could not be retired — the update was rejected, which usually means ` +
-        'changing sections is restricted to admins in this environment. Its jobs have already ' +
-        `moved to "${keeper.name}"; the empty section is still listed.`
-      )
-    }
-  }
-
-  // Counts the jobs a screen can see, matching what the confirmation promised — the retired ones
-  // moved too, but reporting them would name rows the user can't find anywhere.
-  return { movedJobs: preflight.visibleJobs.length, duplicateNames: preflight.duplicateNames, stranded }
-}
-
-/** The line a caller shows when a section merge completed but left a section behind.
- * Deliberately does not name a cause: nothing here checks ownership, so a strand at this point
- * is the database refusing the write for a reason this module can't see. */
-export function strandedSectionMergeMessage(stranded: string[]): string {
-  return (
-    'Kept active — the database refused to move every job off them, so retiring them would have ' +
-    `stranded real work under a section no screen shows: ${stranded.join(', ')}. ` +
-    'Everything else in the selection was merged. Nothing was lost.'
-  )
+  return `line:${section.production_line_id ?? ''}`
 }
