@@ -177,6 +177,8 @@ export default function Nav() {
     return pathname === href || pathname.startsWith(href + '/')
   }
 
+  const toggleLabel = rail ? 'Expand sidebar' : 'Collapse sidebar'
+
   function toggleRail() {
     setFlyout(null)
     if (rail) {
@@ -207,7 +209,7 @@ export default function Nav() {
     {
       key: 'collecting',
       heading: 'Collecting',
-      icon: <TimerIcon />,
+      icon: <PenLineIcon />,
       items: [
         { href: '/collect', label: 'Collect', icon: <ClipboardCheckIcon /> },
         { href: '/tryouts', label: 'Try Outs', icon: <TruckIcon /> },
@@ -275,8 +277,10 @@ export default function Nav() {
         <button
           type="button"
           className="nav-menu-btn"
-          onClick={() => setOpen(true)}
-          aria-label="Open menu"
+          // Both ways, like every other opener here — though the slid-in panel normally covers
+          // it, and the ×, the backdrop and Escape are the usual ways out.
+          onClick={() => setOpen((o) => !o)}
+          aria-label={open ? 'Close menu' : 'Open menu'}
           aria-expanded={open}
         >
           <MenuIcon />
@@ -300,10 +304,31 @@ export default function Nav() {
 
       <div className="nav-sidebar">
         <div className="nav-sidebar-head">
-          <Link href="/dashboard" className="nav-logo" title="J-Motion">
-            <span className="nav-logo-mark"><StopwatchIcon /></span>
-            <span className="nav-link-label">J-Motion</span>
-          </Link>
+          {/* Docked: the header IS the rail/expanded toggle — the same action and persistence as
+              the foot button. It used to be a link to /dashboard, which only LOOKED like an
+              expand: from /labour-matrix (which opens on the rail) it navigated to a page that
+              opens expanded, and clicking it again just reloaded the dashboard. A native button,
+              so Enter and Space work without anything extra.
+              Slide-over (narrow): there is no rail to toggle, so it is just the wordmark — the ×
+              beside it closes the panel. */}
+          {isDesktop ? (
+            <button
+              type="button"
+              className="nav-logo nav-head-toggle"
+              onClick={toggleRail}
+              aria-label={toggleLabel}
+              aria-expanded={!rail}
+              title={toggleLabel}
+            >
+              <span className="nav-logo-mark"><StopwatchIcon /></span>
+              <span className="nav-link-label">J-Motion</span>
+            </button>
+          ) : (
+            <span className="nav-logo">
+              <span className="nav-logo-mark"><StopwatchIcon /></span>
+              <span className="nav-link-label">J-Motion</span>
+            </span>
+          )}
           {/* Narrow only — the slide-over's close. */}
           <button type="button" className="nav-sidebar-close" onClick={() => setOpen(false)} aria-label="Close menu">
             <CloseIcon />
@@ -397,11 +422,12 @@ export default function Nav() {
             type="button"
             className="nav-toggle"
             onClick={toggleRail}
-            aria-label={rail ? 'Expand menu' : 'Collapse menu to icons'}
-            title={rail ? 'Expand menu' : 'Collapse menu to icons'}
+            aria-label={toggleLabel}
+            aria-expanded={!rail}
+            title={toggleLabel}
           >
             <span className="nav-icon">{rail ? <ChevronsRightIcon /> : <ChevronsLeftIcon />}</span>
-            <span className="nav-link-label">Collapse</span>
+            <span className="nav-link-label">{rail ? 'Expand' : 'Collapse'}</span>
           </button>
         </div>
       </div>
@@ -457,8 +483,10 @@ function LogoutIcon() {
 }
 
 // Groups
-function TimerIcon() {
-  return <Icon><line x1="10" x2="14" y1="2" y2="2" /><line x1="12" x2="15" y1="14" y2="11" /><circle cx="12" cy="14" r="8" /></Icon>
+// Collecting is a pen, not a timer: a timer read as the J-Motion stopwatch mark directly above it
+// on the rail, and as the thing you time rather than the act of recording it.
+function PenLineIcon() {
+  return <Icon><path d="M12 20h9" /><path d="M16.376 3.622a1 1 0 0 1 3.002 3.002L7.368 18.635a2 2 0 0 1-.855.506l-2.872.838a.5.5 0 0 1-.62-.62l.838-2.872a2 2 0 0 1 .506-.854z" /></Icon>
 }
 function BarChartIcon() {
   return <Icon><path d="M3 3v18h18" /><path d="M18 17V9" /><path d="M13 17V5" /><path d="M8 17v-3" /></Icon>

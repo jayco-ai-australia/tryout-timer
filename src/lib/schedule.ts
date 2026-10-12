@@ -167,6 +167,14 @@ export async function fetchFutureBuilds(
  * requires to be sound.
  */
 export interface ScheduleWindow {
+  /** The first day of the window, as `YYYY-MM-DD`, INCLUSIVE — the `from` the rows were read
+   * with. Carried so a report can print the boundary it actually used: it is the LOCAL calendar
+   * day (todayIsoDate), which for most of a Melbourne morning is a day ahead of the database's
+   * UTC `current_date`, and a hand-run query that uses the latter counts one more day of builds. */
+  from: string
+  /** Chassis rows with NO dateonline at all. Not in the window on any reading — there is no date
+   * to compare — but counted so a report can say how many builds it could not place in time. */
+  undatedRows: number
   /** Distinct products with at least one build on or after `from`. THE report denominator. */
   productIds: string[]
   /** Builds ahead, per product — how many vans of that model the window actually holds. */
@@ -214,5 +222,15 @@ export async function fetchScheduleWindow(
     if (latest === null || row.dateonline > latest) latest = row.dateonline
   }
 
-  return { productIds: [...buildsByProductId.keys()], buildsByProductId, earliest, latest, unmatchedRows, matchedRows }
+  // A HEAD count, not rows: nothing about these chassis is used except how many there are.
+  const { count: undatedRows, error: undatedError } = await supabase
+    .from('chassis')
+    .select('id', { count: 'exact', head: true })
+    .is('dateonline', null)
+  if (undatedError) throw new Error(undatedError.message)
+
+  return {
+    from, undatedRows: undatedRows ?? 0,
+    productIds: [...buildsByProductId.keys()], buildsByProductId, earliest, latest, unmatchedRows, matchedRows,
+  }
 }

@@ -2,11 +2,11 @@
 
 import { useEffect, useMemo, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
-import { fmtScheduleDate } from '@/lib/schedule'
+import { fmtScheduleDate, type ScheduleWindow } from '@/lib/schedule'
 import { plural } from '@/lib/format'
 import {
   fetchPreAssemblyCoverage,
-  type AreaReport, type PreAssemblyCoverageReport, type SeriesRow,
+  type AreaReport, type ModelTally, type PreAssemblyCoverageReport, type SeriesRow,
 } from '@/lib/preAssemblyCoverage'
 
 /**
@@ -204,7 +204,8 @@ export default function PreAssemblyCoverageClient() {
                 key={area.lineId}
                 area={area}
                 windowLabel={windowLabel}
-                unmatchedRows={report.window.unmatchedRows}
+                scheduleWindow={report.window}
+                unresolved={report.unresolved}
               />
             ))
           )}
@@ -215,12 +216,13 @@ export default function PreAssemblyCoverageClient() {
 }
 
 /** One area — one printed sheet. */
-function AreaSection({ area, windowLabel, unmatchedRows }: {
+function AreaSection({ area, windowLabel, scheduleWindow, unresolved }: {
   area: AreaReport
   windowLabel: string
-  /** Scheduled chassis that resolve to no model. Repeated per area on purpose: the footnote has
+  /** The schedule window and what it left out. Repeated per area on purpose: the footnote has
    * to sit on the same sheet as the numbers it qualifies, and each area prints on its own. */
-  unmatchedRows: number
+  scheduleWindow: ScheduleWindow
+  unresolved: ModelTally
 }) {
   // The marker's meaning, kept as a count rather than as a symbol on every name: how many of
   // this area's missing models are missing because nothing links them to the area at all. That
@@ -310,12 +312,11 @@ function AreaSection({ area, windowLabel, unmatchedRows }: {
       )}
 
       <p className="pac-foot rp-foot">
-        {unmatchedRows > 0 && (
-          <>
-            {unmatchedRows} scheduled chassis could not be matched to a model and are excluded.
-            <br />
-          </>
-        )}
+        {/* ALWAYS rendered, zeros included. It used to appear only when a chassis was unmatched,
+            so on a day with none the sheet said nothing at all about its denominator — and
+            nothing is not the same statement as "nothing was excluded". */}
+        {denominatorNote(area, scheduleWindow, unresolved)}
+        <br />
         {noApplicableTotal > 0 && (
           <>
             {noApplicableTotal === missingTotal
@@ -330,6 +331,41 @@ function AreaSection({ area, windowLabel, unmatchedRows }: {
       </p>
     </section>
   )
+}
+
+/**
+ * The denominator, reconciled in words: what was booked, each thing dropped from it and how
+ * many, and what that leaves for this area. Every deduction between the raw schedule and the
+ * area's "of N scheduled models" is named here — a deduction that is zero today is either stated
+ * as zero (unmatched chassis, the one that is usually not) or left out (the structural ones,
+ * which would otherwise be four sentences of "none" on every sheet).
+ *
+ * Reports only. Every figure is one lib/schedule or lib/preAssemblyCoverage already computed.
+ */
+function denominatorNote(area: AreaReport, window: ScheduleWindow, unresolved: ModelTally): string {
+  const total = window.matchedRows + window.unmatchedRows
+  const parts: string[] = [
+    // "chassis" is its own plural — plural() would render "chassiss".
+    `Denominator: ${total} chassis are booked on line from ${fmtScheduleDate(window.from)} inclusive.`,
+    window.unmatchedRows > 0
+      ? `${window.unmatchedRows} scheduled chassis could not be matched to a model and are excluded.`
+      : 'All of them are matched to a model, so none are excluded on that account.',
+  ]
+  if (window.undatedRows > 0) {
+    parts.push(`${window.undatedRows} chassis have no on-line date and are outside the schedule altogether.`)
+  }
+  if (unresolved.models > 0) {
+    parts.push(`${plural(unresolved.models, 'model')} (${unresolved.chassis} chassis) point at a product record that no longer exists and are excluded.`)
+  }
+  const { notFed, notFedLines, noBuildLine } = area.excluded
+  if (noBuildLine.models > 0) {
+    parts.push(`${plural(noBuildLine.models, 'model')} (${noBuildLine.chassis} chassis) have no build line and are excluded.`)
+  }
+  if (notFed.models > 0) {
+    parts.push(`${plural(notFed.models, 'model')} (${notFed.chassis} chassis) are built on ${notFedLines.join(', ')}, which ${area.name} does not feed, and are excluded.`)
+  }
+  parts.push(`That leaves ${plural(area.scheduled, 'model')} across ${area.scheduledChassis} chassis for ${area.name}.`)
+  return parts.join(' ')
 }
 
 /**

@@ -1,24 +1,27 @@
 'use client'
 
+import type { RangeableQuery } from '@/lib/supabaseRead'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import {
-  currentForOperation, jobCompleteness, operationProductKey,
-  type JobCompleteness, type OperationTimeStat,
+  TIME_FLAG_COLUMNS, currentForOperation, jobCompleteness, onlyCountedTimes, operationProductKey,
+  type JobCompleteness, type OperationTimeStat, type TimeExclusionFlags,
 } from '@/lib/operationTimes'
 import { computeCoverageCombos, type CoverageCombo } from '@/lib/coverage'
 import { chunked, fetchAllChunked, fetchAllRows, logSupabaseError, READ_CHUNK } from '@/lib/supabaseRead'
 import { selectIn } from '@/lib/chunkedIn'
-import { loadLineSplit, modelsForLine, type LineSplit } from '@/lib/lines'
+import { feedTargetsForLine, loadLineSplit, modelsForLine, type LineSplit } from '@/lib/lines'
+import { compareSections } from '@/lib/sections'
 import { fetchFutureBuilds, fmtScheduleDate, todayIsoDate, type FutureBuildSummary } from '@/lib/schedule'
 import { fmtHours, fmtMinutes, plural } from '@/lib/format'
-import { usePersistedFilter } from '@/lib/useLocalStorage'
+import { usePersistedFilter, usePersistedState } from '@/lib/useLocalStorage'
 // THE series-grouped multi-select model list — the same component /collect's Models pane,
 // /setup's BulkModelLinkDrawer and the Add Time drawer render. It is presentational and fully
 // controlled, so a host drives it by choosing what to pass in; the search box below is this
 // screen's own concern and filters the `products` it is handed rather than changing a component
 // three other screens depend on.
 import { ModelSeriesPicker } from '@/components/ModelLinker'
+import AreaChips from '@/components/AreaChips'
 import MatrixCellDrawer from './MatrixCellDrawer'
 import type { Product, ProductionLine, UserRole } from '@/lib/types'
 
@@ -109,7 +112,27 @@ interface MatrixColumn {
   /** The VISIBLE jobs under this column — already past the Show and Team filters, so a filtered
    * column is the sum of what is on screen and never of what was filtered out. */
   jobIds: string[]
+  /** The pre-assembly area (a production line id) this column belongs to. Set only under
+   * Show = Pre-assembly, where the columns are ordered and headed by area; null otherwise. */
+  areaId: string | null
+  /** What the column sits under, one level up the Team → Section → Job hierarchy: a job's
+   * section, a section's team. Null at Team grain, which has no level above it on this grid. */
+  parent: { key: string; label: string } | null
 }
+
+/** A run of adjacent columns belonging to one area — one cell of the area header row. */
+interface AreaSpan { areaId: string; name: string; span: number }
+/** A run of adjacent columns under one parent — one cell of the parent header row. */
+interface ParentSpan { key: string; label: string; span: number }
+
+/**
+ * A model's row total. `applies` is false when NO visible column applies to the model — every
+ * cell on its row is blank — and then the total is blank too, hatched like the cells, never 0.0:
+ * a 0.0 total reads as "applies, nothing timed", a gap to go and close, and this is not one. It
+ * is the cell's BLANK-vs-red-0 rule carried to the end of the row.
+ */
+interface RowTotal { minutes: number; incomplete: boolean; applies: boolean }
+const NO_ROW_TOTAL: RowTotal = { minutes: 0, incomplete: false, applies: false }
 
 /** Buckets for what the hierarchy doesn't reach: a job with no section, or a section with no
  * team. Real states — an unsectioned job still exists and its labour still counts — so they get
@@ -125,11 +148,19 @@ const SEL: React.CSSProperties = {
 const EMPTY: React.CSSProperties = { textAlign: 'center', color: 'var(--text-muted)', fontSize: 13, padding: '40px 0' }
 
 /**
- * How many job columns go on one printed A3 sheet before the grid starts again on the next.
+ * How many columns go on one printed A3 sheet before the grid starts again on the next.
  *
- * A3 landscape is 420mm wide; 10mm margins leave 400mm, of which the model name takes 48mm and
- * the model total 16mm — so about 336mm for job columns at 13mm each. 22 leaves a margin for a
- * four-figure total and a printer that lies about its unprintable edge.
+ * A3 landscape is 420mm wide; 10mm margins leave 400mm, of which the model name takes 38mm and
+ * the model total 16mm — 346mm for the data columns. Each data column has a hard 13mm floor in
+ * the print CSS (.lm-print-th-job — the widest figure, "2514.7*", is 10.3mm, and the rest is
+ * padding and a guaranteed gap), so 346 / 13 = 26 columns is the most one sheet holds legibly.
+ * Past that the grid splits into bands and each band says "sheet n of m across"; it is never
+ * squeezed further.
+ *
+ * Job grain keeps 22 (15.7mm each): a line has ninety jobs, so it runs to several sheets
+ * whatever the cap, and the extra width is margin for a printer that lies about its
+ * unprintable edge. Section and Team grain get the full 26, because a section sheet that splits
+ * in two loses the left-to-right production sequence that is the reason to print it.
  *
  * This is the whole answer to "the grid is wider than the paper": it is cut into bands of
  * columns, each band a fresh sheet with the model names and the model totals repeated down its
@@ -138,7 +169,8 @@ const EMPTY: React.CSSProperties = { textAlign: 'center', color: 'var(--text-mut
  * indication that 68 are missing, or it shrinks the type until nothing is readable. A band
  * cannot silently lose a column, because every band says which columns it holds.
  */
-const PRINT_BAND_COLUMNS = 22
+const PRINT_BAND_COLUMNS_JOB = 22
+const PRINT_BAND_COLUMNS_ROLLUP = 26
 
 interface Props {
   lines: ProductionLine[]
@@ -153,11 +185,13 @@ interface Props {
 /** jobs.team_id is NOT selected, deliberately. It is legacy: a job's team is its SECTION's
  * team (sections.team_id), which is the hierarchy the grain selector rolls up, and reading both
  * would give this screen two answers to "whose job is this". section_id is the only link. */
-interface JobRow { id: string; name: string; section_id: string | null; production_line_id: string | null }
-interface SectionRow { id: string; name: string; team_id: string | null }
+interface JobRow { id: string; name: string; section_id: string | null; production_line_id: string | null; is_active: boolean }
+/** sort_order is the LINE-WIDE production sequence, independent of team, and it is what orders
+ * the Section-grain columns (lib/sections' compareSections). */
+interface SectionRow { id: string; name: string; team_id: string | null; sort_order: number | null }
 interface OperationRow { id: string; job_id: string }
 interface PairRow { operation_id: string; product_id: string }
-interface TimeRow { id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null }
+interface TimeRow extends TimeExclusionFlags { id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null }
 interface TimeModelRow { operation_time_id: string; product_id: string }
 /** production_line_id is what SCOPES the Team filter. A team belongs to exactly one line (it is
  * NOT NULL on the table — see lib/types' Team), and without the column the picker could only
@@ -169,6 +203,10 @@ interface TeamRow { id: string; name: string; production_line_id: string | null 
  * re-fetched by a filter — the filters below are all in-memory views over this. */
 interface MatrixSource {
   products: Product[]
+  /** The build lines the selected line feeds — lib/lines' feedTargetsForLine, so empty for a
+   * normal build line. What the Build line filter offers; carried in `source` rather than held
+   * as its own state so it can never describe a different line than the products beside it. */
+  feedTargetIds: string[]
   jobs: JobRow[]
   /** The middle of the Team → Section → Job hierarchy: a section's name (the SECTION-grain
    * column label) and its team (which is what makes a job a team's job). */
@@ -191,15 +229,51 @@ interface MatrixSource {
 }
 
 const EMPTY_SOURCE: MatrixSource = {
-  products: [], jobs: [], sections: [], operations: [], modelOperations: [],
+  products: [], feedTargetIds: [], jobs: [], sections: [], operations: [], modelOperations: [],
   operationTimes: [], operationTimeModels: [], stats: {}, combos: [], teams: [],
   futureByProductId: new Map(),
+}
+
+/**
+ * A multi-select's ticked ids, remembered across a reload — lib/useLocalStorage's
+ * usePersistedState underneath (the JSON sibling of the usePersistedFilter the selects use),
+ * stored as an array because a Set does not survive JSON, and handed back as the Set the rest of
+ * this screen already works in. Anything that isn't an array of strings reads as "nothing
+ * ticked", which on this screen means "all".
+ */
+function usePersistedIdSet(key: string): [Set<string>, (next: Set<string> | ((prev: Set<string>) => Set<string>)) => void] {
+  const [stored, setStored] = usePersistedState<string[]>(key, [])
+  const ids = useMemo(
+    () => new Set(Array.isArray(stored) ? stored.filter((v): v is string => typeof v === 'string') : []),
+    [stored],
+  )
+  const setIds = useCallback((next: Set<string> | ((prev: Set<string>) => Set<string>)) => {
+    setStored((prev) => {
+      const before = new Set(Array.isArray(prev) ? prev : [])
+      return [...(typeof next === 'function' ? next(before) : next)]
+    })
+  }, [setStored])
+  return [ids, setIds]
 }
 
 export default function LabourMatrixClient({ lines, userId, role }: Props) {
   const supabase = useMemo(() => createClient(), [])
 
   const [lineId, setLineId] = usePersistedFilter('labourMatrix.lineId', '')
+  /**
+   * ── The build-line filter ─────────────────────────────────────────────────────────────
+   *
+   * Only meaningful — and only rendered — for a PRE-ASSEMBLY line. Chassis feeds every build
+   * line, so its model list is all of theirs together, and neither Series (the same series name
+   * appears on several build lines) nor Team (Chassis has one) can cut it back to "Caravans".
+   * This can: it narrows the model ROWS to one of the build lines the selected line feeds.
+   *
+   * Rows only. The columns are the jobs that apply to whatever models are left, as always.
+   * Persisted alongside Line and Series because it is the same kind of answer — "what was I
+   * looking at" — and read only through `activeBuildLineId`, which drops a stored value the
+   * current line doesn't offer.
+   */
+  const [buildLineId, setBuildLineId] = usePersistedFilter('labourMatrix.buildLineId', '')
   const [series, setSeries] = usePersistedFilter('labourMatrix.series', '')
 
   /**
@@ -209,25 +283,48 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
    * ALL. Comparing Team 1 against Team 2 is the question this screen gets asked, and a
    * single-select could only answer it one team at a time.
    *
-   * Session-scoped, NOT persisted — and that is a deliberate change from the single select it
-   * replaces, which stored `labourMatrix.teamId`. A remembered team subset would show the next
-   * person two teams out of eight, with header counts, row totals and a coverage figure all true
-   * of those two and nothing on screen saying why. It is the same reasoning the model filter and
-   * the Show toggle already carry, and the reason none of the three is remembered.
+   * PERSISTED (labourMatrix.teamIds), like every other control on this bar — a reload lands on
+   * the view that was left. It used to be session-only, on the argument that a remembered subset
+   * misleads whoever opens the page next; in practice the page is reopened by the person who set
+   * it, and losing the view on every refresh was the real cost. The button states an active
+   * subset in blue, which is what answers "why are there only two teams".
    *
    * The set is only ever read through `activeTeamIds`, which intersects it with what the CURRENT
-   * line offers — so a stale id cannot reach the grid even if a reset were missed.
+   * line offers — so a stored id for a team that has since been deleted, or that belongs to
+   * another line, cannot reach the grid. If none of them resolve the filter is simply off.
    */
-  const [selectedTeamIds, setSelectedTeamIds] = useState<Set<string>>(new Set())
+  const [selectedTeamIds, setSelectedTeamIds] = usePersistedIdSet('labourMatrix.teamIds')
   const [teamPickerOpen, setTeamPickerOpen] = useState(false)
+  /** The Teams button and its dropdown together — a press anywhere outside this closes it. */
+  const teamPopRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!teamPickerOpen) return
+    const onDown = (e: MouseEvent | TouchEvent) => {
+      if (teamPopRef.current && !teamPopRef.current.contains(e.target as Node)) setTeamPickerOpen(false)
+    }
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setTeamPickerOpen(false) }
+    document.addEventListener('mousedown', onDown)
+    document.addEventListener('touchstart', onDown)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDown)
+      document.removeEventListener('touchstart', onDown)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [teamPickerOpen])
 
   /**
-   * Session-scoped, NOT persisted — the same call /model-total makes about the same toggle. The
-   * three selects above answer "what was I looking at", which is worth surviving a reload; this
-   * answers "what am I checking right now", and a remembered Pre-assembly would silently hide
-   * most of a line's labour from whoever opened the page next, with row totals to match.
+   * Show, PERSISTED (labourMatrix.show). Read through `labourSource`, which accepts only the
+   * three known keys — anything else in storage is "All". See the restore guard below the Show
+   * split for the other half: a remembered Show that leaves this line with no columns at all is
+   * dropped back to All when the line loads.
    */
-  const [labourSource, setLabourSource] = useState<LabourSource>('all')
+  const [storedShow, setLabourSource] = usePersistedFilter('labourMatrix.show', 'all')
+  const labourSource: LabourSource = LABOUR_SOURCES.some((x) => x.key === storedShow) ? (storedShow as LabourSource) : 'all'
+  /** '' = every pre-assembly area. Only meaningful while labourSource === 'pre' — the same state,
+   * with the same meaning, as /model-total's area chips. Persisted (labourMatrix.areaLineId) and
+   * only ever read through `activeAreaLineId`, which drops an area the current rows don't offer. */
+  const [areaLineId, setAreaLineId] = usePersistedFilter('labourMatrix.areaLineId', '')
 
   /**
    * ── The model filter ──────────────────────────────────────────────────────────────────
@@ -239,11 +336,11 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
    * grid — "none selected" is the absence of a filter, not a filter that matches nothing, and a
    * blank grid would read as a broken screen.
    *
-   * Session-scoped, not persisted, for the same reason the Show toggle isn't: a remembered
-   * subset would silently show the next person eight models out of a hundred, with a coverage
-   * figure and a grid total to match and nothing on screen saying why.
+   * PERSISTED (labourMatrix.modelIds), and read only through `activeModelIds`, which intersects
+   * it with the models the current Line + Build line + Series offer — a deleted model, or one
+   * from a line since left, drops out, and if nothing is left the filter is off.
    */
-  const [selectedModelIds, setSelectedModelIds] = useState<Set<string>>(new Set())
+  const [selectedModelIds, setSelectedModelIds] = usePersistedIdSet('labourMatrix.modelIds')
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
   const [modelSearch, setModelSearch] = useState('')
 
@@ -260,11 +357,16 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
    * builds booked into Dec 2026, so it is a PLAN, not a record of completion). Neither can be
    * read as "despatched", and nothing here tries to.
    */
-  const [futureOnly, setFutureOnly] = useState(true)
+  const [storedFutureOnly, setStoredFutureOnly] = usePersistedFilter('labourMatrix.futureOnly', '1')
+  /** Persisted as '1' / '0'. Anything but an explicit '0' is the default, ON. */
+  const futureOnly = storedFutureOnly !== '0'
+  const setFutureOnly = (on: boolean) => setStoredFutureOnly(on ? '1' : '0')
 
   /** Job level is the default: it is the grain the figures are actually computed at, and the
    * one that answers "which job do I go and time". The coarser two are roll-ups of it. */
-  const [grain, setGrain] = useState<Grain>('job')
+  const [storedGrain, setGrain] = usePersistedFilter('labourMatrix.grain', 'job')
+  /** Persisted; an unrecognised stored value is Job. */
+  const grain: Grain = GRAINS.some((g) => g.key === storedGrain) ? (storedGrain as Grain) : 'job'
 
   const [source, setSource] = useState<MatrixSource>(EMPTY_SOURCE)
 
@@ -345,10 +447,12 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
         // query returns an empty list for Chassis or Sew and looks like missing data. Paged
         // inside lib/lines.
         const products = await modelsForLine(supabase, lineId)
+        // Off the same cached topology modelsForLine just read — no extra round trip.
+        const feedTargetIds = await feedTargetsForLine(supabase, lineId)
         if (!isCurrent()) return
         const productIds = products.map((p) => p.id)
         if (productIds.length === 0) {
-          setSource({ ...EMPTY_SOURCE, products })
+          setSource({ ...EMPTY_SOURCE, products, feedTargetIds })
           loadedLineRef.current = lineId
           return
         }
@@ -388,16 +492,17 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
         // guess. Per lib/operationTimes, both inputs give the same `minutes`; only the history
         // count differs, and nothing here shows one.
         //
-        // Deliberately no is_active filter — see the note at the top of lib/operationTimes. In
-        // this database is_active does not mean "hidden"; filtering on it dropped 61% of every
-        // figure in the app and took /dashboard coverage from 68% to 0.5%.
+        // Retired (is_active = false) and hidden records are filtered AT THE QUERY, through
+        // onlyCountedTimes: the matrix only aggregates, so it has no use for them. The flags are
+        // still selected — the helpers' types require them — and currentForOperation and
+        // computeCoverageCombos apply the same rule again. See the note atop lib/operationTimes.
         const timeIds = [...new Set(operationTimeModels.map((tm) => tm.operation_time_id))]
         const operationTimes = await fetchAllChunked<TimeRow>(
           timeIds, READ_CHUNK,
-          (chunk) => supabase
-            .from('operation_times').select('id, operation_id, total_minutes, superseded_by')
-            .in('id', chunk).is('superseded_by', null)
-            .order('id'),
+          (chunk) => onlyCountedTimes(supabase
+            .from('operation_times').select(`id, operation_id, total_minutes, superseded_by, ${TIME_FLAG_COLUMNS}`)
+            .in('id', chunk).is('superseded_by', null))
+            .order('id') as unknown as RangeableQuery<TimeRow>,
           { table: 'operation_times' },
         )
         if (!isCurrent()) return
@@ -414,7 +519,7 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
           ...modelOperations.map((mo) => mo.operation_id),
           ...operationTimes.map((t) => t.operation_id),
         ])]
-        const operations = await selectIn<OperationRow>(opIds, async (chunk) => {
+        const linkedOperations = await selectIn<OperationRow>(opIds, async (chunk) => {
           const res = await supabase
             .from('operations').select('id, job_id').in('id', chunk).eq('is_active', true)
           if (res.error) logSupabaseError('labour-matrix — operations WHERE id IN (…) AND is_active', res.error)
@@ -423,19 +528,31 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
         if (!isCurrent()) return
 
         // ── 5. Jobs: the columns themselves ─────────────────────────────────────────────
-        // Identity lookup by id, deliberately NOT filtered to is_active — a retired job still
-        // labels the operations and times pointing at it, and filtering here would blank a column
-        // heading on real history rather than hide the column. See the note atop lib/jobs.
+        // Identity lookup by id, NOT filtered to is_active in the query — is_active is selected
+        // and the retired jobs are dropped explicitly just below, together with their
+        // operations, so a retired job's column disappears whole rather than surviving with a
+        // blank heading. See the note atop lib/jobs.
         // section_id and production_line_id come down because they are what the grain roll-up
         // and the Show filter split the columns on. team_id does NOT — see JobRow.
-        const jobIds = [...new Set(operations.map((o) => o.job_id).filter(Boolean))]
-        const jobs = await selectIn<JobRow>(jobIds, async (chunk) => {
+        const jobIds = [...new Set(linkedOperations.map((o) => o.job_id).filter(Boolean))]
+        const readJobs = await selectIn<JobRow>(jobIds, async (chunk) => {
           const res = await supabase
-            .from('jobs').select('id, name, section_id, production_line_id').in('id', chunk)
+            .from('jobs').select('id, name, section_id, production_line_id, is_active').in('id', chunk)
           if (res.error) logSupabaseError('labour-matrix — jobs WHERE id IN (…)', res.error)
           return res
         })
         if (!isCurrent()) return
+
+        // A RETIRED job is not a column. A job can be is_active = false while its operations
+        // stay active and linked to models — the operations filter above can't catch that — and
+        // /setup and /collect hide such a job, so this grid and its printout do too. It is
+        // dropped HERE, with its operations, before anything is computed: cells, row totals,
+        // coverage and the printed sheet all read `jobs` and `operations`, so none of them can
+        // count it, and they still reconcile with each other and with /model-total, which applies
+        // the same rule. An operation whose job row didn't come back at all is kept, as before.
+        const retiredJobIds = new Set(readJobs.filter((j) => !j.is_active).map((j) => j.id))
+        const jobs = readJobs.filter((j) => j.is_active)
+        const operations = linkedOperations.filter((o) => !retiredJobIds.has(o.job_id))
 
         // ── 6. Sections: the middle of the hierarchy ────────────────────────────────────
         // The SECTION-grain column labels, and the only route from a job to a team. One read,
@@ -445,7 +562,7 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
         // that point at it, exactly as a retired job still labels its operations.
         const sectionIds = [...new Set(jobs.map((j) => j.section_id).filter((id): id is string => !!id))]
         const sections = await selectIn<SectionRow>(sectionIds, async (chunk) => {
-          const res = await supabase.from('sections').select('id, name, team_id').in('id', chunk)
+          const res = await supabase.from('sections').select('id, name, team_id, sort_order').in('id', chunk)
           if (res.error) logSupabaseError('labour-matrix — sections WHERE id IN (…)', res.error)
           return res
         })
@@ -492,7 +609,7 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
 
         if (!isCurrent()) return
         setSource({
-          products, jobs, sections, operations, modelOperations,
+          products, feedTargetIds, jobs, sections, operations, modelOperations,
           operationTimes, operationTimeModels, stats, combos, teams,
           futureByProductId: future.byProductId,
         })
@@ -514,13 +631,47 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
 
   // ── The filters, as in-memory views ────────────────────────────────────────────────────
 
-  /** Every series present on the line, A–Z. Models with no series land under '(no series)' and
-   * are reachable — a model that can't be filtered to is a model nobody checks. */
+  /** Whether the selected line inherits its models — lib/lines' rule, via the cached topology.
+   * This, not the length of the feed list, is what shows the Build line filter: a pre-assembly
+   * line with nothing configured is still one, and a build line never is. */
+  const isPreAssemblyLine = lineSplit?.isPreAssembly(lineId) ?? false
+
+  /** The build lines the selected line feeds, named and A–Z. Empty for a normal build line. */
+  const buildLineOptions = useMemo(() => {
+    if (!isPreAssemblyLine) return []
+    return source.feedTargetIds
+      .map((id) => ({ id, name: lines.find((l) => l.id === id)?.name ?? 'Unknown line' }))
+      .sort((a, b) => a.name.localeCompare(b.name))
+  }, [isPreAssemblyLine, source.feedTargetIds, lines])
+
+  /** The stored build line, if the current line offers it — otherwise not set. Same guard, for
+   * the same reason, as activeSeries below. */
+  const activeBuildLineId = buildLineOptions.some((b) => b.id === buildLineId) ? buildLineId : ''
+
+  /**
+   * The line's models, cut to the chosen build line. Everything downstream that used to read
+   * `source.products` for the ROWS reads this instead — the series list, the model picker and
+   * the grid — so Series filters within the build line and offers only series present in it.
+   *
+   * Filtering by `production_line_id` here is safe in the way lib/lines warns a re-filter by the
+   * SELECTED line is not: for a pre-assembly line each row carries the build line it really
+   * belongs to, and that is exactly the id being asked for.
+   */
+  const lineProducts = useMemo(
+    () => (activeBuildLineId
+      ? source.products.filter((p) => p.production_line_id === activeBuildLineId)
+      : source.products),
+    [source.products, activeBuildLineId],
+  )
+
+  /** Every series present on the line (and build line, when one is chosen), A–Z. Models with no
+   * series land under '(no series)' and are reachable — a model that can't be filtered to is a
+   * model nobody checks. */
   const seriesOptions = useMemo(() => {
     const set = new Set<string>()
-    for (const p of source.products) set.add(p.product_series?.trim() || '(no series)')
+    for (const p of lineProducts) set.add(p.product_series?.trim() || '(no series)')
     return [...set].sort((a, b) => a.localeCompare(b))
-  }, [source.products])
+  }, [lineProducts])
 
   /**
    * The persisted series and team are remembered across reloads, but they are remembered
@@ -533,7 +684,7 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
   const activeSeries = seriesOptions.includes(series) ? series : ''
 
   /**
-   * Every model the current Line + Series selection offers — what the picker lists, and the
+   * Every model the current Line + Build line + Series selection offers — what the picker lists, and the
    * denominator of "12 of 29". The model filter narrows THIS, so it is always a subset of what
    * the other two filters already chose.
    *
@@ -543,10 +694,10 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
    */
   const modelCandidates = useMemo(() => {
     const rows = activeSeries
-      ? source.products.filter((p) => (p.product_series?.trim() || '(no series)') === activeSeries)
-      : source.products
+      ? lineProducts.filter((p) => (p.product_series?.trim() || '(no series)') === activeSeries)
+      : lineProducts
     return [...rows].sort((a, b) => a.model.localeCompare(b.model))
-  }, [source.products, activeSeries])
+  }, [lineProducts, activeSeries])
 
   /**
    * The selection intersected with what is actually on offer — the same guard activeSeries and
@@ -737,14 +888,15 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
   }
 
   /**
-   * The columns. Jobs filtered by Show and by Team, A–Z.
+   * The jobs past Show and Team, A–Z — the columns, before the area chips narrow them further
+   * (see visibleJobs, below `cells`).
    *
    * The Show split asks lineSplit.isPreAssembly of the JOB's production_line_id — the same
    * question, of the same cached topology, that /model-total's toggle asks. A job on no line at
    * all counts as line labour (LineSplit's documented null rule), which keeps it visible under
    * one half of a split that is meant to partition everything rather than vanishing from both.
    */
-  const visibleJobs = useMemo(() => {
+  const sourceJobs = useMemo(() => {
     return source.jobs
       .filter((j) => {
         // Empty selection = every team, so the test is only applied when something is ticked.
@@ -761,6 +913,33 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
       })
       .sort((a, b) => a.name.localeCompare(b.name))
   }, [source.jobs, activeTeamIds, labourSource, lineSplit, hierarchy])
+
+  /**
+   * ── The restore guard for Show ────────────────────────────────────────────────────────
+   *
+   * Teams, Models and the area chip are each read through an intersection with what is on offer,
+   * so a stale stored value there turns itself off. Show has no such list to intersect with: a
+   * remembered "Pre-assembly" on a line with no pre-assembly work is a valid value that matches
+   * nothing, and the grid would open with no columns and nothing saying why.
+   *
+   * So when a line's data ARRIVES and the remembered Show leaves it without a single column,
+   * Show goes back to All (and the area chip with it). Keyed on the load, not on the toggle: a
+   * click that empties the grid is somebody's own action and stays put — this only refuses to
+   * OPEN on nothing. Waits for lineSplit, without which every job reads as line labour and
+   * Pre-assembly would look empty on every line.
+   */
+  const sourceJobCountRef = useRef(0)
+  sourceJobCountRef.current = sourceJobs.length
+  const labourSourceRef = useRef(labourSource)
+  labourSourceRef.current = labourSource
+  useEffect(() => {
+    if (!lineSplit || source.jobs.length === 0) return
+    if (labourSourceRef.current !== 'all' && sourceJobCountRef.current === 0) {
+      setLabourSource('all')
+      setAreaLineId('')
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [source.jobs, lineSplit])
 
   /**
    * ── The grid ───────────────────────────────────────────────────────────────────────────
@@ -803,7 +982,9 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
     //
     // `timedPairs` is rebuilt from the same two arrays currentForOperation was handed, so a pair
     // can only reach here if the helper has a figure for it — operationTimes was filtered to
-    // current records, so a superseded run's junction row resolves to no stat and falls out.
+    // current records, so a superseded run's junction row resolves to no stat and falls out. A
+    // HIDDEN run falls out the same way: currentForOperation gives its pair no stat, so the
+    // `if (!stat) continue` below is what keeps it out of timedOps and minutes.
     for (const { operationId, productId } of timedPairs) {
       const stat = source.stats[operationProductKey(operationId, productId)]
       if (!stat) continue
@@ -840,40 +1021,213 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
   }, [source.operations, source.modelOperations, source.stats, source.combos, timedPairs])
 
   /**
+   * ── The area chips ────────────────────────────────────────────────────────────────────
+   *
+   * Under Show = Pre-assembly the columns come from several areas at once — Lamination, Chassis
+   * and Sew sections side by side as flat peers, with nothing saying which is whose. The chips
+   * restrict the COLUMNS to one area, exactly as /model-total's do for its breakdown.
+   *
+   * Which areas are offered follows /model-total's rule, widened from one model to the rows on
+   * screen: a pre-assembly line gets a chip only if one of its jobs applies to (or has a time
+   * for) a model currently in the grid. So a chip always narrows to something, and choosing a
+   * build line that Sew does no work for takes the Sew chip away with it.
+   *
+   * Derived from `sourceJobs` — past Show and Team, BEFORE the area filter — so picking a chip
+   * never shortens the row it was picked from.
+   */
+  const preAssemblyAreas = useMemo(() => {
+    if (labourSource !== 'pre' || !lineSplit) return []
+    const ids = new Set<string>()
+    for (const j of sourceJobs) {
+      const jobLineId = j.production_line_id
+      if (!jobLineId || ids.has(jobLineId) || !lineSplit.isPreAssembly(jobLineId)) continue
+      if (visibleProducts.some((p) => cells.get(`${j.id}:${p.id}`)?.applies)) ids.add(jobLineId)
+    }
+    return [...ids]
+      .map((id) => ({ id, name: lineSplit.name(id) }))
+      .sort((a, b) => a.name.localeCompare(b.name))
+  }, [labourSource, lineSplit, sourceJobs, visibleProducts, cells])
+
+  /** The chosen area, if it is still on offer — a chip that has gone (different rows, Show
+   * changed) reads as "All areas" rather than filtering by an id nothing matches. */
+  const activeAreaLineId = preAssemblyAreas.some((a) => a.id === areaLineId) ? areaLineId : ''
+
+  /** The columns' jobs: past Show, Team and the area chip. Everything below — columns, row
+   * totals, coverage, the printed sheet — reads this, so they all narrow together. */
+  const visibleJobs = useMemo(
+    () => (activeAreaLineId
+      ? sourceJobs.filter((j) => j.production_line_id === activeAreaLineId)
+      : sourceJobs),
+    [sourceJobs, activeAreaLineId],
+  )
+
+  /**
    * ── The columns, at the selected grain ────────────────────────────────────────────────
    *
    * A grouping of `visibleJobs` and nothing else — so every filter that narrowed the jobs
    * (Show, Team) has already been applied before a column exists, at every grain.
    */
   const columns: MatrixColumn[] = useMemo(() => {
+    // ── Under Show = Pre-assembly the columns are ORDERED BY AREA ──────────────────────────
+    // Area A–Z, then the section's sort_order within the area. sort_order is a per-line
+    // sequence, so sorting on it alone interleaves Lamination's "Stage 1" with Chassis's and
+    // Sew's sections — numerically adjacent, and nothing to do with each other. A job's area is
+    // the line it sits on, the same attribution the Show split and the area chips use.
+    const byArea = labourSource === 'pre'
+    const areaIdOf = (j: JobRow) => (byArea ? j.production_line_id : null)
+    const areaName = (id: string | null) => (id ? lineSplit?.name(id) ?? '' : '')
+    const teamName = (section: SectionRow | null) => (section?.team_id
+      ? source.teams.find((tm) => tm.id === section.team_id)?.name ?? 'Unknown team'
+      : 'No team')
+
+    interface Built {
+      col: MatrixColumn; section: SectionRow | null; none: boolean
+      /** The team the column sits in (its section's), named for sorting. Null = no team. */
+      team: { id: string; name: string } | null
+    }
+    const teamOf = (section: SectionRow | null) => (section?.team_id
+      ? { id: section.team_id, name: teamName(section) }
+      : null)
+    const built: Built[] = []
+
     if (grain === 'job') {
-      return visibleJobs.map((j) => ({ key: j.id, label: j.name, jobIds: [j.id] }))
+      for (const j of visibleJobs) {
+        const section = hierarchy.sectionOf.get(j.id) ?? null
+        built.push({
+          col: {
+            key: j.id, label: j.name, jobIds: [j.id], areaId: areaIdOf(j),
+            parent: { key: section?.id ?? NO_SECTION, label: section?.name ?? 'No section' },
+          },
+          section,
+          none: false,
+          team: teamOf(section),
+        })
+      }
+    } else {
+      const byKey = new Map<string, Built>()
+      for (const j of visibleJobs) {
+        const section = hierarchy.sectionOf.get(j.id) ?? null
+        const areaId = areaIdOf(j)
+        const base = grain === 'section'
+          ? (section?.id ?? NO_SECTION)
+          : (section?.team_id ?? NO_TEAM)
+        // Keyed by area as well while the columns are grouped by it, so a column sits under
+        // exactly one area heading. A section's jobs normally all share a line and the prefix
+        // changes nothing; one that straddles two is two columns rather than one column filed
+        // under whichever area its first job happened to be on.
+        const key = areaId ? `${areaId}|${base}` : base
+        const label = grain === 'section' ? (section?.name ?? 'No section') : teamName(section)
+        let b = byKey.get(key)
+        if (!b) {
+          b = {
+            col: {
+              key, label, jobIds: [], areaId,
+              parent: grain === 'section'
+                ? { key: section?.team_id ?? NO_TEAM, label: teamName(section) }
+                : null,
+            },
+            section: grain === 'section' ? section : null,
+            // The "doesn't reach the hierarchy" buckets — real, and not what anyone looks for first.
+            none: base === NO_SECTION || base === NO_TEAM,
+            team: teamOf(section),
+          }
+          byKey.set(key, b)
+        }
+        b.col.jobIds.push(j.id)
+      }
+      built.push(...byKey.values())
     }
 
-    const byKey = new Map<string, MatrixColumn>()
-    for (const j of visibleJobs) {
-      const section = hierarchy.sectionOf.get(j.id) ?? null
-      const key = grain === 'section'
-        ? (section?.id ?? NO_SECTION)
-        : (section?.team_id ?? NO_TEAM)
-      const label = grain === 'section'
-        ? (section?.name ?? 'No section')
-        : (section?.team_id
-          ? source.teams.find((tm) => tm.id === section.team_id)?.name ?? 'Unknown team'
-          : 'No team')
-      const col = byKey.get(key) ?? { key, label, jobIds: [] }
-      col.jobIds.push(j.id)
-      byKey.set(key, col)
+    // Job grain is sorted too, in every Show state: the parent header row spans a section's jobs,
+    // and it can only span them if they sit together. A–Z within the section.
+    return built.sort((a, b) => {
+      if (byArea && a.col.areaId !== b.col.areaId) {
+        return areaName(a.col.areaId).localeCompare(areaName(b.col.areaId))
+          || (a.col.areaId ?? '').localeCompare(b.col.areaId ?? '')
+      }
+      // TEAM NEXT, A–Z, at every grain — before the section sequence, not after it. sort_order
+      // is not unique across teams (Running Gear's sections run 1–6 and Chassis Build's 1–3 on
+      // the same line), so sorting on it alone interleaves the two teams' sections and the team
+      // heading above them fragments into a run per interleaving. Team first makes each team
+      // one contiguous block. No team last.
+      if ((a.team?.id ?? '') !== (b.team?.id ?? '')) {
+        if (!a.team || !b.team) return a.team ? -1 : 1
+        return a.team.name.localeCompare(b.team.name) || a.team.id.localeCompare(b.team.id)
+      }
+      if (a.none !== b.none) return a.none ? 1 : -1
+      // THEN PRODUCTION SEQUENCE within the team: sort_order, then name — lib/sections'
+      // compareSections, shared with every other section list. At Section grain and at Job grain,
+      // so a section's jobs read together in the team's order (a job with no section last). The
+      // printed sheet is built from this same array, so screen and paper cannot disagree.
+      if (grain !== 'team') {
+        if (a.section && b.section) {
+          const bySection = compareSections(a.section, b.section)
+          if (bySection !== 0) return bySection
+        } else if (a.section || b.section) {
+          return a.section ? -1 : 1
+        }
+      }
+      return a.col.label.localeCompare(b.col.label)
+    }).map((b) => b.col)
+  }, [grain, visibleJobs, hierarchy, source.teams, labourSource, lineSplit])
+
+  /**
+   * ── The area header row ───────────────────────────────────────────────────────────────
+   *
+   * Shown under Show = Pre-assembly with the chip on "All areas" — the one state where columns
+   * from several areas sit side by side. With a single area chosen every column is that area and
+   * the chip already says so, so the row is omitted rather than repeated.
+   *
+   * `areaSpansOf` is run over whatever slice of `columns` is being rendered: the whole array on
+   * screen, one band at a time on paper — an area cut by a band boundary is headed on both sheets.
+   */
+  const showAreaHeader = labourSource === 'pre' && !activeAreaLineId
+  const areaSpansOf = useCallback((cols: MatrixColumn[]): AreaSpan[] => {
+    const spans: AreaSpan[] = []
+    for (const col of cols) {
+      const last = spans[spans.length - 1]
+      if (last && last.areaId === (col.areaId ?? '')) last.span += 1
+      else spans.push({ areaId: col.areaId ?? '', name: lineSplit?.name(col.areaId) ?? '', span: 1 })
     }
-    return [...byKey.values()].sort((a, b) => {
-      // The "doesn't reach the hierarchy" buckets sort last — they are real, and they are not
-      // what anyone is looking for first.
-      const aNone = a.key === NO_SECTION || a.key === NO_TEAM
-      const bNone = b.key === NO_SECTION || b.key === NO_TEAM
-      if (aNone !== bNone) return aNone ? 1 : -1
-      return a.label.localeCompare(b.label)
-    })
-  }, [grain, visibleJobs, hierarchy, source.teams])
+    return spans
+  }, [lineSplit])
+  const areaSpans = useMemo(
+    () => (showAreaHeader ? areaSpansOf(columns) : []),
+    [showAreaHeader, areaSpansOf, columns],
+  )
+
+  /**
+   * ── The parent header row ─────────────────────────────────────────────────────────────
+   *
+   * One level up from the columns: the SECTION over each run of jobs, the TEAM over each run of
+   * sections. Team grain has nothing above it here (the area row, when on, already is that), so
+   * the row is omitted.
+   *
+   * A parent is headed once per stretch of adjacent columns, and the sort above (area → team →
+   * section → job) is what makes that once per section at Job grain and once per team at Section
+   * grain. A run never crosses an area boundary — the area row sits above this one, and a parent
+   * cell straddling two area cells would belong to both.
+   *
+   * Run over a slice like `areaSpansOf`: a parent cut by a print band is headed on both sheets.
+   */
+  const showParentHeader = grain !== 'team'
+  const parentSpansOf = useCallback((cols: MatrixColumn[]): ParentSpan[] => {
+    const spans: ParentSpan[] = []
+    for (const col of cols) {
+      const key = `${col.areaId ?? ''}|${col.parent?.key ?? ''}`
+      const last = spans[spans.length - 1]
+      if (last && last.key === key) last.span += 1
+      else spans.push({ key, label: col.parent?.label ?? '', span: 1 })
+    }
+    return spans
+  }, [])
+  const parentSpans = useMemo(
+    () => (showParentHeader ? parentSpansOf(columns) : []),
+    [showParentHeader, parentSpansOf, columns],
+  )
+  /** How many header rows are stacked — what Model and Total span to keep their corners. */
+  const headerRows = 1 + (showAreaHeader ? 1 : 0) + (showParentHeader ? 1 : 0)
+  const parentNoun = grain === 'job' ? 'Section' : 'Team'
 
   /**
    * ── The roll-up ───────────────────────────────────────────────────────────────────────
@@ -1020,17 +1374,19 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
    * because the columns partition visibleJobs; it would just be an answer that could break.)
    */
   const rowTotals = useMemo(() => {
-    const out = new Map<string, { minutes: number; incomplete: boolean }>()
+    const out = new Map<string, RowTotal>()
     for (const p of visibleProducts) {
       let minutes = 0
       let incomplete = false
+      let applies = false
       for (const j of visibleJobs) {
         const cell = cells.get(`${j.id}:${p.id}`)
         if (!cell || !cell.applies) continue
+        applies = true
         minutes += cell.minutes
         if (jobCompleteness(cell.timedOps, cell.totalOps) !== 'timed') incomplete = true
       }
-      out.set(p.id, { minutes, incomplete })
+      out.set(p.id, { minutes, incomplete, applies })
     }
     return out
   }, [visibleProducts, visibleJobs, cells])
@@ -1064,7 +1420,11 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
   const filterPhrase = useMemo(() => {
     const show = labourSource === 'all' ? 'All labour'
       : labourSource === 'line' ? 'Line labour only'
-        : 'Pre-assembly only'
+        : activeAreaLineId
+          // The area, NAMED — "Pre-assembly only" over a grid cut to Chassis would be true and
+          // would describe a different sheet. Same wording as /model-total's printed scope.
+          ? `Pre-assembly — ${lineSplit?.name(activeAreaLineId) ?? 'area'}`
+          : 'Pre-assembly only'
     // The teams, NAMED — not "2 teams". A header is read away from the controls that produced it
     // (on paper there are no controls at all), and "Team 1 + Team 2" is the only version of this
     // line that lets a reader check the figures are about what they think they are about. Past
@@ -1108,13 +1468,29 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
 
     const grainMeta = GRAINS.find((g) => g.key === grain) ?? GRAINS[2]
 
+    // Only a pre-assembly line has the filter, so only a pre-assembly line gets the phrase. "All
+    // build lines" is stated rather than left out, for the same reason "All teams" is.
+    const buildLine = !isPreAssemblyLine ? null
+      : buildLineOptions.find((b) => b.id === activeBuildLineId)?.name ?? 'All build lines'
+
+    // The two filters the head-count alone hides, in words beside the counts they narrowed:
+    // "66 models built on Caravan × 17 sections in Chassis". Said for "all" as well, so the
+    // sentence reads the same shape whether or not anything was cut.
+    const rowScope = !buildLine ? ''
+      : activeBuildLineId ? ` built on ${buildLine}` : ' across all build lines'
+    const columnScope = labourSource !== 'pre' ? ''
+      : activeAreaLineId ? ` in ${lineSplit?.name(activeAreaLineId) ?? 'one area'}`
+        : preAssemblyAreas.length > 0
+          ? ` across ${preAssemblyAreas.length === 1 ? '1 pre-assembly area' : `all ${preAssemblyAreas.length} pre-assembly areas`} (${preAssemblyAreas.map((a) => a.name).join(', ')})`
+          : ''
+
     return {
-      show, team, series: activeSeries || 'All series', models, modelNames, subset, schedule,
+      show, team, buildLine, rowScope, columnScope, series: activeSeries || 'All series', models, modelNames, subset, schedule,
       grain: `${grainMeta.label} level`,
       // Capitalised for the band heading ("Teams 1–8 of 8").
       grainNoun: grainMeta.noun.charAt(0).toUpperCase() + grainMeta.noun.slice(1),
     }
-  }, [labourSource, activeTeamIds, teamOptions, activeSeries, modelCandidates, visibleProducts, futureOnly, grain])
+  }, [labourSource, activeAreaLineId, preAssemblyAreas, lineSplit, activeTeamIds, teamOptions, isPreAssemblyLine, buildLineOptions, activeBuildLineId, activeSeries, modelCandidates, visibleProducts, futureOnly, grain])
 
   const lineName = lines.find((l) => l.id === lineId)?.name ?? 'No production line'
 
@@ -1146,7 +1522,8 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
   // Bands are computed off the COLUMNS, whatever grain produced them — nothing here assumes a
   // count. Team and Section grain usually come out as a single band; job grain on a full line
   // runs to four or five. Either way the band heading names the range it holds.
-  const printBands = useMemo(() => chunked(columns, PRINT_BAND_COLUMNS), [columns])
+  const printBandSize = grain === 'job' ? PRINT_BAND_COLUMNS_JOB : PRINT_BAND_COLUMNS_ROLLUP
+  const printBands = useMemo(() => chunked(columns, printBandSize), [columns, printBandSize])
 
   const ready = !!lineId && !loading && !error && visibleProducts.length > 0
 
@@ -1166,6 +1543,7 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
             value={lineId}
             onChange={(e) => {
               setLineId(e.target.value)
+              setBuildLineId('')
               setSeries('')
               // Both multi-selects are re-scoped by the line, so both are dropped rather than left
               // holding ids that belong to the line being left. The panels close with them: a panel
@@ -1178,6 +1556,28 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
             <option value="">— Select a production line —</option>
             {lines.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
           </select>
+          {/* Only for a pre-assembly line: a build line's models are all its own, so the filter
+              could offer exactly one option. Before Series because it is the broader cut — Series
+              then filters within it, and its list narrows to match. */}
+          {isPreAssemblyLine && (
+            <select
+              style={SEL}
+              value={activeBuildLineId}
+              aria-label="Build line"
+              title="Narrow the model rows to one of the build lines this area feeds"
+              onChange={(e) => {
+                setBuildLineId(e.target.value)
+                // Re-scopes Series and the model list, so both are dropped — the same reason the
+                // line select drops them.
+                setSeries('')
+                resetModelFilter()
+                setCellTarget(null)
+              }}
+            >
+              <option value="">All build lines</option>
+              {buildLineOptions.map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}
+            </select>
+          )}
           <select
             style={SEL}
             value={activeSeries}
@@ -1192,6 +1592,7 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
               kind of question ("which of these, together?") and two multi-selects that looked
               different would read as two different mechanisms. Same classes, same "empty = all"
               rule, same panel. */}
+          <div className="lm-pop-anchor" ref={teamPopRef}>
           <button
             type="button"
             className={activeTeamIds.size > 0 ? 'btn-ghost lm-models-btn lm-models-btn-on' : 'btn-ghost lm-models-btn'}
@@ -1209,6 +1610,78 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
               : `Teams: all ${teamOptions.length}`}
             <span aria-hidden="true" style={{ fontSize: 10 }}>{teamPickerOpen ? '▲' : '▼'}</span>
           </button>
+          {/* ── The team picker ─────────────────────────────────────────────────────────
+              The rows are the same primitives ModelSeriesPicker renders — `.checkbox-list
+              .checkbox-list-grid` and `.checkbox-row`, so the ticks, the hit areas and the columns
+              are the app's, not this screen's — inside the same `.lm-models-panel` chrome the model
+              filter opens — here as a DROPDOWN anchored to the Teams button (.lm-pop), closed by Done,
+              Escape or a click anywhere else. ModelSeriesPicker itself is not reused HERE because it is typed to
+              `Product` and groups by `product_series`: a team has neither, and handing it fabricated
+              products to get one flat group would mean this screen inventing what a product is for
+              a component three other screens depend on. */}
+          {teamPickerOpen && lineId && teamOptions.length > 0 && (
+            <div className="card lm-models-panel lm-pop" role="dialog" aria-label="Teams">
+              <div className="lm-models-panel-bar">
+                <button
+                  type="button"
+                  className="lm-models-action"
+                  disabled={activeTeamIds.size === teamOptions.length}
+                  onClick={() => setSelectedTeamIds(new Set(teamOptions.map((t) => t.id)))}
+                >
+                  Select all
+                </button>
+                <button
+                  type="button"
+                  className="lm-models-action"
+                  disabled={activeTeamIds.size === 0}
+                  onClick={resetTeamFilter}
+                >
+                  Clear
+                </button>
+                <span className="lm-models-count">
+                  {activeTeamIds.size === 0
+                    ? `Nothing ticked — showing all ${teamOptions.length}`
+                    : `${activeTeamIds.size} of ${teamOptions.length} selected`}
+                </span>
+                <button type="button" className="lm-models-action" onClick={() => setTeamPickerOpen(false)}>
+                  Done
+                </button>
+              </div>
+              {/* Said out loud for the same reason it is said over the models: "tick nothing to see
+                  everything" is the opposite of what a filter usually does. The second sentence is
+                  this filter's own: the list is the LINE's teams, which is not the same set as the
+                  teams owning a column, and a reader who expects to find a pre-assembly team in here
+                  should be told where it went rather than left to conclude the list is incomplete. */}
+              <p className="lm-models-hint">
+                Tick the teams to compare. With none ticked the grid shows every team on this line —
+                clearing the selection is how you get back to all of them. Only teams that belong to{' '}
+                <strong>{lineName}</strong> are listed; a pre-assembly team whose work applies to
+                these models still has its jobs in the grid and its own column at Team grain, and the{' '}
+                <strong>Show</strong> toggle is what separates that labour out.
+              </p>
+              <div className="checkbox-list lm-pop-list">
+                {teamOptions.map((t) => {
+                  const isSelected = activeTeamIds.has(t.id)
+                  // How many of the grid's jobs this team owns, before the Show filter — the same
+                  // service the model picker's row badge performs: what a tick will cost, stated at
+                  // the moment of ticking rather than after the grid comes back empty.
+                  const jobCount = source.jobs.filter((j) => hierarchy.teamIdOf.get(j.id) === t.id).length
+                  return (
+                    <div key={t.id} className="checkbox-row" style={{ cursor: 'default' }}>
+                      <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, cursor: 'pointer', width: '100%', minWidth: 0 }}>
+                        <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                          <input type="checkbox" checked={isSelected} onChange={() => toggleTeam(t.id)} />
+                          {t.name}
+                        </span>
+                        <span className="lm-models-badge">{plural(jobCount, 'job')}</span>
+                      </label>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+          </div>
 
           {/* A 101-model checkbox list cannot sit inline in a filter bar, so the control here is
               a button that states the selection and opens the list beneath the card. Not a
@@ -1282,12 +1755,21 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
                 type="button"
                 title={s.hint}
                 className={labourSource === s.key ? 'lm-toggle-btn lm-toggle-btn-on' : 'lm-toggle-btn'}
-                onClick={() => setLabourSource(s.key)}
+                // Leaving Pre-assembly drops any area narrowing with it — an area chip that
+                // stayed selected while invisible would silently scope the next view.
+                onClick={() => { setLabourSource(s.key); if (s.key !== 'pre') setAreaLineId('') }}
               >
                 {s.label}
               </button>
             ))}
           </div>
+
+          {/* The same chips /model-total shows beside the same toggle. Without them the
+              Pre-assembly grid lays "Stage 1", "CUTTING" and "After Press Section" side by side
+              with nothing saying they belong to three different areas. */}
+          {labourSource === 'pre' && preAssemblyAreas.length > 0 && (
+            <AreaChips areas={preAssemblyAreas} value={activeAreaLineId} onChange={setAreaLineId} />
+          )}
 
           <button
             type="button"
@@ -1307,77 +1789,6 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
             <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Updating figures…</span>
           )}
         </div>
-
-        {/* ── The team picker ─────────────────────────────────────────────────────────
-            The rows are the same primitives ModelSeriesPicker renders — `.checkbox-list
-            .checkbox-list-grid` and `.checkbox-row`, so the ticks, the hit areas and the columns
-            are the app's, not this screen's — inside the same `.lm-models-panel` chrome the model
-            filter opens. ModelSeriesPicker itself is not reused HERE because it is typed to
-            `Product` and groups by `product_series`: a team has neither, and handing it fabricated
-            products to get one flat group would mean this screen inventing what a product is for
-            a component three other screens depend on. */}
-        {teamPickerOpen && lineId && teamOptions.length > 0 && (
-          <div className="card lm-models-panel">
-            <div className="lm-models-panel-bar">
-              <button
-                type="button"
-                className="lm-models-action"
-                disabled={activeTeamIds.size === teamOptions.length}
-                onClick={() => setSelectedTeamIds(new Set(teamOptions.map((t) => t.id)))}
-              >
-                Select all
-              </button>
-              <button
-                type="button"
-                className="lm-models-action"
-                disabled={activeTeamIds.size === 0}
-                onClick={resetTeamFilter}
-              >
-                Clear
-              </button>
-              <span className="lm-models-count">
-                {activeTeamIds.size === 0
-                  ? `Nothing ticked — showing all ${teamOptions.length}`
-                  : `${activeTeamIds.size} of ${teamOptions.length} selected`}
-              </span>
-              <button type="button" className="lm-models-action" onClick={() => setTeamPickerOpen(false)}>
-                Done
-              </button>
-            </div>
-            {/* Said out loud for the same reason it is said over the models: "tick nothing to see
-                everything" is the opposite of what a filter usually does. The second sentence is
-                this filter's own: the list is the LINE's teams, which is not the same set as the
-                teams owning a column, and a reader who expects to find a pre-assembly team in here
-                should be told where it went rather than left to conclude the list is incomplete. */}
-            <p className="lm-models-hint">
-              Tick the teams to compare. With none ticked the grid shows every team on this line —
-              clearing the selection is how you get back to all of them. Only teams that belong to{' '}
-              <strong>{lineName}</strong> are listed; a pre-assembly team whose work applies to
-              these models still has its jobs in the grid and its own column at Team grain, and the{' '}
-              <strong>Show</strong> toggle is what separates that labour out.
-            </p>
-            <div className="checkbox-list checkbox-list-grid" style={{ maxHeight: 'none' }}>
-              {teamOptions.map((t) => {
-                const isSelected = activeTeamIds.has(t.id)
-                // How many of the grid's jobs this team owns, before the Show filter — the same
-                // service the model picker's row badge performs: what a tick will cost, stated at
-                // the moment of ticking rather than after the grid comes back empty.
-                const jobCount = source.jobs.filter((j) => hierarchy.teamIdOf.get(j.id) === t.id).length
-                return (
-                  <div key={t.id} className="checkbox-row" style={{ cursor: 'default' }}>
-                    <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, cursor: 'pointer', width: '100%', minWidth: 0 }}>
-                      <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-                        <input type="checkbox" checked={isSelected} onChange={() => toggleTeam(t.id)} />
-                        {t.name}
-                      </span>
-                      <span className="lm-models-badge">{plural(jobCount, 'job')}</span>
-                    </label>
-                  </div>
-                )
-              })}
-            </div>
-          </div>
-        )}
 
         {/* ── The model picker ────────────────────────────────────────────────────────
             ModelSeriesPicker is the app's one series-grouped multi-select model list — the same
@@ -1486,7 +1897,9 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
             <div className="lm-summary">
               <span>
                 <strong>{visibleProducts.length}</strong> {visibleProducts.length === 1 ? 'model' : 'models'}
+                {filterPhrase.rowScope}
                 {' × '}<strong>{columns.length}</strong> {columns.length === 1 ? grainNoun : `${grainNoun}s`}
+                {filterPhrase.columnScope}
               </span>
               <span>
                 {filterPhrase.show} · {filterPhrase.series} · {filterPhrase.team} · {filterPhrase.models}
@@ -1518,10 +1931,36 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
                 relative to the nearest scrolling ancestor, so both axes have to scroll HERE and
                 not on the window, or the model column scrolls away with everything else. */}
             <div className="lm-scroll">
-              <table className="lm-table">
+              <table className={`lm-table${showAreaHeader ? ' lm-has-area' : ''}${showParentHeader ? ' lm-has-parent' : ''}`}>
                 <thead>
-                  <tr>
-                    <th className="lm-th-corner">Model</th>
+                  {/* Up to three rows: area → parent → column. Model and Total sit in whichever
+                      row comes first and span them all, so they keep their corners; each row
+                      below sticks BENEATH the ones above it (the lm-has-* classes on the table
+                      are what tell the CSS how far down that is). */}
+                  {showAreaHeader && (
+                    <tr>
+                      <th className="lm-th-corner" rowSpan={headerRows}>Model</th>
+                      {areaSpans.map((a) => (
+                        <th key={a.areaId} className="lm-th-area" colSpan={a.span} title={`${a.name} — ${plural(a.span, grainNoun)}`}>
+                          <span className="lm-th-area-text">{a.name}</span>
+                        </th>
+                      ))}
+                      <th className="lm-th-total" rowSpan={headerRows}>Total</th>
+                    </tr>
+                  )}
+                  {showParentHeader && (
+                    <tr className="lm-th-row-parent">
+                      {!showAreaHeader && <th className="lm-th-corner" rowSpan={headerRows}>Model</th>}
+                      {parentSpans.map((s, i) => (
+                        <th key={`${i}|${s.key}`} className="lm-th-parent" colSpan={s.span} title={`${parentNoun}: ${s.label} — ${plural(s.span, grainNoun)}`}>
+                          <span className="lm-th-parent-text">{s.label}</span>
+                        </th>
+                      ))}
+                      {!showAreaHeader && <th className="lm-th-total" rowSpan={headerRows}>Total</th>}
+                    </tr>
+                  )}
+                  <tr className="lm-th-row-cols">
+                    {headerRows === 1 && <th className="lm-th-corner">Model</th>}
                     {columns.map((col) => (
                       // Rotated, because the column is sized by its widest FIGURE (~5
                       // characters) and not by a name that can run to forty. Horizontal
@@ -1535,12 +1974,12 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
                         <span className="lm-th-job-text">{col.label}</span>
                       </th>
                     ))}
-                    <th className="lm-th-total">Total</th>
+                    {headerRows === 1 && <th className="lm-th-total">Total</th>}
                   </tr>
                 </thead>
                 <tbody>
                   {visibleProducts.map((p) => {
-                    const total = rowTotals.get(p.id) ?? { minutes: 0, incomplete: false }
+                    const total = rowTotals.get(p.id) ?? NO_ROW_TOTAL
                     return (
                       <tr key={p.id}>
                         {/* products.model, never product_code — see visibleProducts. */}
@@ -1561,9 +2000,14 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
                             onOpen={() => setCellTarget({ columnKey: col.key, productId: p.id })}
                           />
                         ))}
-                        <td className={`lm-td-total${total.incomplete ? ' lm-incomplete' : ''}`}>
-                          {fmtMinutes(total.minutes)}{total.incomplete ? '*' : ''}
-                        </td>
+                        {total.applies ? (
+                          <td className={`lm-td-total${total.incomplete ? ' lm-incomplete' : ''}`}>
+                            {fmtMinutes(total.minutes)}{total.incomplete ? '*' : ''}
+                          </td>
+                        ) : (
+                          // Nothing on this row applies, so there is no total to state — see RowTotal.
+                          <td className="lm-td-total lm-td-na" title={`Nothing in these columns applies to ${p.model}`} />
+                        )}
                       </tr>
                     )
                   })}
@@ -1602,7 +2046,7 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
       )}
 
       {/* ── The printed document ────────────────────────────────────────────────────────
-          A3 landscape (see print.css), cut into bands of PRINT_BAND_COLUMNS job columns. Not
+          A3 landscape (see print.css), cut into bands of printBandSize columns. Not
           .rp-doc: that class flattens everything inside it to black on purpose, and the red
           zeros are the point of this sheet. It follows /roadmap instead, which scopes its forced
           black to the prose and lets the chart keep its colour. */}
@@ -1617,6 +2061,7 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
               {/* The grain first: it is what the columns ARE, so a reader who takes it for job
                   level when it is team level misreads every figure on the sheet. */}
               Grain: <strong>{filterPhrase.grain}</strong>
+              {filterPhrase.buildLine && <>{' · Build line: '}<strong>{filterPhrase.buildLine}</strong></>}
               {' · '}<strong>{filterPhrase.series}</strong> · <strong>{filterPhrase.team}</strong>
               {' · Show: '}<strong>{filterPhrase.show}</strong>
             </p>
@@ -1659,7 +2104,7 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
           </div>
 
           {printBands.map((band, bandIndex) => {
-            const from = bandIndex * PRINT_BAND_COLUMNS + 1
+            const from = bandIndex * printBandSize + 1
             const to = from + band.length - 1
             return (
               <section key={from} className="lm-print-band">
@@ -1668,29 +2113,60 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
                 <p className="lm-print-band-head">
                   {filterPhrase.grainNoun}s {from}–{to} of {columns.length}
                   {printBands.length > 1 ? ` · sheet ${bandIndex + 1} of ${printBands.length} across` : ''}
-                  {' · '}{lineName} · {filterPhrase.series} · {filterPhrase.team} · {filterPhrase.show}
+                  {' · '}{lineName}{filterPhrase.buildLine ? ` · ${filterPhrase.buildLine}` : ''} · {filterPhrase.series} · {filterPhrase.team} · {filterPhrase.show}
                   {/* Repeated on every band: the bands are separate sheets and get separated,
                       so each one has to say for itself that it is a subset. */}
                   {filterPhrase.subset ? ` · ${filterPhrase.models}` : ''}
                   {futureOnly ? ' · future builds only' : ''}
                 </p>
                 <table className="lm-print-table">
+                  {/* Explicit columns. Under table-layout: fixed the widths are read off the
+                      FIRST row, and when that row is the area headings its cells are colspans
+                      with no width of their own — the 13mm floor would be lost exactly when the
+                      area row is on. A colgroup outranks any row. */}
+                  <colgroup>
+                    <col className="lm-print-col-model" />
+                    {band.map((col) => <col key={col.key} className="lm-print-col-job" />)}
+                    <col className="lm-print-col-total" />
+                  </colgroup>
                   {/* display: table-header-group in the print CSS — a band with 101 models runs
                       down several sheets, and the job names come back at the top of each. */}
                   <thead>
+                    {showAreaHeader && (
+                      <tr>
+                        <th className="lm-print-th-model" rowSpan={headerRows}>Model</th>
+                        {areaSpansOf(band).map((a) => (
+                          <th key={a.areaId} className="lm-print-th-area" colSpan={a.span}>{a.name}</th>
+                        ))}
+                        <th className="lm-print-th-total" rowSpan={headerRows}>Model total</th>
+                      </tr>
+                    )}
+                    {/* Spans worked out per band, like the area row's — a section or team cut by
+                        the band boundary is headed again on the next sheet. */}
+                    {showParentHeader && (
+                      <tr>
+                        {!showAreaHeader && <th className="lm-print-th-model" rowSpan={headerRows}>Model</th>}
+                        {parentSpansOf(band).map((s, i) => (
+                          <th key={`${i}|${s.key}`} className="lm-print-th-parent" colSpan={s.span}>
+                            <span className="lm-print-th-parent-text">{s.label}</span>
+                          </th>
+                        ))}
+                        {!showAreaHeader && <th className="lm-print-th-total" rowSpan={headerRows}>Model total</th>}
+                      </tr>
+                    )}
                     <tr>
-                      <th className="lm-print-th-model">Model</th>
+                      {headerRows === 1 && <th className="lm-print-th-model">Model</th>}
                       {band.map((col) => (
                         <th key={col.key} className="lm-print-th-job">
                           <span className="lm-print-th-job-text">{col.label}</span>
                         </th>
                       ))}
-                      <th className="lm-print-th-total">Model total</th>
+                      {headerRows === 1 && <th className="lm-print-th-total">Model total</th>}
                     </tr>
                   </thead>
                   <tbody>
                     {visibleProducts.map((p) => {
-                      const total = rowTotals.get(p.id) ?? { minutes: 0, incomplete: false }
+                      const total = rowTotals.get(p.id) ?? NO_ROW_TOTAL
                       return (
                         <tr key={p.id}>
                           <th scope="row" className="lm-print-td-model">
@@ -1712,8 +2188,10 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
                               would show for this model under this filter, and a per-band subtotal
                               would be a number that exists nowhere else in the app. The heading
                               says "Model total" for exactly that reason. */}
+                          {/* Blank when nothing on the row applies — blank on paper means blank,
+                              the same as a cell. See RowTotal. */}
                           <td className={`lm-print-td-total${total.incomplete ? ' lm-incomplete' : ''}`}>
-                            {fmtMinutes(total.minutes)}{total.incomplete ? '*' : ''}
+                            {total.applies ? `${fmtMinutes(total.minutes)}${total.incomplete ? '*' : ''}` : ''}
                           </td>
                         </tr>
                       )

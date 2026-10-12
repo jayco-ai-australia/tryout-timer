@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import AddTimeDrawer from '@/components/AddTimeDrawer'
 import BulkModelLinkDrawer, { DRAWER_WIDTH, useSlideOverDrawer } from '@/components/BulkModelLinkDrawer'
@@ -115,6 +115,18 @@ export default function MatrixCellDrawer({
   )
   const focusedJob = jobs.find((j) => j.id === focusedJobId) ?? null
 
+  function focusJob(id: string) { setFocusedJobId(id); setNotice(null); setError(null) }
+
+  /** The coarse-grain job list, split by whether the job applies to this model. A partition and
+   * nothing else — each half keeps the order the matrix handed the jobs over in, and "applies"
+   * is the matrix's own cell fact, not a second rule. */
+  const jobGroups = useMemo(() => {
+    const applies: DrawerJob[] = []
+    const na: DrawerJob[] = []
+    for (const j of jobs) (cellFor(j.id)?.applies ? applies : na).push(j)
+    return { applies, na }
+  }, [jobs, cellFor])
+
   /** Bumped after anything this drawer opened wrote, so the operation list below re-reads — a
    * newly created operation has to appear without closing the drawer. */
   const [opsTick, setOpsTick] = useState(0)
@@ -181,6 +193,12 @@ export default function MatrixCellDrawer({
     }
     return [...ids]
   }, [operations, linkedOperationIds, minutesFor])
+
+  /** The focused job's operations, split the same way: linked to this model, then not. */
+  const opGroups = useMemo(() => ({
+    linked: linkedHere,
+    na: operations.filter((o) => !linkedOperationIds.has(o.id)),
+  }), [operations, linkedHere, linkedOperationIds])
 
   const jobApplies = focusedJob ? (cellFor(focusedJob.id)?.applies ?? false) : false
 
@@ -283,37 +301,52 @@ export default function MatrixCellDrawer({
                 the job you mean.
               </p>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                {jobs.map((j) => {
+                {jobGroups.applies.map((j) => {
                   const cell = cellFor(j.id)
-                  const state = cell && cell.applies
-                    ? jobCompleteness(cell.timedOps, cell.totalOps)
-                    : null
+                  const state = cell ? jobCompleteness(cell.timedOps, cell.totalOps) : null
                   return (
                     <button
                       key={j.id}
                       type="button"
                       className="lm-cell-job"
-                      onClick={() => { setFocusedJobId(j.id); setNotice(null); setError(null) }}
+                      onClick={() => focusJob(j.id)}
                     >
                       <span className="lm-cell-job-name">{j.name}</span>
-                      <span className="lm-cell-job-meta">
-                        {!cell || !cell.applies ? (
-                          <span className="lm-cell-tag">doesn’t apply</span>
-                        ) : (
-                          <>
-                            <span className={
-                              'lm-cell-fig'
-                              + (state === 'none' ? ' lm-cell-fig-none' : state === 'partial' ? ' lm-cell-fig-partial' : ' lm-cell-fig-timed')
-                            }>
-                              {fmtMinutes(cell.minutes)}m
-                            </span>
-                            <span className="lm-cell-tag">{cell.timedOps} / {cell.totalOps} timed</span>
-                          </>
-                        )}
-                      </span>
+                      {cell && (
+                        <span className="lm-cell-job-meta">
+                          <span className={
+                            'lm-cell-fig'
+                            + (state === 'none' ? ' lm-cell-fig-none' : state === 'partial' ? ' lm-cell-fig-partial' : ' lm-cell-fig-timed')
+                          }>
+                            {fmtMinutes(cell.minutes)}m
+                          </span>
+                          <span className="lm-cell-tag">{cell.timedOps} / {cell.totalOps} timed</span>
+                        </span>
+                      )}
                     </button>
                   )
                 })}
+                {/* The jobs this model doesn't do, below the ones it does and under their own
+                    heading — A–Z together, "Air Bag Fitment" sat above three jobs with real
+                    times. No figure and no tag: the heading says what they are, and a blank is
+                    what the grid shows for them too. Still buttons — this is where a job gets
+                    applied. Nothing at all when every job applies. */}
+                {jobGroups.na.length > 0 && (
+                  <>
+                    <div className="lm-cell-na-head">Doesn’t apply to this model</div>
+                    {jobGroups.na.map((j) => (
+                      <button
+                        key={j.id}
+                        type="button"
+                        className="lm-cell-job lm-cell-job-na"
+                        title={`${j.name} does not apply to ${product.model} — open it to apply it`}
+                        onClick={() => focusJob(j.id)}
+                      >
+                        <span className="lm-cell-job-name">{j.name}</span>
+                      </button>
+                    ))}
+                  </>
+                )}
               </div>
             </>
           )}
@@ -399,50 +432,59 @@ export default function MatrixCellDrawer({
                   </p>
                 ) : (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                    {operations.map((op) => {
-                      const linked = linkedOperationIds.has(op.id)
-                      const minutes = minutesFor(op.id)
-                      return (
-                        <div key={op.id} className="lm-cell-op">
-                          {/* The per-operation applies control. Ticking writes a
-                              model_operations row through the shared writer; unticking opens the
-                              confirmed, times-aware unlink rather than deleting the row here. */}
-                          <label className="lm-cell-op-tick" title={linked
-                            ? `${op.name} applies to ${product.model} — untick to remove it`
-                            : `${op.name} does not apply to ${product.model} — tick to link it`}>
-                            <input
-                              type="checkbox"
-                              checked={linked}
-                              disabled={busy}
-                              onChange={() => {
-                                if (linked) setUnlinkTarget({ operationIds: [op.id], operationName: op.name })
-                                else void link([op.id], `“${op.name}”`)
-                              }}
-                            />
-                            <span className="lm-cell-op-name">{op.name}</span>
-                          </label>
-                          <span className="lm-cell-op-time">
-                            {minutes === null
-                              ? <span className="lm-cell-tag lm-cell-tag-none">not yet timed</span>
-                              : <span className="lm-cell-fig lm-cell-fig-timed">{fmtMinutes(minutes)}m</span>}
-                            <button
-                              type="button"
-                              className="lm-models-action"
-                              disabled={busy}
-                              title={minutes === null
-                                ? 'Enter a time for this operation against this model'
-                                : 'Every run behind this figure — edit, supersede, split or delete'}
-                              onClick={() => {
-                                if (minutes === null) setAddTimeOpen(true)
-                                else setEditTimesFor({ id: op.id, name: op.name })
-                              }}
-                            >
-                              {minutes === null ? 'Add time' : 'Edit'}
-                            </button>
-                          </span>
-                        </div>
-                      )
-                    })}
+                    {/* Linked operations first, then the ones this model doesn't do under the same
+                        heading the job list uses. An unlinked row is secondary: muted, and with
+                        no figure and no time action — EXCEPT one that still has a current time
+                        (a run whose applies-row was removed elsewhere). Those minutes are in the
+                        grid's total, so the figure and its Edit stay visible. */}
+                    {([[opGroups.linked, true], [opGroups.na, false]] as const).map(([ops, linked]) => ops.length > 0 && (
+                      <Fragment key={linked ? 'linked' : 'na'}>
+                        {!linked && <div className="lm-cell-na-head">Doesn’t apply to this model</div>}
+                        {ops.map((op) => {
+                          const minutes = minutesFor(op.id)
+                          return (
+                            <div key={op.id} className={linked ? 'lm-cell-op' : 'lm-cell-op lm-cell-op-na'}>
+                              {/* The per-operation applies control. Ticking writes a
+                                  model_operations row through the shared writer; unticking opens the
+                                  confirmed, times-aware unlink rather than deleting the row here. */}
+                              <label className="lm-cell-op-tick" title={linked
+                                ? `${op.name} applies to ${product.model} — untick to remove it`
+                                : `${op.name} does not apply to ${product.model} — tick to link it`}>
+                                <input
+                                  type="checkbox"
+                                  checked={linked}
+                                  disabled={busy}
+                                  onChange={() => {
+                                    if (linked) setUnlinkTarget({ operationIds: [op.id], operationName: op.name })
+                                    else void link([op.id], `“${op.name}”`)
+                                  }}
+                                />
+                                <span className="lm-cell-op-name">{op.name}</span>
+                              </label>
+                              <span className="lm-cell-op-time">
+                                {minutes !== null
+                                  ? <span className="lm-cell-fig lm-cell-fig-timed">{fmtMinutes(minutes)}m</span>
+                                  : linked && <span className="lm-cell-tag lm-cell-tag-none">not yet timed</span>}
+                                {(linked || minutes !== null) && <button
+                                  type="button"
+                                  className="lm-models-action"
+                                  disabled={busy}
+                                  title={minutes === null
+                                    ? 'Enter a time for this operation against this model'
+                                    : 'Every run behind this figure — edit, supersede, split or delete'}
+                                  onClick={() => {
+                                    if (minutes === null) setAddTimeOpen(true)
+                                    else setEditTimesFor({ id: op.id, name: op.name })
+                                  }}
+                                >
+                                  {minutes === null ? 'Add time' : 'Edit'}
+                                </button>}
+                              </span>
+                            </div>
+                          )
+                        })}
+                      </Fragment>
+                    ))}
                   </div>
                 )}
               </div>
