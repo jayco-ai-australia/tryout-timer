@@ -236,6 +236,79 @@ body {
 .data-table tbody td.right { text-align: right; }
 .data-table tbody td.center { text-align: center; }
 
+/* ── Config → Sections: the structure-cleanup table ──────────────────────────────────────
+   A .data-table with four things the plain one doesn't do:
+
+   1. A STICKY header, pinned under the app chrome (--topbar-h: 56px with the top bar, 0 while the
+      sidebar is docked) as the page scrolls. Sticky resolves against the nearest scrolling
+      ancestor, so the card around this table must NOT set overflow — see SectionsTab. The bottom
+      rule is an inset shadow rather than a border: with border-collapse a sticky cell leaves its
+      border behind.
+   2. Section and Team never wrap — one line each, so every row is the same height. A section
+      name longer than its column truncates with an ellipsis (the full name is on the cell's
+      title).
+   3. The four counts are CENTRED, header and value alike.
+   4. The row is BOOKENDED: Order + Section on the left and Actions on the right carry the same
+      slightly darker fill, so the row is anchored at both ends and the counts sit in a lighter
+      band between them. The fill is --sec-zone, a tint of the design system's own neutral
+      (--grey) rather than a new grey — and translucent, so it darkens whatever is underneath
+      (the plain row, the hover state, an open section) instead of replacing it. Only the fill
+      darkens; the section name keeps the row's strongest text colour.
+   5. The card around it (.sections-card) has a firmer edge and more lift than a plain .card, so
+      the table reads as a surface of its own against the page background. */
+.sections-card {
+  /* The neutral the system already uses for a pressed/hovered outline (.btn-ghost:hover). */
+  border-color: #cdd0d6;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.06), 0 6px 20px rgba(0,0,0,0.10);
+}
+.sections-table {
+  --sec-zone: rgba(78, 75, 72, 0.07);                              /* --grey at 7%, for old engines */
+  --sec-zone: color-mix(in srgb, var(--grey) 7%, transparent);
+  --sec-zone-head: #f0f0f0;                                        /* the same tint over the header's #fafafa, opaque */
+  --sec-zone-head: color-mix(in srgb, var(--grey) 7%, #fafafa);
+}
+.sections-table thead th {
+  position: sticky;
+  top: var(--topbar-h);
+  z-index: 3;
+  background: #fafafa;
+  border-bottom: none;
+  box-shadow: inset 0 -1px 0 var(--border);
+  white-space: nowrap;
+}
+.sections-table thead th:first-child { border-top-left-radius: 10px; }
+.sections-table thead th:last-child { border-top-right-radius: 10px; }
+.sections-table tbody td.sec-name {
+  white-space: nowrap;
+  min-width: 340px;
+  max-width: 460px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sections-table tbody td.sec-team { white-space: nowrap; min-width: 96px; }
+.sections-table thead th.sec-num,
+.sections-table tbody td.sec-num { text-align: center; white-space: nowrap; }
+.sections-table thead th.sec-actions { text-align: right; }
+/* Opaque in the header (it is sticky, and rows pass underneath); translucent in the body. */
+.sections-table thead th.sec-order,
+.sections-table thead th.sec-name,
+.sections-table thead th.sec-actions { background: var(--sec-zone-head); }
+.sections-table tbody td.sec-order,
+.sections-table tbody td.sec-name,
+.sections-table tbody td.sec-actions { background: var(--sec-zone); }
+.sections-table tbody td.sec-actions { text-align: right; white-space: nowrap; }
+/* The section name stays the most legible thing in the row: full text colour on the tint. */
+.sections-table tbody td.sec-name { color: var(--text); }
+/* A team's group row spans the table. The same neutral, a step stronger, so it reads as a
+   divider between bookended rows rather than as a paler one of them. */
+.sections-table tbody td.sec-group {
+  background: color-mix(in srgb, var(--grey) 10%, var(--surface));
+  color: var(--text-mid);
+}
+/* An open section and its job panel are one unit: the panel takes the same tint as the row's
+   bookends down its left edge, so it hangs off its parent instead of floating under it. */
+.sections-table tbody td.sec-panel { padding: 0; box-shadow: inset 4px 0 0 var(--sec-zone); }
+
 /* A small icon affordance inside a table cell — sized to sit on the text baseline without
    stretching the row, and muted until hovered so the cell still reads as its value first. */
 .row-icon-button {
@@ -280,10 +353,14 @@ body {
    measured per frame. Transitions only exist under html[data-nav-anim], which Nav sets after the
    first paint, so the initial state is never animated in.
 
-   COLOUR. The column is #0749c1 with white text (7.7:1). Group headings sit on a darker band of
-   the same hue, #032d7a — 1.65:1 against the column so it reads as a divider, with #cfe0ff
-   heading text on it at 9.5:1. Hover is a 14% white wash (white text on it: 5.7:1). Active is the
-   inverse — a white pill with #0749c1 text (7.7:1) — the one thing on the column that is white.
+   COLOUR. The column is the brand blue, #0079c1 (= --blue), with white text at 4.66:1 — AA for
+   normal text with little headroom, so NOTHING on the column may be lighter than white-on-blue:
+   no translucent white text, and no white hover wash (a 14% wash drops white text to 3.7:1).
+     band     #004066 — the same 202° hue, darker; 2.34:1 against the column so it reads as a
+              divider. Heading text #d6ecfa (same hue family) on it: 8.95:1.
+     hover    #00639e — the column darkened ~18%, so white text gets MORE contrast (6.41:1).
+     active   a white pill with --blue-dark text (5.75:1) — the one white thing on the column.
+     email    plain white (4.66:1); the old #dbe6fb tint was 3.7:1 on this blue.
 
    --topbar-h is how tall the top bar is right now (56px, or 0 while docked). Anything pinned
    under the bar — the /tryouts timer rail — reads it rather than hard-coding 56px.
@@ -294,10 +371,11 @@ body {
   --sidenav-w: 232px;
   --sidenav-rail: 64px;
   --topbar-h: 56px;
-  --nav-bg: #0749c1;
-  --nav-band: #032d7a;
-  --nav-band-text: #cfe0ff;
-  --nav-hover: rgba(255, 255, 255, 0.14);
+  --nav-bg: var(--blue);
+  --nav-band: #004066;
+  --nav-band-text: #d6ecfa;
+  --nav-hover: #00639e;
+  --nav-active-text: var(--blue-dark);
   --nav-divider: rgba(255, 255, 255, 0.16);
   --nav-ease: 0.22s cubic-bezier(0.4, 0, 0.2, 1);
 }
@@ -391,6 +469,21 @@ body {
   width: var(--sidenav-w);
 }
 .nav-sidebar-head .nav-logo { color: #fff; gap: 10px; }
+/* The header as the rail toggle (desktop). Reads as the wordmark, behaves as a button. */
+.nav-head-toggle {
+  margin-left: -8px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  transition: background 0.12s;
+}
+.nav-head-toggle:hover { background: var(--nav-hover); }
+/* Its box shrinks to the mark on the rail, so the hover pill sits inside the 64px column instead
+   of being clipped at its edge. max-width on the same easing as the column. */
+@media screen and (min-width: 1280px) {
+  .nav-head-toggle { max-width: 200px; overflow: hidden; }
+  html[data-nav="rail"] .nav-head-toggle { max-width: 38px; }
+  html[data-nav-anim] .nav-head-toggle { transition: background 0.12s, max-width var(--nav-ease); }
+}
 .nav-logo-mark { display: inline-flex; }
 .nav-sidebar-close {
   display: inline-flex;
@@ -399,7 +492,7 @@ body {
   width: 32px;
   height: 32px;
   border-radius: 7px;
-  color: rgba(255,255,255,0.85);
+  color: #fff;
   transition: background 0.12s;
 }
 .nav-sidebar-close:hover { background: var(--nav-hover); color: #fff; }
@@ -425,8 +518,9 @@ body {
   justify-content: center;
   background: #fff;
   border-color: #fff;
-  color: var(--nav-bg);
+  color: var(--nav-active-text);
 }
+/* --blue-dark on --blue-light: 5.14:1. (--blue on it would be 4.17:1 — below AA.) */
 .nav-sidebar-action .nav-add-time:hover { background: var(--blue-light); border-color: var(--blue-light); }
 
 /* The links scroll on their own in a short window; Add Time and the foot stay put. */
@@ -459,7 +553,7 @@ body {
 }
 .nav-link:hover { background: var(--nav-hover); }
 .nav-link-active,
-.nav-link-active:hover { background: #fff; color: var(--nav-bg); }
+.nav-link-active:hover { background: #fff; color: var(--nav-active-text); }
 .nav-icon { display: inline-flex; flex-shrink: 0; }
 .nav-link-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
@@ -475,7 +569,7 @@ body {
   flex: 1;
   min-width: 0;
   font-size: 12px;
-  color: #dbe6fb;
+  color: #fff;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -511,8 +605,8 @@ body {
 }
 .nav-rail-btn:hover, .nav-rail-btn-open { background: var(--nav-hover); }
 /* The group holding the current page — same inverse pill as an active link. */
-.nav-rail-btn-active, .nav-rail-btn-active:hover { background: #fff; color: var(--nav-bg); }
-.nav-rail-add { background: #fff; color: var(--nav-bg); }
+.nav-rail-btn-active, .nav-rail-btn-active:hover { background: #fff; color: var(--nav-active-text); }
+.nav-rail-add { background: #fff; color: var(--nav-active-text); }
 .nav-rail-add:hover { background: var(--blue-light); }
 
 /* ── The rail toggle (desktop only) ── */
@@ -530,7 +624,7 @@ body {
   height: 40px;
   padding: 0 11px;
   border-radius: 8px;
-  color: rgba(255,255,255,0.9);
+  color: #fff;
   font-size: 13px;
   font-weight: 600;
   transition: background 0.12s;
@@ -1708,10 +1802,11 @@ body {
   border-left: 1px solid var(--border);
   box-shadow: -2px 0 12px rgba(0, 0, 0, 0.05);
 }
-/* Idle: the same footprint, quietly styled and holding a one-line empty state. The width is
-   deliberately NOT collapsed — the rail changing width when the first timer starts reflowed the
-   panes and shifted the whole screen sideways, which is exactly what must not happen. It stays
-   unobtrusive by being quiet, not by being narrow. */
+/* Idle: the same footprint, quietly styled and holding a one-line empty state. On DESKTOP the
+   width is deliberately NOT collapsed — the rail changing width when the first timer starts
+   reflowed the panes and shifted the whole screen sideways. It stays unobtrusive by being quiet,
+   not by being narrow. Tablet is the one exception, collapsing to a strip — see the TABLET
+   block below the finder breakpoints for why. */
 .timer-rail-empty {
   background: var(--bg);
   box-shadow: none;
@@ -1875,6 +1970,103 @@ body {
     overflow-x: visible;
   }
   .finder-pane { height: auto; max-height: 52vh; }
+}
+
+/* ── TABLET: 721–1400px ─────────────────────────────────────────────────────────────────────
+   1400px is this sheet's existing desktop line (the four-up finder above stops being readable
+   below it); 720px is where phones take over. Nothing in this block applies above 1400px, so the
+   desktop layout is untouched.
+
+   The running rail, while it is still a SIDE column (1101–1400px; at 1100px and below it is
+   already the bottom bar):
+     • With timers: 232px instead of a quarter of the screen. The clock, the wrapped operation name
+       and Pause / Complete all fit at that width (the 44px touch target is in the 721–1400px
+       block below, so the portrait bottom bar gets it too).
+     • With NO timers: a 44px strip carrying the "Running (0)" heading turned on its side. It
+       widens back to 232px the moment a timer starts.
+
+   That widening does reflow the panes once, when the first timer starts and again when the last
+   one ends, and this is a deliberate exception to the desktop rule (see .timer-rail-empty). A
+   quarter of a tablet held by an empty panel costs more than one reflow. The reflow happens on a
+   tap of Start, not while a finger is on its way to a moving Complete button: once a timer is
+   running, the width doesn't change again until none are left.
+
+   Both widths go through --timer-rail-w, so .rail-page's reserved margin follows the rail
+   automatically and the panes never sit underneath it. */
+@media (min-width: 1101px) and (max-width: 1400px) {
+  :root { --timer-rail-w: 232px; }
+  :root:has(.timer-rail-empty) { --timer-rail-w: 44px; }
+
+  .timer-rail-empty .timer-rail-header {
+    writing-mode: vertical-rl;
+    transform: rotate(180deg);
+    align-self: center;
+    padding: 14px 0;
+    border-bottom: none;
+    background: transparent;
+    white-space: nowrap;
+  }
+  .timer-rail-empty .timer-rail-none { display: none; }
+
+  .timer-rail-body { padding: 8px; }
+  .timer-rail-card { padding: 10px; }
+}
+
+/* The three panes at tablet width (portrait and landscape): fitted to the width instead of the
+   280px-a-column horizontal scroller above. That scroller pushed the Operations pane, the one
+   being worked in, partly off the right-hand edge and cut "Enter manually" in half. Operations
+   keeps the larger share and a 300px floor, so its controls always have room. overflow-x stays
+   only as a last resort for a viewport narrower than the floors add up to. */
+@media (min-width: 721px) and (max-width: 1400px) {
+  /* The rail's controls at a 44px touch target, whether the rail is the side column (landscape)
+     or the bottom bar (portrait). !important only to beat the buttons' inline padding/font-size,
+     which are their desktop size. */
+  .timer-rail-card-actions .btn-ghost,
+  .timer-rail-card-actions .btn-primary {
+    min-height: 44px;
+    padding: 8px 14px !important;
+    font-size: 13px !important;
+  }
+  .timer-rail-card-actions .finder-row-action { min-height: 44px; padding: 0 6px; }
+
+  .finder-panes-3 {
+    grid-auto-flow: row;
+    grid-auto-columns: auto;
+    grid-template-columns: minmax(180px, 1fr) minmax(180px, 1fr) minmax(300px, 1.7fr);
+  }
+
+  /* The operation row: the NAME WRAPS instead of ellipsising. A truncated name is useless to
+     someone working from it on the floor. The row grows to fit, and that doesn't break the row's
+     no-reflow rule (see .finder-row-op): the wrap depends only on the name and the pane width,
+     never on timer state, and the running-dot slot beside the name is reserved whether or not a
+     timer is on. Starting or completing a timer still changes nothing but the slot's contents. */
+  .finder-row-op {
+    height: auto;
+    min-height: 110px;
+    grid-template-rows: auto 18px auto;
+  }
+  .finder-row-op-head { align-items: flex-start; overflow: visible; }
+  .finder-row-op-head .finder-row-name {
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+    overflow-wrap: break-word;
+    line-height: 1.4;
+    padding-top: 2px;
+  }
+  /* The capture slot WRAPS rather than clipping. Start + Enter manually and the running clock +
+     Pause + Complete each fit on one line at the 300px floor, so neither timer state wraps and
+     switching between them doesn't change the row's height. Only the wider "doesn't apply" set
+     (Start, Apply to model first, Enter manually) can take a second line, and then "Enter
+     manually" drops below, right-aligned, instead of running off the pane. */
+  .finder-row-op-slot {
+    flex-wrap: wrap;
+    row-gap: 6px;
+    min-height: 34px;
+    overflow: visible;
+    white-space: normal;
+  }
+  .finder-row-op-slot > button { white-space: nowrap; }
 }
 
 /* ── Print: the Model Total collection sheet ─────────────────────────────────────────────
@@ -2580,13 +2772,13 @@ body {
 }
 
 /* ── /model-total: the print controls ────────────────────────────────────────────────────
-   The page prints three sheets from two controls. "Print blank sheet" stands on its own with a
+   The page prints five sheets from two controls. "Print blank sheet" stands on its own with a
    hairline divider after it, because it is a different errand: an empty sheet that goes OUT to
-   the line to be written on. What comes back — the recorded times — is one document at two
-   depths, so it is one labelled group with two segments.
+   the line to be written on. What comes back — the recorded times — is one document at four
+   grains (Operations, Job, Section, Team Detail), so it is one labelled group of segments.
 
-   A segmented pair, not a dropdown on a single button: two options do not earn a menu, and a
-   menu would hide the fact that the job-summary sheet exists at all. Both segments are ordinary
+   Segments, not a dropdown on a single button: a menu would hide the fact that the coarser
+   sheets exist at all. Every segment is an ordinary
    .btn-ghost buttons; everything here only joins them and hangs the label above. */
 .mt-print-divider {
   width: 1px;
@@ -2609,7 +2801,9 @@ body {
    instead of having half of it painted over. */
 .mt-print-seg-btn { border-radius: 0; position: relative; }
 .mt-print-seg-btn:first-child { border-radius: 8px 0 0 8px; }
-.mt-print-seg-btn:last-child { border-radius: 0 8px 8px 0; margin-left: -1px; }
+.mt-print-seg-btn:last-child { border-radius: 0 8px 8px 0; }
+/* Every segment after the first overlaps its neighbour's border, so four read as one control. */
+.mt-print-seg-btn + .mt-print-seg-btn { margin-left: -1px; }
 .mt-print-seg-btn:hover:not(:disabled) { z-index: 1; }
 
 /* ── /model-total: the recorded-times sheets ─────────────────────────────────────────────
@@ -2632,8 +2826,26 @@ body {
 @media print {
   /* Name takes the measure; the figure column is fixed and right-aligned, wide enough that a
      four-figure total and the "MINS" heading can never meet. */
-  .mt-times-table th.mt-col-name { width: 78%; }
-  .mt-times-table th.mt-col-mins { width: 22%; }
+  .mt-times-table .mt-col-name { width: 78%; }
+  .mt-times-table .mt-col-mins { width: 22%; }
+
+  /* ── Team and section grouping ────────────────────────────────────────────────────────
+     Line and team are headings; each SECTION is a table of its own, because a <thead> is the
+     only thing a browser brings back at the top of every sheet a block runs onto. That thead
+     names the team and the section, so both repeat across a page break. */
+  .mt-times-grouphead {
+    display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
+    font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+    break-after: avoid; page-break-after: avoid; break-inside: avoid;
+  }
+  .mt-times-grouphead > span:last-child {
+    font-size: 8.5pt; font-weight: 400; text-transform: none; letter-spacing: 0; white-space: nowrap;
+  }
+  .mt-times-line { font-size: 11pt; margin: 16px 0 0; padding-bottom: 2px; border-bottom: 1pt solid #000; }
+  .mt-times-team { font-size: 9.5pt; margin: 12px 0 0; padding-bottom: 2px; border-bottom: 0.75pt solid #444; }
+  .rp-head + .mt-times-line { margin-top: 0; }
+  .mt-times-table.mt-sec-table { margin-top: 8px; }
+  .mt-times-table th.mt-sec-head { font-size: 8.5pt; }
 
   .mt-times-heading {
     font-size: 10.5pt; font-weight: 700; margin: 14px 0 4px;
@@ -2694,6 +2906,119 @@ body {
     break-inside: avoid;
     page-break-inside: avoid;
   }
+
+  /* DETAILED sheet only: an operation row reads as nested under its job — a small indent and
+     italic, against the bold job and line rows. Scoped through tbody.mt-times-jobblock because
+     .mt-times-op alone also marks the JOB rows on the job-summary sheet, which must stay as they
+     are. The :first-child is what lets the indent win over report-print.css's
+     `.rp-table td:first-child { padding-left: 0 }` — which is why the plain .mt-times-op indent
+     above never showed. Only the name cell moves; the Mins cell is untouched, so the figures
+     stay one right-aligned column. */
+  .mt-times-table tbody.mt-times-jobblock td.mt-times-op:first-child {
+    padding-left: 10px;
+    font-style: italic;
+  }
+}
+
+/* ── /model-total: the grouped breakdown (Team → Section → Job → Operation) ───────────────
+   Everything structural is /config → Sections' own — .sections-card, .sections-table, the
+   .sec-group team row, the bookended .sec-name / .sec-actions, the centred .sec-num counts.
+   .mt-tree only adds what that table doesn't have: FIXED column widths, so each production
+   line's table and the grand total under them put the same figure at the same x; two more
+   levels of indent under a section; and the coverage state of a section. */
+.mt-tree { table-layout: fixed; }
+.mt-tree col.mt-c-jobs    { width: 98px; }
+.mt-tree col.mt-c-ops     { width: 98px; }
+.mt-tree col.mt-c-untimed { width: 88px; }
+.mt-tree col.mt-c-mins    { width: 100px; }
+.mt-tree col.mt-c-state   { width: 128px; }
+.mt-tree col.mt-c-actions { width: 132px; }
+.mt-tree col.mt-c-count   { width: 190px; }
+.mt-tree thead th, .mt-tree tbody td { padding-left: 10px; padding-right: 10px; }
+.mt-tree thead th:first-child, .mt-tree tbody td:first-child { padding-left: 20px; }
+.mt-tree tbody td.sec-num { font-variant-numeric: tabular-nums; }
+/* The name column is whatever the fixed columns leave, so it truncates rather than sizes. */
+.mt-tree tbody td.sec-name { min-width: 0; max-width: none; }
+.mt-tree tbody td.mt-name, .mt-tree tbody td.mt-team-name {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.mt-tree tbody td.sec-group { padding-top: 8px; padding-bottom: 8px; }
+.mt-tree tbody td.mt-team-name { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
+.mt-tree tbody tr.mt-section td { padding-top: 9px; padding-bottom: 9px; }
+.mt-tree tbody tr.mt-job td { padding-top: 6px; padding-bottom: 6px; font-size: 13px; }
+.mt-tree tbody td.mt-job-name { padding-left: 46px; }
+.mt-tree tbody tr.mt-op td { padding-top: 5px; padding-bottom: 5px; font-size: 13px; background: var(--bg); }
+.mt-tree tbody tr.mt-op:hover td { background: #f1f3f5; }
+.mt-tree tbody td.mt-op-name { padding-left: 82px; }
+.mt-tree tbody tr.mt-op-untimed td.mt-op-name { color: var(--text-muted); }
+.mt-tree tbody tr.mt-grand td { font-weight: 700; color: var(--text); }
+
+/* The coverage state of a section, on the edge the eye runs down. The app's existing three —
+   --red nothing timed, --amber partly, --green fully (as .badge-*, .validate-cell-*) — and never
+   colour alone: the Status badge beside it says the same thing in words. A section with NOTHING
+   timed also takes --red-bg across the whole row; it is the most actionable thing on the page. */
+.mt-tree tbody tr.mt-state-none td.sec-name    { box-shadow: inset 4px 0 0 var(--red); }
+.mt-tree tbody tr.mt-state-partial td.sec-name { box-shadow: inset 4px 0 0 var(--amber); }
+.mt-tree tbody tr.mt-state-timed td.sec-name   { box-shadow: inset 4px 0 0 var(--green); }
+.mt-tree tbody tr.mt-state-none td { background: var(--red-bg); }
+/* An untimed count, wherever it is shown. --red, the colour already on a not-yet-timed 0m. */
+.mt-untimed { color: var(--red); font-weight: 700; }
+.mt-copied {
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--text-muted); border: 1px solid var(--border); border-radius: 4px;
+  padding: 1px 4px; margin-left: 6px; white-space: nowrap;
+}
+
+/* The blank collection sheet's grouping — same reason as the recorded-times sheets above: one
+   table per section, whose <thead> (team · section) the browser repeats on every sheet. */
+@media print {
+  .print-line-name {
+    font-size: 12pt; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+    margin: 0 0 6px; break-after: avoid; page-break-after: avoid;
+  }
+  .print-sec-table + .print-line-name { margin-top: 22px; }
+  .print-sec-table + .print-team-name { margin-top: 20px; }
+  .print-team-name {
+    font-size: 11.5pt; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em;
+    margin: 0 0 8px; padding: 4px 0; border-top: 2px solid #000; border-bottom: 2px solid #000;
+    break-after: avoid; page-break-after: avoid;
+  }
+  .print-sec-table { width: 100%; border-collapse: collapse; margin: 0 0 16px; }
+  .print-sec-table thead { display: table-header-group; }
+  .print-sec-table th {
+    text-align: left; font-size: 10.5pt; font-weight: 700; padding: 0 0 4px;
+    border-bottom: 1.5px solid #000;
+  }
+  .print-sec-table .print-sec-count { font-weight: 400; }
+  .print-sec-table td { padding: 0; }
+  .print-sec-table tr { break-inside: avoid; page-break-inside: avoid; }
+  .print-sec-table .print-job-name { font-size: 10.5pt; margin: 10px 0 0; border-bottom: 0; padding-bottom: 0; }
+}
+
+/* ── components/InfoPopover: the info icon and its popover ────────────────────────────────
+   The icon is 20px to look at and 28px to hit (the padding is the target), so a row of them
+   stays compact without becoming untappable on a tablet. Tone colours are set inline from the
+   semantic pairs the badges use. Above a Modal (300), since that is where it mostly lives. */
+.info-pop-btn {
+  flex: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; margin: 4px; padding: 0;
+  border: 1.5px solid; border-radius: 50%;
+  font-family: inherit; font-size: 11px; font-weight: 700; line-height: 1;
+  cursor: pointer;
+  position: relative;
+}
+.info-pop-btn::after { content: ''; position: absolute; inset: -6px; }
+.info-pop-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.info-pop {
+  position: fixed; z-index: 400;
+  padding: 9px 12px;
+  background: var(--surface); color: var(--text-mid);
+  border: 1px solid var(--border); border-top: 3px solid;
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.14);
+  font-size: 12px; line-height: 1.5; font-weight: 400;
+  text-align: left; white-space: normal;
 }
 
 /* ── /labour-matrix: models × jobs ───────────────────────────────────────────────────────────
@@ -2774,12 +3099,12 @@ body {
   text-align: left; vertical-align: bottom;
 }
 /* Rotated, so a column is as wide as "1234.5" instead of as wide as "Fit Water Tanks And Pump".
-   At ~58px a 90-job grid is 5,200px across; horizontal headings would make it 12,000px. */
+   At ~64px a 90-job grid is 5,800px across; horizontal headings would make it 12,000px. */
 /* ── Centring a rotated header over its column ─────────────────────────────────────────
    `text-align: center` on the cell is only half of it, and on its own does nothing at all.
 
    The label was `display: block`, which makes it a BLOCK box in the cell's horizontal
-   formatting context — so it stretched to the full 58px of the column, and `text-align` (which
+   formatting context — so it stretched to the full width of the column, and `text-align` (which
    only moves inline-level boxes) had nothing to move. Inside that full-width box the label's own
    `writing-mode: vertical-rl` puts the first line box against its RIGHT edge, and the
    `rotate(180deg)` then carries it to the LEFT — which is exactly where the headers were sitting.
@@ -2789,27 +3114,113 @@ body {
    rotation needs no transform-origin of its own: `writing-mode` turns the LAYOUT BOX, so the box
    is genuinely tall and narrow, and a 180° turn about its default centre leaves it where it is.
 
-   Width is untouched — the column is still sized by .lm-td/.lm-th-job below. */
-.lm-th-job {
-  height: 156px;
-  padding: 6px 0 8px;
+   Width is untouched — the column is still sized by .lm-td/.lm-th-job below.
+
+   The selector is `.lm-table thead th.lm-th-job`, not `.lm-th-job`, and that is the other half:
+   `.lm-table thead th` above sets `text-align: left` at a higher specificity than a lone class,
+   so a bare `.lm-th-job { text-align: center }` loses to it and the headers stay on the left.
+
+   Along the rotation axis the label is CENTRED too: the strip sits in the middle of the cell's
+   height, so a short label and a long one share one middle line instead of the short one
+   sinking to the bottom of a cell the long one fills.
+
+   The row has no height of its own — it is as tall as its longest label, up to the cap on the
+   strip below (128px of text + 12px of padding = 140px). A label longer than that is cut with an
+   ellipsis at its far end; the cell's title carries the full name. */
+.lm-table thead th.lm-th-job {
+  padding: 6px 0;
   text-align: center;
+  vertical-align: middle;
+  line-height: 0;
 }
 .lm-th-job-text {
   display: inline-block;
-  /* Flush to the bottom of the cell. On an inline-level box the default `baseline` would leave
-     the line box's descender space beneath it, floating every header a few pixels high. */
-  vertical-align: bottom;
+  vertical-align: middle;
   writing-mode: vertical-rl;
   transform: rotate(180deg);
   white-space: nowrap;
-  max-height: 140px;
+  max-height: 128px;
   overflow: hidden;
+  text-overflow: ellipsis;
   font-weight: 600;
+  /* The cell's line-height is 0 so the line box adds nothing around the strip; the strip's own
+     is put back here. In vertical-rl this is its thickness across the column. */
+  line-height: 1.35;
 }
-.lm-th-corner, .lm-th-total { z-index: 3; }
+/* ── The area header row ───────────────────────────────────────────────────────────────
+   Above the section/job headings under Show = Pre-assembly: one cell per area, spanning its
+   columns. Two sticky rows, so the second has to stick BELOW the first rather than at top: 0 —
+   hence a fixed, border-box height here and the same number as .lm-th-row2's offset. Change
+   them together.
+
+   The label is CENTRED over its span, and sticky too, horizontally: an area can be twenty
+   columns wide, and a label parked mid-span would scroll off while most of its columns were
+   still on screen. `left` and `right` together hold it inside the visible grid (clear of the
+   210px model column and the 82px total column) for as long as any of its span is in view — at
+   rest it sits at the middle of the span, and it slides to whichever edge the middle left by.
+
+   The three header rows step down in tone — area darkest, parent mid, column headings on the
+   plain surface — so the band reads as a hierarchy. Backgrounds, not banners: one step each. */
+.lm-table thead th.lm-th-area {
+  height: 28px; box-sizing: border-box; padding: 0;
+  vertical-align: middle; text-align: center; white-space: nowrap;
+  background: #eceef2;
+  border-right: 1.5px solid var(--border);
+  font-size: 10.5px; letter-spacing: 0.07em; text-transform: uppercase; color: var(--text);
+}
+.lm-th-area-text { position: sticky; left: 210px; right: 82px; display: inline-block; padding: 0 10px; }
+/* ── The parent header row ─────────────────────────────────────────────────────────────
+   Between the area row and the column headings at Job and Section grain: the section over its
+   jobs, the team over its sections. Horizontal — it spans columns, so there is width for it.
+
+   `max-width: 0` is what stops a long name widening the grid. This table is auto-layout, and a
+   spanning cell's content width is shared out among the columns it spans: "Axle Alignment &
+   Brake Looms" over two 64px columns would push both to 90px. A cell with max-width 0 claims
+   nothing and takes the width its columns already have.
+
+   ONE LINE, NEVER BROKEN. The label does not wrap, so it cannot break inside a word or between
+   two; one that is wider than its span is cut with an ellipsis and the cell's title carries the
+   full name. The 64px column floor (.lm-td) is what lets a one-word name over a single column —
+   "Welding", "CUTTING" — fit whole. `overflow: clip`, not `hidden`:
+   hidden would make the cell a scroll container and the sticky label would stick to IT.
+
+   The label is centred and sticky exactly as the area label is. */
+.lm-table thead th.lm-th-parent {
+  height: 26px; box-sizing: border-box; padding: 0;
+  max-width: 0; overflow: clip;
+  vertical-align: middle; text-align: left;
+  background: var(--bg);
+  border-right: 1.5px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  font-size: 10.5px; line-height: 1.3; color: var(--text);
+}
+.lm-th-parent-text {
+  /* Centred over its span, and held inside the visible grid by `left` + `right` — the same
+     treatment as the area label above. `margin: auto` does the centring because this is a block
+     box (it has to be, to carry the ellipsis), which `text-align` on the cell would not move. */
+  position: sticky; left: 210px; right: 82px;
+  display: block; width: fit-content; max-width: 100%; margin: 0 auto;
+  padding: 0 5px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  hyphens: none; overflow-wrap: normal; word-break: normal;
+}
+/* ── Stacking the sticky header rows ───────────────────────────────────────────────────
+   area → parent → column, any of the first two optional. Each row sticks beneath the rows above
+   it, so its `top` is the sum of their heights — which is why those two are fixed, border-box
+   heights, and why the numbers here must match .lm-th-area and .lm-th-parent. Change them
+   together. A row that isn't rendered contributes 0. Model and Total sit in the first row
+   rendered, whose offset is always 0, and span the lot. */
+.lm-table { --lm-area-h: 0px; --lm-parent-h: 0px; }
+.lm-table.lm-has-area { --lm-area-h: 28px; }
+.lm-table.lm-has-parent { --lm-parent-h: 26px; }
+.lm-table thead tr.lm-th-row-parent th.lm-th-parent { top: var(--lm-area-h); }
+.lm-table thead tr.lm-th-row-cols th.lm-th-job { top: calc(var(--lm-area-h) + var(--lm-parent-h)); }
+/* Qualified to outrank `.lm-table thead th` (z-index 2, text-align left). As bare classes these
+   lost to it: the corners sat at the same level as every other heading, and the headings that
+   come later in the markup slid over the top of "Model" on a sideways scroll. */
+.lm-table thead th.lm-th-corner, .lm-table thead th.lm-th-total { z-index: 3; }
 .lm-th-corner { left: 0; }
-.lm-th-total { right: 0; text-align: center; }
+.lm-table thead th.lm-th-total { right: 0; text-align: center; }
 .lm-th-corner, .lm-td-model { position: sticky; left: 0; width: 210px; min-width: 210px; }
 .lm-th-total, .lm-td-total { position: sticky; right: 0; width: 82px; min-width: 82px; }
 .lm-th-corner, .lm-th-total { padding: 6px 12px 8px; }
@@ -2831,7 +3242,9 @@ body {
   text-align: center; font-weight: 700; color: var(--blue);
 }
 
-.lm-td, .lm-th-job { width: 58px; min-width: 58px; max-width: 58px; }
+/* 64px: the floor at which a one-word parent label over a single column fits unbroken. Never
+   squeezed below it — the grid scrolls sideways instead (.lm-scroll). */
+.lm-td, .lm-th-job { width: 64px; min-width: 64px; max-width: 64px; }
 /* CENTRED, following the headers. A figure column normally right-aligns so the decimal points
    stack — but here the heading is a narrow rotated strip pinned to the column's midpoint, and a
    right-aligned figure under a centred header reads as belonging to the column on its right.
@@ -2935,7 +3348,15 @@ body {
 
   /* table-layout: fixed, so the widths declared below are the widths given. With `auto` the
      browser re-measures against content and the widest job name drags the table off the right
-     margin. The job columns carry no width and share what is left equally. */
+     margin.
+
+     EVERY column carries a width, the data columns included, and that is what makes 13mm a
+     FLOOR rather than a suggestion: under fixed layout a table is the wider of its `width` and
+     the sum of its columns, so on A3 the 100% wins and the spare millimetres are shared out, and
+     on anything narrower the columns stay 13mm and the table runs past the margin instead of
+     squeezing them. Without the floor, a sheet printed at A4 width laid 24 columns out at 9.2mm
+     and "2514.7" ran into its neighbour with no gap at all. A figure you can't separate from the
+     next one is worse than a sheet you have to reprint. */
   .lm-print-table {
     width: 100%;
     border-collapse: collapse;
@@ -2953,7 +3374,7 @@ body {
   .lm-print-table th, .lm-print-table td {
     border: 0;
     border-bottom: 0.5pt solid #ccc;
-    padding: 1.6pt 3pt;
+    padding: 1.6pt 2pt;
     vertical-align: top;
   }
   .lm-print-table thead th {
@@ -2962,32 +3383,71 @@ body {
     vertical-align: bottom;
   }
 
+  /* Sized to the codes, which are one fixed shape: "88.88-8.OB.DY-MY26 (888)" — the widest form,
+     every digit an 8 — measures 34.2mm at 7pt bold, plus 1.4mm of padding. 38mm leaves ~2mm
+     over. See PRINT_BAND_COLUMNS_ROLLUP for what the rest of the width buys. */
   .lm-print-th-model, .lm-print-td-model {
-    width: 48mm;
+    width: 38mm;
     text-align: left;
     font-weight: 700;
     border-right: 0.75pt solid #444;
     overflow: hidden;
   }
   .lm-print-td-model { font-size: 7pt; }
+  /* The same three widths, on the columns themselves — see the <colgroup> note in the component
+     for why the cells' own widths stop being enough once the area row is the first row. */
+  .lm-print-col-model { width: 38mm; }
+  .lm-print-col-job { width: 13mm; }
+  .lm-print-col-total { width: 16mm; }
+  /* The area heading over its columns. A rule down its left edge is what separates one area's
+     columns from the next on paper, where there is no tint to do it. */
+  .lm-print-table thead th.lm-print-th-area {
+    text-align: left; vertical-align: middle;
+    font-size: 7.5pt; letter-spacing: 0.06em; text-transform: uppercase;
+    border-left: 0.75pt solid #444;
+    padding: 2pt 3pt;
+    overflow: hidden; white-space: nowrap;
+  }
+  /* The section over its jobs, or the team over its sections. Horizontal, one line, never
+     broken inside a word — a name wider than its span is cut with an ellipsis. Same left rule as
+     the area heading, lighter, so the two levels read as two levels. */
+  .lm-print-table thead th.lm-print-th-parent {
+    text-align: left; vertical-align: middle;
+    font-size: 6.5pt; line-height: 1.2;
+    border-left: 0.5pt solid #444;
+    padding: 1.5pt 2pt;
+    overflow: hidden;
+  }
+  .lm-print-th-parent-text {
+    display: block;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    hyphens: none; overflow-wrap: normal; word-break: normal;
+  }
   .lm-print-th-total, .lm-print-td-total {
-    width: 17mm;
+    width: 16mm;
     /* Centred, matching the cells and the rotated headings — see .lm-td. */
     text-align: center;
     font-weight: 700;
     border-left: 0.75pt solid #444;
   }
-  /* Rotated for the same reason as on screen: 22 columns of "1234.5" fit across A3 landscape,
-     22 columns of job name do not. 34mm of height buys about 45 characters at 6.5pt. */
+  /* Rotated for the same reason as on screen: 26 columns of "1234.5" fit across A3 landscape,
+     26 columns of job name do not. 34mm of height buys about 45 characters at 6.5pt. */
   /* Same fix as the screen's .lm-th-job — see the note there for why `inline-block` is the
      part that matters and `text-align` alone does nothing. Repeated rather than shared because
      the printed sheet is styled separately throughout (different sizes, different units), and a
      rule that only got fixed on one of the two would be a header aligned on screen and adrift on
      paper. */
-  .lm-print-th-job {
+  /* The legibility floor. "2514.7*" — four figures, the decimal and the partial asterisk, in
+     the bold a red zero cell uses — measures 10.3mm at 7pt; 2pt of padding a side brings that
+     to 11.7mm, and 13mm leaves at least 2.7mm of clear paper between two of the widest figures
+     side by side. PRINT_BAND_COLUMNS_ROLLUP is derived from this number — change them together. */
+  .lm-print-table thead th.lm-print-th-job {
+    width: 13mm;
     height: 34mm;
     padding-bottom: 2pt;
     text-align: center;
+    vertical-align: bottom;
+    line-height: 0;
   }
   .lm-print-th-job-text {
     display: inline-block;
@@ -2999,6 +3459,7 @@ body {
     overflow: hidden;
     font-size: 6.5pt;
     font-weight: 700;
+    line-height: 1.3;
   }
 
   .lm-print-td { text-align: center; }
@@ -3043,6 +3504,19 @@ body {
 .lm-models-btn-on:hover { background: #eaf3ff; border-color: var(--blue); }
 
 .lm-models-panel { padding: 14px 18px 16px; margin-bottom: 16px; }
+/* ── The dropdown form of the panel ────────────────────────────────────────────────────
+   The same panel, anchored under the button that opens it instead of pushing the grid down the
+   page. z-index clears the grid's sticky headers (2–3). The list scrolls inside the panel, so a
+   line with many teams cannot run it off the bottom of the screen; the width is capped to the
+   viewport so it cannot run off the side on a tablet either. */
+.lm-pop-anchor { position: relative; display: inline-flex; }
+.lm-pop {
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 30;
+  width: 380px; max-width: calc(100vw - 48px);
+  margin-bottom: 0;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.16);
+}
+.lm-pop-list { max-height: min(46vh, 420px); overflow-y: auto; gap: 4px; }
 .lm-models-panel-bar {
   display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 8px;
 }
@@ -3125,7 +3599,9 @@ body {
 
 @media print {
   .lm-print-model-label { display: flex; align-items: baseline; gap: 3pt; min-width: 0; }
-  .lm-print-model-name { min-width: 0; overflow: hidden; }
+  /* nowrap: a code breaks at its hyphens ("17.54-1.OB.DY-" / "MY26") if it's allowed to, and
+     a two-line row costs a line of paper for every model on the sheet. */
+  .lm-print-model-name { min-width: 0; overflow: hidden; white-space: nowrap; }
   /* Same subordination as on screen, and it holds on paper: 6pt against the cell's 7pt, normal
      weight against its bold, and a grey that a mono printer renders as grey rather than as
      another black number. The key in the sheet's header says what the bracket means. */
@@ -3273,6 +3749,23 @@ body {
 .lm-cell-job:hover { border-color: var(--blue); background: #f5f9ff; }
 .lm-cell-job-name { min-width: 0; font-weight: 600; word-break: break-word; }
 .lm-cell-job-meta { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+/* ── "Doesn't apply to this model" ─────────────────────────────────────────────────────
+   The second half of the drawer's lists: the jobs (or, inside a job, the operations) this model
+   doesn't do, under one subheading and below everything it does. Secondary on purpose — muted
+   text and the grid's own hatch (.lm-td-na / .lm-legend-na), so the block reads as the same
+   "doesn't apply" the legend names rather than as a list of gaps to close. */
+.lm-cell-na-head {
+  margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border);
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+.lm-cell-job-na {
+  min-height: 36px; padding: 6px 10px;
+  border-color: #eceef0; color: var(--text-muted);
+  background: repeating-linear-gradient(135deg, #f8f9fa 0 5px, #eef0f2 5px 10px);
+}
+.lm-cell-job-na .lm-cell-job-name { font-weight: 500; }
+.lm-cell-op-na .lm-cell-op-name { color: var(--text-muted); }
 
 .lm-cell-back {
   align-self: flex-start;
