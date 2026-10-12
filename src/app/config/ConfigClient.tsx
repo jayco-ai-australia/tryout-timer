@@ -4,14 +4,15 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { parseCsv } from '@/lib/csv'
 import { fmtDate } from '@/lib/format'
+import SectionsTab from './SectionsTab'
 import type {
   ChangeRequestStatus, Operator, OperatorChangeRequest,
-  Product, ProductionLine, Team,
+  Product, ProductionLine, Team, UserRole,
 } from '@/lib/types'
 
-type ConfigTab = 'lines' | 'teams' | 'operators' | 'products' | 'requests'
+type ConfigTab = 'lines' | 'teams' | 'sections' | 'operators' | 'products' | 'requests'
 
-interface Props { userId: string }
+interface Props { userId: string; role: UserRole | null }
 
 const EMPTY: React.CSSProperties = { textAlign: 'center', color: 'var(--text-muted)', fontSize: 13, padding: '28px 0' }
 const ERR_BOX: React.CSSProperties = { marginTop: 10, padding: '9px 14px', borderRadius: 8, background: 'var(--red-bg)', border: '1px solid #fecaca', color: 'var(--red)', fontSize: 13 }
@@ -22,7 +23,7 @@ async function readCsvFile(file: File): Promise<Record<string, string>[]> {
   return parseCsv(text)
 }
 
-export default function ConfigClient({ userId }: Props) {
+export default function ConfigClient({ userId, role }: Props) {
   const supabase = useMemo(() => createClient(), [])
   const [tab, setTab] = useState<ConfigTab>('lines')
   const [productionLines, setProductionLines] = useState<ProductionLine[]>([])
@@ -34,16 +35,19 @@ export default function ConfigClient({ userId }: Props) {
   const TABS: { key: ConfigTab; label: string }[] = [
     { key: 'lines', label: 'Production Lines' },
     { key: 'teams', label: 'Teams' },
+    { key: 'sections', label: 'Sections' },
     { key: 'operators', label: 'Operators' },
     { key: 'products', label: 'Products' },
     { key: 'requests', label: 'Change Requests' },
   ]
 
   return (
-    <main className="page">
+    // The Sections tab is a wide working table (structure cleanup, several sections open at once),
+    // so it takes the app's wide page; the other tabs keep the 1200px reading width.
+    <main className={tab === 'sections' ? 'page-wide' : 'page'}>
       <div style={{ marginBottom: 24 }}>
         <h1 style={{ fontSize: 24, fontWeight: 700, color: 'var(--text)', margin: 0 }}>Config</h1>
-        <p style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 4 }}>Master data: production lines, teams, operators, and products. Jobs and operations are managed in Setup.</p>
+        <p style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 4 }}>Master data: production lines, teams, sections and their jobs, operators, and products. Jobs are managed here, under Sections; operations are managed in Setup.</p>
       </div>
 
       <div className="tabs">
@@ -56,6 +60,7 @@ export default function ConfigClient({ userId }: Props) {
 
       {tab === 'lines' && <LinesTab supabase={supabase} lines={productionLines} setLines={setProductionLines} />}
       {tab === 'teams' && <TeamsTab supabase={supabase} lines={productionLines} />}
+      {tab === 'sections' && <SectionsTab supabase={supabase} lines={productionLines} userId={userId} role={role} />}
       {tab === 'operators' && <OperatorsTab supabase={supabase} lines={productionLines} />}
       {tab === 'products' && <ProductsTab supabase={supabase} lines={productionLines} />}
       {tab === 'requests' && <RequestsTab supabase={supabase} userId={userId} />}
