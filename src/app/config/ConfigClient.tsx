@@ -5,12 +5,14 @@ import { createClient } from '@/lib/supabase/client'
 import { parseCsv } from '@/lib/csv'
 import { fmtDate } from '@/lib/format'
 import SectionsTab from './SectionsTab'
+import { usePersistedFilter } from '@/lib/useLocalStorage'
 import type {
   ChangeRequestStatus, Operator, OperatorChangeRequest,
   Product, ProductionLine, Team, UserRole,
 } from '@/lib/types'
 
 type ConfigTab = 'lines' | 'teams' | 'sections' | 'operators' | 'products' | 'requests'
+const DEFAULT_TAB: ConfigTab = 'lines'
 
 interface Props { userId: string; role: UserRole | null }
 
@@ -25,7 +27,9 @@ async function readCsvFile(file: File): Promise<Record<string, string>[]> {
 
 export default function ConfigClient({ userId, role }: Props) {
   const supabase = useMemo(() => createClient(), [])
-  const [tab, setTab] = useState<ConfigTab>('lines')
+  // Remembered across a refresh and navigation, by the same hook and key family as the Sections
+  // tab's own filters (configSections.lineId / .teamId).
+  const [storedTab, setTab] = usePersistedFilter('config.tab', DEFAULT_TAB)
   const [productionLines, setProductionLines] = useState<ProductionLine[]>([])
 
   useEffect(() => {
@@ -40,6 +44,10 @@ export default function ConfigClient({ userId, role }: Props) {
     { key: 'products', label: 'Products' },
     { key: 'requests', label: 'Change Requests' },
   ]
+
+  // A stored key that names no tab offered here (renamed, removed, or hand-edited) falls back to
+  // the default rather than rendering a page with no tab selected and nothing under it.
+  const tab: ConfigTab = TABS.find((t) => t.key === storedTab)?.key ?? DEFAULT_TAB
 
   return (
     // The Sections tab is a wide working table (structure cleanup, several sections open at once),
