@@ -1,48 +1,64 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { fetchAllChunked, fetchAllRows, READ_CHUNK, type RangeableQuery } from './supabaseRead'
-import { selectCountedTimes } from './operationTimes'
+import {
+  TIME_FLAG_COLUMNS, currentForOperation, fetchOperationTimeModelLinks, onlyCountedTimes, operationProductKey,
+  type TimeRow,
+} from './operationTimes'
 import { fetchLinksForOperations } from './modelOperations'
 import { groupSectionsByTeam, isSectionTray } from './sections'
 
 /**
  * The Structure Review — a whole area's walk (Team → Section → Job → Operation) with, against
- * every operation, how many times were recorded, what they add up to, and how many models it is
- * linked to. Printed by /structure-review and taken onto the floor to be marked up by hand.
+ * every operation, its typical labour per van, how many models that rests on and how many
+ * recordings sit behind it. Printed by /structure-review and taken onto the floor to be marked
+ * up by hand.
+ *
+ * ── The figures are the app's figures ─────────────────────────────────────────────────────
+ * Nothing is summed from records here. Every figure is lib/operationTimes' currentForOperation —
+ * the same per (operation, model) labour figure Model Total, the Labour Matrix and the times
+ * drawer show — and this module only rolls those figures up:
+ *
+ *   Minutes   the AVERAGE of the operation's per-model figures — typical labour per van. Job and
+ *             section minutes are the sum of their operations' averages: a typical van's job.
+ *   Models    how many models have a figure (and, beside it, how many the operation is linked to)
+ *   Times     how many distinct recordings make up those figures (stat.recordIds), so one record
+ *             linked to forty models is one recording, not forty
+ *
+ * Until 28 Oct 2026 this document added up EVERY recording of an operation across every model,
+ * superseded ones included, which agreed with no screen. Averaging per model is deliberate: the
+ * models' figures differ (130 of Caravan's 290 operations), so a sum across them is labour for
+ * the whole range, not a van, and picking one model's figure would be arbitrary. Not comparable to
+ * the Labour Matrix's "across the grid", which adds every model together.
  *
  * ── The fan-out trap ──────────────────────────────────────────────────────────────────────
  * Times and model links are BOTH one-to-many off an operation. Read them in one joined pass and
  * every time is repeated once per model link, so the sums multiply by the link count — a SQL
- * version of this report once showed 25,466 minutes on Caravan where the truth was 9,222. So
- * they are two separate reads here, each aggregated to one number per operation_id on its own,
- * and only those per-operation numbers ever meet. The `avg × times = total` identity holds by
- * construction (avg is total / times over the same rows), which is the check that catches a
- * fan-out if one is ever reintroduced.
+ * version of this report once showed 25,466 minutes on Caravan where the truth was 9,222. So the
+ * applies-list (model_operations) is a separate read from the times, and the times' own models
+ * come from operation_time_models through the shared helper, keyed per pair.
  *
  * ── What counts ───────────────────────────────────────────────────────────────────────────
- * Times: lib/operationTimes' selectCountedTimes, i.e. onlyCountedTimes — the record, its
- * operation and its job are live and the record isn't hidden. No second definition here.
+ * Times: onlyCountedTimes at the query and pickCurrent again inside currentForOperation — current,
+ * live, not hidden. No second definition here.
  * Structure: live sections (is_active IS NOT FALSE) on the line, live jobs in them, live
  * operations under those. A "No Section" tray is included only when it holds jobs — an empty
  * tray is not structure anyone has to decide about. A job with no section at all is not on the
  * walk and is not in the document.
- *
- * Every operation counts in Times — current and superseded alike. That is deliberate and is what
- * the document means by "how many separate recordings exist"; the app's own labour figures take
- * the CURRENT record (see operationTimes' OperationTimeStat), not this average.
  */
 
 export interface ReviewOperation {
   id: string
   name: string
   createdAt: string
-  /** Counted time records. */
-  times: number
-  /** Sum of their total_minutes. */
-  totalMinutes: number
-  /** totalMinutes / times, or null when untimed. */
-  avgMinutes: number | null
-  /** model_operations rows — 0 means it can never show as a gap on any model. */
+  /** Average of the operation's current per-model figures — typical labour per van. null when
+   * no model has a figure (untimed). */
+  minutes: number | null
+  /** Models with a figure — how many figures `minutes` averages. */
   models: number
+  /** Distinct recordings behind those figures. */
+  times: number
+  /** model_operations rows — 0 means it can never show as a gap on any model. */
+  linkedModels: number
 }
 
 export interface ReviewJob {
@@ -89,7 +105,6 @@ export interface StructureReview {
 interface SectionRow { id: string; name: string; team_id: string | null; sort_order: number | null }
 interface JobRow { id: string; name: string; section_id: string }
 interface OperationRow { id: string; name: string; job_id: string; created_at: string }
-interface TimeRow { id: string; operation_id: string; total_minutes: number | null }
 
 const byName = (a: { name: string }, b: { name: string }) => a.name.localeCompare(b.name)
 
@@ -131,34 +146,54 @@ export async function fetchStructureReview(
       operationIds, READ_CHUNK,
       // The select string is built from a template, so supabase-js can't infer the row type —
       // cast, as model-total's CopyToModelsPanel does.
-      (chunk) => selectCountedTimes(supabase, 'id, operation_id, total_minutes')
-        .in('operation_id', chunk).order('id') as unknown as RangeableQuery<TimeRow>,
+      // Current, counted records only: nothing here shows history, so archived rows would be
+      // fetched just for currentForOperation to drop. The minutes are the same either way.
+      (chunk) => onlyCountedTimes(supabase.from('operation_times')
+        .select(`id, operation_id, total_minutes, superseded_by, chassis_id, created_at, ${TIME_FLAG_COLUMNS}`)
+        .in('operation_id', chunk).is('superseded_by', null))
+        .order('id') as unknown as RangeableQuery<TimeRow>,
       { table: 'operation_times' },
     ),
     fetchLinksForOperations(supabase, operationIds),
   ])
 
-  const timesByOp = new Map<string, { count: number; minutes: number }>()
-  for (const t of timeRows) {
-    const agg = timesByOp.get(t.operation_id) ?? { count: 0, minutes: 0 }
-    agg.count += 1
-    agg.minutes += t.total_minutes ?? 0
-    timesByOp.set(t.operation_id, agg)
+  // The figures: one per (operation, model), from the shared rule. Then, per operation, the
+  // average of its figures and the distinct recordings behind them.
+  const timeModels = await fetchOperationTimeModelLinks(supabase, timeRows.map((t) => t.id))
+  const stats = currentForOperation(timeRows, timeModels)
+  const operationOf = new Map(timeRows.map((t) => [t.id, t.operation_id]))
+  const pairKeysByOp = new Map<string, Set<string>>()
+  for (const tm of timeModels) {
+    const operationId = operationOf.get(tm.operation_time_id)
+    if (!operationId) continue
+    const keys = pairKeysByOp.get(operationId) ?? new Set<string>()
+    keys.add(operationProductKey(operationId, tm.product_id))
+    pairKeysByOp.set(operationId, keys)
   }
-  const modelsByOp = new Map<string, number>()
-  for (const l of links) modelsByOp.set(l.operation_id, (modelsByOp.get(l.operation_id) ?? 0) + 1)
+  const figuresByOp = new Map<string, { minutes: number | null; models: number; times: number }>()
+  for (const [operationId, keys] of pairKeysByOp) {
+    const figures = [...keys].map((k) => stats[k]).filter((s) => s != null)
+    const recordings = new Set(figures.flatMap((s) => s.recordIds))
+    figuresByOp.set(operationId, {
+      minutes: figures.length > 0 ? figures.reduce((sum, s) => sum + s.minutes, 0) / figures.length : null,
+      models: figures.length,
+      times: recordings.size,
+    })
+  }
+  const linkedByOp = new Map<string, number>()
+  for (const l of links) linkedByOp.set(l.operation_id, (linkedByOp.get(l.operation_id) ?? 0) + 1)
 
   const opsByJob = new Map<string, ReviewOperation[]>()
   for (const o of operationRows) {
-    const agg = timesByOp.get(o.id)
+    const fig = figuresByOp.get(o.id)
     const op: ReviewOperation = {
       id: o.id,
       name: o.name,
       createdAt: o.created_at,
-      times: agg?.count ?? 0,
-      totalMinutes: agg?.minutes ?? 0,
-      avgMinutes: agg && agg.count > 0 ? agg.minutes / agg.count : null,
-      models: modelsByOp.get(o.id) ?? 0,
+      minutes: fig?.minutes ?? null,
+      models: fig?.models ?? 0,
+      times: fig?.times ?? 0,
+      linkedModels: linkedByOp.get(o.id) ?? 0,
     }
     opsByJob.set(o.job_id, [...(opsByJob.get(o.job_id) ?? []), op])
   }
@@ -170,8 +205,9 @@ export async function fetchStructureReview(
       id: j.id,
       name: j.name,
       operations,
-      totalMinutes: operations.reduce((sum, o) => sum + o.totalMinutes, 0),
-      untimed: operations.filter((o) => o.times === 0).length,
+      // A typical van's job: the sum of its operations' per-van averages.
+      totalMinutes: operations.reduce((sum, o) => sum + (o.minutes ?? 0), 0),
+      untimed: operations.filter((o) => o.minutes == null).length,
     }
     jobsBySection.set(j.section_id, [...(jobsBySection.get(j.section_id) ?? []), job])
   }
@@ -208,10 +244,10 @@ export async function fetchStructureReview(
       sections: sections.length,
       jobs: jobs.length,
       operations: operations.length,
-      minutes: operations.reduce((sum, o) => sum + o.totalMinutes, 0),
+      minutes: operations.reduce((sum, o) => sum + (o.minutes ?? 0), 0),
       jobsWithNoOperations: jobs.filter((j) => j.operations.length === 0).length,
-      operationsWithNoTime: operations.filter((o) => o.times === 0).length,
-      operationsWithNoModel: operations.filter((o) => o.models === 0).length,
+      operationsWithNoTime: operations.filter((o) => o.minutes == null).length,
+      operationsWithNoModel: operations.filter((o) => o.linkedModels === 0).length,
       teams: teams.length,
     },
   }

@@ -76,6 +76,10 @@ export interface OperationTimeStat {
   currentId: string
   /** How many current records the figure is built from. 1 in the ordinary case. */
   combined: number
+  /** Which records those are (`combined` of them). For a view that rolls several pairs up and
+   * has to count the recordings behind them without counting a multi-model record once per model
+   * — /structure-review's Times column. */
+  recordIds: string[]
   /** How many observations were averaged: one per chassis (its records summed), plus one for the
    * newest record with no chassis. 1 in the ordinary case. */
   observations: number
@@ -92,7 +96,7 @@ export interface OperationTimeStat {
  * definition, every surface — /collect's model badges, /setup's coverage badges and collected
  * times, /tryouts' van log, /model-total's breakdown and the times drawer.
  */
-export function historyLabel(stat: OperationTimeStat): string {
+export function historyLabel(stat: Pick<OperationTimeStat, 'archived' | 'combined' | 'observations'>): string {
   const current = stat.combined <= 1 ? 'current'
     : `${stat.combined} current records combined${stat.observations > 1 ? ` over ${stat.observations} observations` : ''}`
   return stat.archived === 0
@@ -327,7 +331,7 @@ function pickCurrent(allRows: TimeRow[]): OperationTimeStat | null {
   const newest = [...timed].sort(newerFirst)[0]
 
   const { minutes, observations } = combineCurrentRecords(timed)
-  return { minutes, currentId: newest.id, combined: timed.length, observations, archived: rows.length - current.length }
+  return { minutes, currentId: newest.id, combined: timed.length, recordIds: timed.map((r) => r.id), observations, archived: rows.length - current.length }
 }
 
 /**

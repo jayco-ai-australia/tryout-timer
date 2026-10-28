@@ -239,7 +239,7 @@ function JobRows({
       {open && job.rows.map((r) => (
         <tr
           key={r.operationId} className="mt-op" style={{ cursor: 'pointer' }}
-          title={`Current time for this model — ${historyLabel({ minutes: r.minutes, currentId: '', archived: r.archived, combined: r.combined, observations: r.observations })}. Open to edit or promote an earlier record.`}
+          title={`Current time for this model — ${historyLabel({ archived: r.archived, combined: r.combined, observations: r.observations })}. Open to edit or promote an earlier record.`}
           onClick={() => onEditTimes(r.operationId, r.operationName)}
         >
           <td className="mt-name mt-op-name">

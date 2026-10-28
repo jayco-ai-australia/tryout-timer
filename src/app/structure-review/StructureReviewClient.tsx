@@ -143,7 +143,7 @@ function Cover({ review, areaName, today }: { review: StructureReview; areaName:
     ['Sections', String(s.sections), false],
     ['Jobs', String(s.jobs), false],
     ['Operations', String(s.operations), false],
-    ['Minutes recorded', s.minutes.toLocaleString('en-AU', { minimumFractionDigits: 1, maximumFractionDigits: 1 }), false],
+    ['Minutes per van', s.minutes.toLocaleString('en-AU', { minimumFractionDigits: 1, maximumFractionDigits: 1 }), false],
     ['Jobs with no operations', String(s.jobsWithNoOperations), s.jobsWithNoOperations > 0],
     ['Operations with no time', String(s.operationsWithNoTime), s.operationsWithNoTime > 0],
     ['Operations linked to no model', String(s.operationsWithNoModel), s.operationsWithNoModel > 0],
@@ -169,10 +169,30 @@ function Cover({ review, areaName, today }: { review: StructureReview; areaName:
         <ul>
           <li>Every section starts on a new page.</li>
           <li>A job shaded <span className="sr-flag-swatch">amber</span> with <em>no operations</em> has nothing to record time against. Decide: add operations, or delete the job.</li>
-          <li>Operations in <span className="sr-flag-swatch">amber</span> have no time recorded.</li>
-          <li>A red <span className="sr-zero">0</span> in Models means the operation is linked to no model at all, so it can never show as a gap.</li>
+          <li>Operations in <span className="sr-flag-swatch">amber</span> have no current time on any model.</li>
+          <li>
+            <strong>Minutes are per van.</strong> For each operation it is the average of its current time on each
+            model that has one &mdash; the same figures Model Total and the Labour Matrix use. Job, section and cover
+            minutes add those up: the labour on a typical van.
+          </li>
+          <li>
+            <strong>This is not what earlier copies said.</strong> Before 28 October 2026 this document added up every
+            recording of an operation across every model, replaced ones included. Those totals were labour across the
+            whole range, not a van, so they were several times larger. Don&rsquo;t compare the two.
+          </li>
+          <li>
+            The Labour Matrix&rsquo;s &ldquo;across the grid&rdquo; figure adds every model together, so it is far larger
+            than the minutes here. Both are right; they answer different questions.
+          </li>
+          <li>
+            <strong>Models</strong> is how many models have a time, out of how many the operation applies to. A red{' '}
+            <span className="sr-zero">0</span> after the slash means it applies to no model at all, so it can never show as a gap.
+          </li>
+          <li>
+            <strong>Times</strong> is how many recordings sit behind the minutes. One recording and twelve can give the same
+            average; the first is a single observation. Replaced recordings are not counted.
+          </li>
           <li>Tick <strong>K</strong> keep, <strong>M</strong> merge, <strong>D</strong> delete. Write the merge target in Notes.</li>
-          <li><strong>Times</strong> is how many separate recordings exist; <strong>Avg</strong> is their average. The app&rsquo;s own totals use each operation&rsquo;s current recording, so Avg can differ from Model Total.</li>
           <li><strong>Added</strong> is the date the operation was created — useful for spotting one-off entries made during a van walk.</li>
         </ul>
       </div>
@@ -187,7 +207,7 @@ function jobFlag(job: ReviewJob) {
 }
 
 function sectionRollup(section: ReviewSection): string {
-  return `${plural(section.jobs.length, 'job')} · ${plural(section.operationCount, 'op')} · ${fmtMinutes(section.totalMinutes)} min`
+  return `${plural(section.jobs.length, 'job')} · ${plural(section.operationCount, 'op')} · ${fmtMinutes(section.totalMinutes)} min / van`
 }
 
 function Contents({ review }: { review: StructureReview }) {
@@ -203,7 +223,7 @@ function Contents({ review }: { review: StructureReview }) {
         <thead>
           <tr>
             <th>Team</th><th className="sr-num">Ord</th><th>Section</th><th>Job</th>
-            <th className="sr-num">Operations</th><th className="sr-num">Minutes</th><th>Flag</th>
+            <th className="sr-num">Operations</th><th className="sr-num">Min / van</th><th>Flag</th>
           </tr>
         </thead>
         {review.teams.map((team) => {
@@ -253,7 +273,7 @@ function SectionSheet({ section }: { section: ReviewSection }) {
         <h2 className="sr-h2">{section.name}</h2>
         <p className="sr-meta">
           {section.teamName} · Ord {section.sortOrder ?? '—'} · {plural(section.jobs.length, 'job')} ·{' '}
-          {plural(section.operationCount, 'operation')} · {fmtMinutes(section.totalMinutes)} min
+          {plural(section.operationCount, 'operation')} · {fmtMinutes(section.totalMinutes)} min per van
         </p>
       </header>
       {section.jobs.length === 0 && <p className="sr-meta"><em className="sr-flag-text">No jobs in this section.</em></p>}
@@ -281,37 +301,38 @@ function JobBlock({ job }: { job: ReviewJob }) {
       <h3 className={'sr-h3' + (empty ? ' sr-flag-row' : '')}>
         {job.name}
         <span className="sr-job-meta">
-          {plural(job.operations.length, 'operation')} · {fmtMinutes(job.totalMinutes)} min
+          {plural(job.operations.length, 'operation')} · {fmtMinutes(job.totalMinutes)} min per van
           {job.untimed > 0 && <> · <span className="sr-flag-text">{job.untimed} untimed</span></>}
         </span>
       </h3>
       <table className="sr-table sr-ops">
         <colgroup>
-          <col style={{ width: '28%' }} /><col style={{ width: '8%' }} /><col style={{ width: '6%' }} />
-          <col style={{ width: '8%' }} /><col style={{ width: '8%' }} /><col style={{ width: '8%' }} />
+          <col style={{ width: '32%' }} /><col style={{ width: '8%' }} /><col style={{ width: '9%' }} />
+          <col style={{ width: '10%' }} /><col style={{ width: '7%' }} />
           <col style={{ width: '10%' }} /><col style={{ width: '24%' }} />
         </colgroup>
         <thead>
           <tr>
-            <th>Operation</th><th>Added</th><th className="sr-num">Times</th><th className="sr-num">Total min</th>
-            <th className="sr-num">Avg min</th><th className="sr-num">Models</th><th className="sr-center">K / M / D</th><th>Notes</th>
+            <th>Operation</th><th>Added</th><th className="sr-num">Min / van</th><th className="sr-num">Models</th>
+            <th className="sr-num">Times</th><th className="sr-center">K / M / D</th><th>Notes</th>
           </tr>
         </thead>
         <tbody>
           {empty ? (
             <tr className="sr-flag-row">
-              <td colSpan={6}><em>No operations — nothing can be timed against this job.</em></td>
+              <td colSpan={5}><em>No operations — nothing can be timed against this job.</em></td>
               <td className="sr-center"><Boxes only={['K', 'D']} /></td>
               <td className="sr-notes" />
             </tr>
           ) : job.operations.map((op) => (
-            <tr key={op.id} className={op.times === 0 ? 'sr-flag-row' : undefined}>
+            <tr key={op.id} className={op.minutes == null ? 'sr-flag-row' : undefined}>
               <td>{op.name}</td>
               <td>{fmtAddedDate(op.createdAt)}</td>
+              <td className="sr-num">{op.minutes != null ? fmtMinutes(op.minutes) : '—'}</td>
+              <td className="sr-num">
+                {op.models} / <span className={op.linkedModels === 0 ? 'sr-zero' : undefined}>{op.linkedModels}</span>
+              </td>
               <td className="sr-num">{op.times}</td>
-              <td className="sr-num">{op.times > 0 ? fmtMinutes(op.totalMinutes) : '—'}</td>
-              <td className="sr-num">{op.avgMinutes != null ? fmtMinutes(op.avgMinutes) : '—'}</td>
-              <td className={'sr-num' + (op.models === 0 ? ' sr-zero' : '')}>{op.models}</td>
               <td className="sr-center"><Boxes /></td>
               <td className="sr-notes" />
             </tr>
