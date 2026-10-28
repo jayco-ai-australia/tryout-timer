@@ -10,6 +10,10 @@ import OperatorSelect from './OperatorSelect'
 import { ModelSeriesPicker } from './ModelLinker'
 import { createClient } from '@/lib/supabase/client'
 import { fetchAllChunked, READ_CHUNK, type RangeableQuery } from '@/lib/supabaseRead'
+import {
+  JOB_PARENT_CHAIN, OPERATION_PARENT_CHAIN, isLiveJob, isLiveOperation,
+  type JobLiveChain, type OperationLiveChain,
+} from '@/lib/liveStructure'
 import { fetchSectionsForLine } from '@/lib/sections'
 import { createJob } from '@/lib/jobs'
 import { createOperations, parseOperationNames } from '@/lib/operations'
@@ -343,11 +347,15 @@ export default function AddTimeDrawer({
   useEffect(() => {
     let cancelled = false
     if (!section) { setJobs([]); return }
-    supabase.from('jobs').select('id, name').eq('section_id', section).eq('is_active', true).order('name')
+    // The section's own flag rides along: a host can pre-fill a section id (Labour Matrix passes
+    // its focused job's), and the section list above hides retired ones but the id would still
+    // reach here — a live job inside a retired section is retired structure (lib/liveStructure).
+    supabase.from('jobs').select(`id, name, is_active, ${JOB_PARENT_CHAIN}`).eq('section_id', section).eq('is_active', true).order('name')
       .then(({ data, error: e }) => {
         if (cancelled) return
         if (e) { setError(e.message); return }
-        setJobs((data ?? []) as { id: string; name: string }[])
+        const rows = (data ?? []) as unknown as ({ id: string; name: string } & JobLiveChain)[]
+        setJobs(rows.filter(isLiveJob).map((j) => ({ id: j.id, name: j.name })))
       })
     return () => { cancelled = true }
   }, [supabase, section])
@@ -355,11 +363,14 @@ export default function AddTimeDrawer({
   useEffect(() => {
     let cancelled = false
     if (!job) { setOperations([]); return }
-    supabase.from('operations').select('*').eq('job_id', job).eq('is_active', true).order('name')
+    // The whole chain, not just the operation's flag: a pre-filled job id skips the job picker,
+    // so a retired job (or one in a retired section) would otherwise list its live operations.
+    supabase.from('operations').select(`*, ${OPERATION_PARENT_CHAIN}`).eq('job_id', job).eq('is_active', true).order('name')
       .then(({ data, error: e }) => {
         if (cancelled) return
         if (e) { setError(e.message); return }
-        setOperations((data ?? []) as Operation[])
+        const rows = (data ?? []) as unknown as (Operation & OperationLiveChain)[]
+        setOperations(rows.filter(isLiveOperation).map((op) => ({ ...op, jobs: null })))
       })
     return () => { cancelled = true }
   }, [supabase, job])

@@ -1,6 +1,7 @@
 'use client'
 
 import { type TimeParentFlags, TIME_FLAG_COLUMNS, isRetiredTime, LIVE_PARENTS } from '@/lib/operationTimes'
+import { JOB_PARENT_CHAIN, fetchOperationLiveChain, isLiveJob, retiredLevel } from '@/lib/liveStructure'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { selectIn } from '@/lib/chunkedIn'
@@ -26,8 +27,8 @@ import {
 } from '@/lib/modelOperations'
 import {
   addOperationTimeNote, currentByOperation, currentForOperation, deleteOperationTime, historyLabel,
-  fetchOperationTimeNotes, recordOperationTime, updateOperationTimeMinutes,
-  type OperationTimeStat,
+  fetchLinkedProductIds, fetchOperationTimeNotes, recordOperationTime, updateOperationTimeMinutes,
+  UnlinkedOperationError, type OperationTimeStat,
 } from '@/lib/operationTimes'
 import {
   elapsedSecondsNow, saveTimerRun, useStopwatches, type ActiveTimer,
@@ -157,7 +158,36 @@ interface RawJob {
   id: string; name: string; primary_operator_id: string | null
   team_id: string | null; production_line_id: string | null; section_id: string | null; created_at: string
   teams: RawTeamRef | RawTeamRef[] | null
+  is_active: boolean | null
+  sections: { is_active: boolean | null } | null
 }
+/** What the Complete dialog checked on opening — see completeCheck. */
+interface CompleteCheck {
+  unlinkedProductIds: string[]
+  retired: 'section' | 'job' | 'operation' | null
+}
+
+/** The Complete dialog's explanation. Information, not a refusal: every case here still saves. */
+function completeNotice(check: CompleteCheck | null, model: string | null | undefined): React.ReactNode {
+  if (!check) return null
+  const modelName = model ?? 'this model'
+  const parts: string[] = []
+  if (check.unlinkedProductIds.length > 0) {
+    parts.push(
+      `This operation isn’t linked to ${modelName} yet. Saving links it — the same as ticking it as ` +
+      `applying — and then records the time, for every ${modelName}.`
+    )
+  }
+  if (check.retired) {
+    parts.push(
+      `${check.retired === 'operation' ? 'This operation' : `This operation’s ${check.retired}`} was retired ` +
+      'after the timer started. The run is still saved and kept in its history, but retired work doesn’t ' +
+      'count towards labour figures.'
+    )
+  }
+  return parts.length > 0 ? parts.map((p, i) => <p key={p} style={{ margin: i > 0 ? '6px 0 0' : 0 }}>{p}</p>) : null
+}
+
 interface RawOperatorRef { id: string; full_name: string }
 interface RawOperation {
   id: string; name: string; job_id: string
@@ -407,6 +437,13 @@ export default function TryOutsClient({ userId, role }: Props) {
   const [completingTimer, setCompletingTimer] = useState<ActiveTimer | null>(null)
   const [completing, setCompleting] = useState(false)
   const [completeError, setCompleteError] = useState<string | null>(null)
+  /**
+   * What the Complete dialog found when it opened: which of the timer's models the operation is
+   * NOT linked to, and whether any level of its structure has been retired since the timer
+   * started. Neither stops the save — see confirmComplete. null while the check is in flight, or
+   * when it failed (the save then goes ahead and recordOperationTime's guard is the backstop).
+   */
+  const [completeCheck, setCompleteCheck] = useState<CompleteCheck | null>(null)
   const [cancelingTimerId, setCancelingTimerId] = useState<string | null>(null)
 
   // ── "Who have I timed?": the left-hand log, opposite the timer rail ──────────────────
@@ -707,15 +744,17 @@ export default function TryOutsClient({ userId, role }: Props) {
     // production_line_id was never filled in — the section link is the stronger signal for a walk.
     const sectionIds = loadedSections.map((s) => s.id)
     // Retired jobs (merged away — see lib/jobs' mergeJobs) never appear in a pane, a list or a
-    // picker, exactly as retired sections and operations don't.
-    let jobQuery = supabase.from('jobs').select('*, teams ( id, name )').eq('is_active', true).order('name')
+    // picker, exactly as retired sections and operations don't. A live job inside a RETIRED
+    // section is dropped too, below: the section query above leaves that section out, so the
+    // job would otherwise fall into the tray and be offered from there (lib/liveStructure).
+    let jobQuery = supabase.from('jobs').select(`*, teams ( id, name ), ${JOB_PARENT_CHAIN}`).eq('is_active', true).order('name')
     jobQuery = sectionIds.length > 0
       ? jobQuery.or(`production_line_id.eq.${context.productionLineId},section_id.in.(${sectionIds.join(',')})`)
       : jobQuery.eq('production_line_id', context.productionLineId)
     const { data: jobRows, error: jobsError } = await jobQuery
     if (jobsError) { setVanError(jobsError.message); setLoadingVan(false); return }
 
-    const loadedJobs: Job[] = ((jobRows ?? []) as unknown as RawJob[]).map((r) => ({
+    const loadedJobs: Job[] = ((jobRows ?? []) as unknown as RawJob[]).filter(isLiveJob).map((r) => ({
       id: r.id, name: r.name, primary_operator_id: r.primary_operator_id,
       team_id: r.team_id, production_line_id: r.production_line_id, section_id: r.section_id,
       created_at: r.created_at,
@@ -1218,7 +1257,24 @@ export default function TryOutsClient({ userId, role }: Props) {
   /** Opens the Start confirmation. Writes nothing and starts nothing — the clock begins only
    * when that form's "Start timing" is pressed (confirmStart), so Cancel leaves the operation
    * exactly as it was. */
-  function requestStart(target: CaptureTarget) {
+  async function requestStart(target: CaptureTarget) {
+    // The panes are as of the last load. A page left open across a structure cleanup still lists
+    // what was retired since, so the chain is re-read here, before a clock can start against it.
+    // A failed read lets Start through: Complete re-checks, and never throws the run away.
+    try {
+      const chain = await fetchOperationLiveChain(supabase, target.operationId)
+      const level = chain ? retiredLevel(chain) : 'operation'
+      if (level) {
+        setScopeError(
+          `“${target.operationName}” can’t be timed — ${level === 'operation' ? 'it has' : `its ${level} has`} ` +
+          'been retired since this page loaded. The list has been refreshed.'
+        )
+        if (van) await loadVan(van)
+        return
+      }
+    } catch {
+      // fall through — see above
+    }
     setStartTarget(target)
   }
 
@@ -1246,12 +1302,26 @@ export default function TryOutsClient({ userId, role }: Props) {
 
   function requestComplete(timer: ActiveTimer) {
     setCompleteError(null)
+    setCompleteCheck(null)
     setCompletingTimer(timer)
+    // Read fresh rather than taken from modelOpIds: the timer may be from before this page
+    // loaded (it is restored from localStorage), or the structure may have been cleaned up while
+    // it ran. Same read the save guard makes, so the dialog says what the save will meet.
+    Promise.all([
+      fetchLinkedProductIds(supabase, timer.operationId, timer.productIds),
+      fetchOperationLiveChain(supabase, timer.operationId),
+    ]).then(([linked, chain]) => {
+      setCompleteCheck({
+        unlinkedProductIds: timer.productIds.filter((id) => !linked.has(id)),
+        retired: chain ? retiredLevel(chain) : 'operation',
+      })
+    }).catch(() => setCompleteCheck(null))
   }
 
   function cancelComplete() {
     setCompletingTimer(null)
     setCompleteError(null)
+    setCompleteCheck(null)
   }
 
   async function confirmComplete(result: CompleteTimerResult) {
@@ -1259,6 +1329,17 @@ export default function TryOutsClient({ userId, role }: Props) {
     const timer = completingTimer
     setCompleting(true); setCompleteError(null)
     try {
+      // A completed stopwatch is never lost to a missing link. The work has been done and
+      // measured; the link is one write away, through the same writer the applies tick uses.
+      // Linking first is what lets recordOperationTime's guard pass — the guard stays as it is,
+      // so a time is still never banked against a model the operation doesn't apply to.
+      const unlinked = completeCheck?.unlinkedProductIds ?? []
+      if (unlinked.length > 0) {
+        const { error } = await linkOperationsToModels(
+          supabase, unlinked.map((productId) => ({ operation_id: timer.operationId, product_id: productId }))
+        )
+        if (error) throw new Error(`The time was not saved yet — linking the operation to this model failed: ${error}`)
+      }
       await saveTimerRun(supabase, timer, {
         userId,
         operatorId: result.operatorId,
@@ -1270,10 +1351,26 @@ export default function TryOutsClient({ userId, role }: Props) {
       // in the rail rather than throwing the elapsed time away.
       discardTimer(timer.timerId)
       setCompletingTimer(null)
+      setCompleteCheck(null)
+      if (completeCheck?.retired) {
+        setJobApplyNotice(
+          `Saved ${timer.operationName}. It is retired, so the run is kept in its history but won’t count ` +
+          'towards labour figures unless it is reinstated.'
+        )
+      } else if (unlinked.length > 0) {
+        setJobApplyNotice(`Saved, and “${timer.operationName}” now applies to ${timer.models?.[0]?.model || 'this model'}.`)
+      }
       // Refresh the on-van figures so the operation row shows the run that was just recorded.
       if (van && timer.chassisId === van.chassisId) await loadVan(van)
     } catch (err) {
-      setCompleteError(err instanceof Error ? err.message : 'Could not save time')
+      if (err instanceof UnlinkedOperationError) {
+        // The link vanished between the dialog's check and the save (or the check never came
+        // back). Nothing was written; turn the dialog into the apply-and-save offer rather than
+        // a refusal. The timer is still in the rail, untouched.
+        setCompleteCheck((prev) => ({ unlinkedProductIds: err.productIds, retired: prev?.retired ?? null }))
+      } else {
+        setCompleteError(err instanceof Error ? err.message : 'Could not save time')
+      }
     } finally {
       setCompleting(false)
     }
@@ -1949,6 +2046,8 @@ export default function TryOutsClient({ userId, role }: Props) {
           operators={lineOperators}
           saving={completing}
           error={completeError}
+          notice={completeNotice(completeCheck, completingTimer.models?.[0]?.model || van.model)}
+          saveLabel={completeCheck && completeCheck.unlinkedProductIds.length > 0 ? 'Apply to this model and save' : undefined}
           onSave={confirmComplete}
           onCancel={() => { if (!completing) cancelComplete() }}
         />

@@ -32,6 +32,10 @@ const ERR_BOX: React.CSSProperties = {
   padding: '9px 14px', borderRadius: 8, background: 'var(--red-bg)',
   border: '1px solid #fecaca', color: 'var(--red)', fontSize: 13,
 }
+const INFO_BOX: React.CSSProperties = {
+  margin: 0, padding: '10px 14px', borderRadius: 8, background: 'var(--blue-light)',
+  border: '1px solid #bae0f5', color: 'var(--text-mid)', fontSize: 13, lineHeight: 1.55,
+}
 const SECTION_LABEL: React.CSSProperties = {
   fontSize: 12, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em',
   color: 'var(--text-muted)', marginBottom: 8, display: 'block',
@@ -393,7 +397,7 @@ export interface CompleteTimerResult {
  * one is plain state, never a write.
  */
 export function CompleteTimerDialog({
-  timer, contextLabel, operators, saving, error, blockedReason, children, onSave, onCancel,
+  timer, contextLabel, operators, saving, error, blockedReason, notice, saveLabel, children, onSave, onCancel,
 }: {
   timer: ActiveTimer
   /** What the run is being banked against — shown for confirmation before saving. */
@@ -404,6 +408,15 @@ export function CompleteTimerDialog({
   error: string | null
   /** Set to refuse the save with a reason — /collect uses it for "no models selected". */
   blockedReason?: string | null
+  /**
+   * Something the operator should know before saving that does NOT stop the save — /tryouts
+   * uses it for "this operation isn't linked to this model yet, saving will link it". Shown as
+   * information, never as an error: by the time this dialog is open the work has been done and
+   * measured, and the save is the way forward, not the problem.
+   */
+  notice?: React.ReactNode
+  /** Replaces "Save" — e.g. "Apply to this model and save" when saving will also link. */
+  saveLabel?: string
   /** Extra host-specific content above the fields (e.g. /collect's model list). */
   children?: React.ReactNode
   onSave: (result: CompleteTimerResult) => void
@@ -430,7 +443,7 @@ export function CompleteTimerDialog({
         `for “${timer.operationName}” against ${contextLabel}. ` +
         'Operator and notes are both optional — leave them as they are to save without either.'
       }
-      confirmLabel={saving ? 'Saving…' : 'Save'}
+      confirmLabel={saving ? 'Saving…' : saveLabel ?? 'Save'}
       cancelLabel="Cancel"
       // 720 rather than 560 so /collect's expanded model grid gets three columns out of the
       // 180px track instead of two — 89 models is 30 rows, not 45. The two side-by-side fields
@@ -446,6 +459,7 @@ export function CompleteTimerDialog({
         {children}
 
         {blockedReason && <p style={ERR_BOX}>{blockedReason}</p>}
+        {notice && <div style={INFO_BOX}>{notice}</div>}
 
         {/* Both optional, side by side — the run saves with neither. */}
         <div className="capture-fields">
