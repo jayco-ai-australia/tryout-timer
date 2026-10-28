@@ -4031,6 +4031,22 @@ body {
 .est-na-btn { pointer-events: none; }
 .est-td-input:focus-within .est-na-btn, .est-na-pending .est-na-btn { opacity: 1; pointer-events: auto; }
 .est-na-btn:hover { color: var(--red); border-color: var(--red); }
+/* Remove a saved estimate: the opposite corner from the ×, a bin rather than a cross, and the
+   pending state red-dashed rather than grey-hatched — clearing a figure, not deciding applicability.
+   Top-right is free in a focused cell: the notes "i" hides while the input has focus. */
+.est-rm-btn {
+  position: absolute; top: 1px; right: 2px; width: 15px; height: 15px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 700; line-height: 1; color: var(--text-muted); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 4px; opacity: 0; pointer-events: none; transition: opacity 0.1s;
+}
+.est-td-input:focus-within .est-rm-btn, .est-rm-pending .est-rm-btn { opacity: 1; pointer-events: auto; }
+.est-rm-btn:hover { color: var(--red); border-color: var(--red); }
+.est-rm-pending { background: var(--red-bg); outline: 1.5px dashed var(--red); outline-offset: -3px; }
+.est-rm-pending .est-input { color: var(--red); text-decoration: line-through; }
+.est-swatch.est-rm-pending { outline: none; border: 1.5px dashed var(--red); }
+.est-savebar-rm { color: var(--red); }
+.est-link-rm { color: var(--red); }
 
 .est-table tfoot td, .est-table tfoot th { position: sticky; bottom: 0; background: var(--bg); border-top: 2px solid var(--text-muted); z-index: 1; }
 .est-table tfoot .est-td-op { z-index: 2; }
@@ -4114,6 +4130,33 @@ body {
 .est-notes-kind { padding: 1px 6px; border-radius: 4px; font-weight: 600; }
 .est-notes-measured { background: var(--measured-bg); color: var(--green-deep); }
 .est-notes-estimated { background: var(--estimated-bg); color: #9a4a00; }
+/* Apply copy's confirmation dialog. */
+.est-copy { font-size: 13.5px; color: var(--text); }
+.est-copy p { margin: 0; }
+.est-copy-source { font-size: 14px; }
+.est-copy-label { display: block; margin: 16px 0 6px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted); }
+.est-copy-models { max-height: 84px; overflow: auto; line-height: 1.5; }
+.est-copy-rows { width: 100%; border-collapse: collapse; }
+.est-copy-rows td { padding: 5px 0; border-bottom: 1px solid var(--border); vertical-align: top; }
+.est-copy-rows td:first-child { padding-right: 12px; }
+.est-copy-min, .est-copy-n { white-space: nowrap; text-align: right; font-variant-numeric: tabular-nums; }
+.est-copy-arrow { width: 28px; text-align: center; color: var(--text-muted); }
+.est-copy-row-none td { color: var(--text-muted); }
+.est-copy-total { margin-top: 8px !important; font-weight: 600; }
+.est-copy-links { margin-top: 12px !important; padding: 10px 12px; border-radius: 8px; background: var(--estimated-bg); color: #7a3a00; }
+.est-copy-links strong { font-size: 15px; }
+.est-copy-links span { display: block; margin-top: 2px; font-size: 12px; }
+.est-copy-warn { margin-top: 10px !important; padding: 8px 12px; border-radius: 8px; background: var(--amber-bg); color: #92400e; }
+.est-copy-skips { margin: 0; padding-left: 18px; color: var(--text-mid, var(--text-muted)); }
+.est-copy-skips li { padding: 1px 0; }
+.est-copy-note { width: 100%; box-sizing: border-box; font: inherit; border: 1.5px solid var(--border); border-radius: 8px; padding: 8px 10px; background: var(--surface); color: var(--text); resize: vertical; }
+.est-copy-hint { margin-top: 4px; font-size: 11.5px; color: var(--text-muted); }
+.est-copy-progress { margin-right: auto; font-size: 12.5px; color: var(--text-muted); }
+.est-notes-who { padding: 8px 12px; border-bottom: 1px solid var(--border); }
+.est-notes-who-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted); }
+.est-notes-who-name { font-weight: 600; color: var(--text); }
+.est-notes-who-none { font-weight: 400; font-style: italic; color: var(--text-muted); }
+.est-notes-who-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 3px; font-size: 11.5px; color: var(--text-muted); }
 
 /* One note for the whole save. */
 .est-savebar-note {

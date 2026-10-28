@@ -1663,6 +1663,12 @@ export interface UpdateOperationTimeInput {
    * follows, in the same module, so "cleared" means one thing across insert and update.
    */
   operatorId?: string | null
+  /**
+   * is_hidden: true takes the record out of every figure and coverage number (countsTowardLabour)
+   * while keeping it, its links and its notes — the reversible "this figure shouldn't be here".
+   * false brings it back. Written here, not inline, so it goes through the same RLS read-back.
+   */
+  isHidden?: boolean
 }
 
 /**
@@ -1693,6 +1699,9 @@ export async function updateOperationTime(
   }
   if (input.operatorId !== undefined) {
     patch.operator_id = input.operatorId ?? await resolvePlaceholderOperatorId(supabase)
+  }
+  if (input.isHidden !== undefined) {
+    patch.is_hidden = input.isHidden
   }
   if (Object.keys(patch).length === 0) {
     throw new Error('Nothing to update')

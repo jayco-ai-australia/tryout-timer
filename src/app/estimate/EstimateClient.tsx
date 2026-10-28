@@ -3,13 +3,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import { createClient } from '@/lib/supabase/client'
-import { fetchEstimateGrid, markNotApplicable, saveEstimates, type EstimateCellState, type EstimateGrid, type EstimateOperation, type EstimatePair, type EstimateWrite } from '@/lib/estimates'
+import { fetchEstimateGrid, markNotApplicable, removeEstimates, saveEstimates, type EstimateCellState, type EstimateRemoval, type EstimateGrid, type EstimateOperation, type EstimatePair, type EstimateWrite } from '@/lib/estimates'
 import { modelsForLine } from '@/lib/lines'
 import { operationProductKey } from '@/lib/operationTimes'
 import { groupProducts } from '@/lib/productGroups'
 import { fetchSectionsForLine } from '@/lib/sections'
 import { fetchAllRows } from '@/lib/supabaseRead'
 import { fmtDateTime, fmtMinutes, plural } from '@/lib/format'
+import Modal from '@/components/Modal'
 import { usePersistedFilter } from '@/lib/useLocalStorage'
 import type { Product, ProductionLine, Section, Team } from '@/lib/types'
 
@@ -18,9 +19,10 @@ import type { Product, ProductionLine, Section, Team } from '@/lib/types'
  *
  * One JOB's operations down the side — or, with only a section chosen, every job in the section
  * stacked, each with its own heading and total — and a range of MODELS across the top. Measured cells are the
- * evidence and are read-only; empty cells are inputs; saved estimates are editable. Nothing is
- * written until Save, and then each filled cell becomes one is_estimated operation_times record
- * through the shared writers — see lib/estimates for exactly what one cell writes.
+ * evidence and are read-only; empty cells are inputs; saved estimates are editable. Typed cells
+ * are written by Save estimates; a column copy is written by its own confirmation dialog (see
+ * CopyPlan). Either way each cell becomes one is_estimated operation_times record through the
+ * shared writers — see lib/estimates for exactly what one cell writes.
  *
  * The four cell states, and why each looks the way it does:
  *   MEASURED   green tint, the Labour Matrix's "this figure was measured" colour. Read-only:
@@ -36,6 +38,11 @@ import type { Product, ProductionLine, Section, Team } from '@/lib/types'
  *              cell (the × control, or typing "x") removes the link and writes that row; typing a
  *              figure into an excluded cell withdraws the decision and links it. Never allowed
  *              where a measured time exists.
+ *   REMOVING   a saved estimate marked for removal (the bin control): red tint, red dashed edge,
+ *              the figure struck through in red. Save HIDES the record (is_hidden, nothing
+ *              deleted) and leaves the link — the cell becomes OPEN, a gap again. Not "not
+ *              applicable", which removes the link. Never drawn on a measured cell, and
+ *              lib/estimates' removeEstimates refuses one regardless.
  */
 
 export interface EstimateTarget {
@@ -55,8 +62,39 @@ interface Props {
 interface JobOption { id: string; name: string }
 type TeamRow = Pick<Team, 'id' | 'name' | 'production_line_id'>
 
-/** A typed figure not yet saved. The pair travels with it so nothing has to take a key apart. */
-interface Draft { operationId: string; productId: string; raw: string }
+/** A typed figure not yet saved. The pair travels with it so nothing has to take a key apart.
+ * `remove` marks a saved estimate for removal instead — raw is then unused, and the cell is
+ * read-only until the mark is undone (↺ or Esc). */
+interface Draft { operationId: string; productId: string; raw: string; remove?: true }
+
+/**
+ * What a column copy will write, worked out once when Apply copy is pressed and shown in its
+ * dialog. A snapshot, not live: what was inspected is exactly what Save writes, even if the grid
+ * reloads underneath. Every in-range cell lands in `writes` or in one of the `skipped` counts —
+ * nothing is dropped without being counted.
+ */
+interface CopyPlan {
+  sourceModel: string
+  factor: number
+  /** Where the copied figures come from on the source model. `typed` = typed there, not saved. */
+  sourceKinds: { measured: number; estimated: number; typed: number }
+  rows: { operationId: string; name: string; minutes: number; models: number }[]
+  writes: EstimateWrite[]
+  /** Models receiving at least one figure, in column order. */
+  targets: Product[]
+  /** Models in range (ticked, or every one on screen) — some may receive nothing. */
+  rangeCount: number
+  /** model_operations links the save creates: the work applied to a model for the first time. */
+  newLinks: number
+  skipped: {
+    measured: number
+    notApplicable: number
+    /** Already holds a figure — a saved estimate, or one typed and not saved. */
+    filled: number
+    /** Operations in the copy with no figure on the source model. */
+    noSource: number
+  }
+}
 
 const SEL: React.CSSProperties = {
   fontSize: 13, fontWeight: 500, fontFamily: 'inherit',
@@ -265,6 +303,7 @@ export default function EstimateClient({ lines, userId, target }: Props) {
     const state = stateOf(operationId, productId)
     if (state?.kind === 'measured') return state.minutes
     const draft = drafts.get(operationProductKey(operationId, productId))
+    if (draft?.remove) return null
     if (draft && draft.raw.trim() !== '') return parseMinutes(draft.raw)
     return state?.kind === 'estimated' ? state.minutes : null
   }, [stateOf, drafts])
@@ -475,8 +514,9 @@ export default function EstimateClient({ lines, userId, target }: Props) {
   const isFillable = useCallback(
     (operationId: string, productId: string) =>
       isEditable(operationId, productId) && !isExcluded(operationId, productId) &&
-      valueOf(operationId, productId) == null && !isMarkedNa(operationId, productId),
-    [isEditable, isExcluded, valueOf, isMarkedNa],
+      valueOf(operationId, productId) == null && !isMarkedNa(operationId, productId) &&
+      !drafts.get(operationProductKey(operationId, productId))?.remove,
+    [isEditable, isExcluded, valueOf, isMarkedNa, drafts],
   )
   const selectedOnScreen = columns.filter((p) => selectedTargets.has(p.id) && p.id !== activeSource)
   /** Ticked model headings narrow both bulk tools; with none ticked they reach every model on screen. */
@@ -493,27 +533,96 @@ export default function EstimateClient({ lines, userId, target }: Props) {
   /**
    * Copy a column across, optionally at a factor, into every empty cell in range — linked or
    * undecided. It never changes a figure somebody already typed or saved, never touches a
-   * measured cell, and never overturns a not-applicable decision.
+   * measured cell, and never overturns a not-applicable decision. Builds the plan the dialog
+   * shows; nothing is written until Save inside it.
    */
-  function copyColumn() {
-    if (!activeSource || factor == null || !copyJob || copyBlocked) return
-    const entries: { operationId: string; productId: string; minutes: number }[] = []
+  function planCopy(): CopyPlan | null {
+    if (!activeSource || factor == null || !copyJob || copyBlocked || !grid) return null
+    const sourceKinds = { measured: 0, estimated: 0, typed: 0 }
+    const skipped = { measured: 0, notApplicable: 0, filled: 0, noSource: 0 }
+    const rows: CopyPlan['rows'] = []
+    const writes: EstimateWrite[] = []
+    const hit = new Set<string>()
     for (const o of copyOps) {
       const src = valueOf(o.id, activeSource)
-      if (src == null) continue
-      for (const t of fillTargets) {
-        if (!isFillable(o.id, t.id)) continue
-        entries.push({ operationId: o.id, productId: t.id, minutes: src * factor })
+      if (src == null) { skipped.noSource += 1; continue }
+      const srcState = stateOf(o.id, activeSource)
+      const srcDraft = drafts.get(operationProductKey(o.id, activeSource))
+      if (srcState?.kind === 'measured') sourceKinds.measured += 1
+      else if (srcDraft && srcDraft.raw.trim() !== '' && !(srcState && Math.abs(srcState.minutes - src) < 1e-9)) sourceKinds.typed += 1
+      else sourceKinds.estimated += 1
+      const minutes = round1(src * factor)
+      let models = 0
+      for (const t of fillRange) {
+        if (stateOf(o.id, t.id)?.kind === 'measured') { skipped.measured += 1; continue }
+        if (isExcluded(o.id, t.id) || isMarkedNa(o.id, t.id)) { skipped.notApplicable += 1; continue }
+        if (valueOf(o.id, t.id) != null || drafts.get(operationProductKey(o.id, t.id))?.remove) { skipped.filled += 1; continue }
+        writes.push({
+          operationId: o.id, productId: t.id, minutes, existing: null,
+          linked: grid.links.has(operationProductKey(o.id, t.id)), excluded: false,
+        })
+        hit.add(t.id)
+        models += 1
       }
+      rows.push({ operationId: o.id, name: o.name, minutes, models })
     }
-    setDraftsBulk(entries)
-    const src = filteredProducts.find((p) => p.id === activeSource)?.model ?? ''
-    setNotice({
-      tone: entries.length > 0 ? 'ok' : 'warn',
-      text: entries.length > 0
-        ? `Filled ${plural(entries.length, 'cell')} from ${src}${factor !== 1 ? ` × ${factor}` : ''} — not saved yet.`
-        : `Nothing to fill — no empty cell${selectedOnScreen.length > 0 ? ' on the ticked models' : ''}${tickedOps.length > 0 ? ' in the ticked rows' : ''} lines up with a figure in ${src}.`,
-    })
+    return {
+      sourceModel: filteredProducts.find((p) => p.id === activeSource)?.model ?? '',
+      factor,
+      sourceKinds,
+      rows,
+      writes,
+      targets: fillRange.filter((p) => hit.has(p.id)),
+      rangeCount: fillRange.length,
+      newLinks: writes.filter((w) => !w.linked).length,
+      skipped,
+    }
+  }
+  const [copyPlan, setCopyPlan] = useState<CopyPlan | null>(null)
+  /** Why this copy is being made — onto every record it writes. Its own, not the save bar's. */
+  const [copyNote, setCopyNote] = useState('')
+  function openCopy() {
+    const plan = planCopy()
+    if (!plan) return
+    setCopyNote('')
+    setNotice(null)
+    setCopyPlan(plan)
+  }
+
+  /** The dialog's Save: straight to the database through saveEstimates — the same writer, and
+   * the same note path, as Save estimates. Typed drafts elsewhere on the grid are left alone. */
+  async function saveCopy() {
+    if (!copyPlan || copyPlan.writes.length === 0 || saving) return
+    const { writes, targets, sourceModel } = copyPlan
+    setSaving({ done: 0, total: writes.length })
+    try {
+      const est = await saveEstimates(supabase, writes, userId, (done) => setSaving({ done, total: writes.length }), copyNote)
+      const noteMiss = est.noteFailures > 0 ? ` The note could not be added to ${plural(est.noteFailures, 'record')}; the figures are saved.` : ''
+      setCopyPlan(null)
+      if (est.failures.length === 0) {
+        clearTicks()
+        setNotice({
+          tone: est.noteFailures > 0 ? 'warn' : 'ok',
+          text: `Saved ${plural(writes.length, 'estimate')} across ${plural(targets.length, 'model')} from ${sourceModel}.` + noteMiss,
+        })
+      } else {
+        // Failed cells stay empty on the reload, so Apply copy again offers exactly those.
+        const opName = (id: string) => grid?.operations.find((o) => o.id === id)?.name ?? 'operation'
+        const model = (id: string) => products.find((p) => p.id === id)?.model ?? 'model'
+        const first = est.failures[0]
+        setNotice({
+          tone: 'warn',
+          text: `Saved ${est.saved} of ${writes.length}. ${plural(est.failures.length, 'cell')} could not be saved and ` +
+            `${est.failures.length === 1 ? 'is' : 'are'} left empty — Apply copy again to retry them. e.g. ${opName(first.operationId)} on ${model(first.productId)}: ${first.message}` + noteMiss,
+        })
+      }
+    } catch (err) {
+      setCopyPlan(null)
+      setNotice({ tone: 'warn', text: err instanceof Error ? err.message : 'Could not save the copy' })
+    } finally {
+      setSaving(null)
+      setReloadTick((t) => t + 1)
+    }
   }
 
   /** The figure a row fill copies: the cell last focused in that row if it holds one, else the
@@ -543,13 +652,45 @@ export default function EstimateClient({ lines, userId, target }: Props) {
       .map((p) => ({ operationId, productId: p.id, minutes: src.minutes })))
   }
 
+  /** Bulk remove: every saved estimate in the ticked rows × ticked models (either alone narrows
+   * one axis; the other is everything on screen), marked for removal — still only on Save.
+   * stateOf 'estimated' only, so a measured cell can't be swept in. */
+  const removableInSelection = useMemo(() => {
+    if (selectedOps.size === 0 && selectedTargets.size === 0) return []
+    const rows = tickedOps.length > 0 ? tickedOps : visibleOps
+    const cols = selectedTargets.size > 0 ? columns.filter((p) => selectedTargets.has(p.id)) : columns
+    const out: Draft[] = []
+    for (const o of rows) for (const p of cols) {
+      const key = operationProductKey(o.id, p.id)
+      if (stateOf(o.id, p.id)?.kind === 'estimated' && !drafts.has(key)) out.push({ operationId: o.id, productId: p.id, raw: '', remove: true })
+    }
+    return out
+  }, [selectedOps, selectedTargets, tickedOps, visibleOps, columns, stateOf, drafts])
+  function markSelectionForRemoval() {
+    if (removableInSelection.length === 0) return
+    setDrafts((prev) => {
+      const next = new Map(prev)
+      for (const d of removableInSelection) next.set(operationProductKey(d.operationId, d.productId), d)
+      return next
+    })
+    setNotice(null)
+  }
+
   // ── What Save would write ────────────────────────────────────────────────────────────────
   const pending = useMemo(() => {
     const writes: EstimateWrite[] = []
     const notApplicable: EstimatePair[] = []
+    const removals: EstimateRemoval[] = []
     let invalid = 0
     for (const d of drafts.values()) {
       if (!isEditable(d.operationId, d.productId)) continue
+      if (d.remove) {
+        // Only a saved estimate can be removed; a mark left on a cell that no longer holds one
+        // (a reload since) is nothing to do.
+        const state = stateOf(d.operationId, d.productId)
+        if (state?.kind === 'estimated') removals.push({ operationId: d.operationId, productId: d.productId, timeId: state.timeId })
+        continue
+      }
       if (d.raw.trim() === '') continue
       if (isNaText(d.raw)) {
         // Any cell not already decided can be marked — an undecided one included, since recording
@@ -576,12 +717,13 @@ export default function EstimateClient({ lines, userId, target }: Props) {
     return {
       writes,
       notApplicable,
+      removals,
       invalid,
-      models: new Set([...writes, ...notApplicable].map((w) => w.productId)).size,
+      models: new Set([...writes, ...notApplicable, ...removals].map((w) => w.productId)).size,
       updates: writes.filter((w) => w.existing).length,
       newLinks: writes.filter((w) => !w.linked && !w.excluded).length,
       reopened: writes.filter((w) => w.excluded).length,
-      changes: writes.length + notApplicable.length,
+      changes: writes.length + notApplicable.length + removals.length,
     }
   }, [drafts, isEditable, isExcluded, hasMeasured, stateOf, grid])
 
@@ -595,19 +737,24 @@ export default function EstimateClient({ lines, userId, target }: Props) {
 
   async function save() {
     if (pending.changes === 0 || pending.invalid > 0 || saving) return
-    const { writes, notApplicable } = pending
-    const total = writes.length + notApplicable.length
+    const { writes, notApplicable, removals } = pending
+    const total = writes.length + notApplicable.length + removals.length
     setSaving({ done: 0, total })
     setNotice(null)
     try {
+      // Removals first, on cells no other write touches (a cell holds one draft). Each record and
+      // its pair are re-read inside removeEstimates and refused if anything measured is there.
+      const rm = await removeEstimates(supabase, removals, userId)
       // Not-applicable first: it is one guarded unlink per model, and it never touches a cell
       // the estimate writes below are about (a cell holds a figure or n/a, not both).
+      setSaving({ done: removals.length, total })
       const na = await markNotApplicable(supabase, notApplicable, userId, saveNote)
-      setSaving({ done: notApplicable.length, total })
-      const est = await saveEstimates(supabase, writes, userId, (done) => setSaving({ done: notApplicable.length + done, total }), saveNote)
+      const before = removals.length + notApplicable.length
+      setSaving({ done: before, total })
+      const est = await saveEstimates(supabase, writes, userId, (done) => setSaving({ done: before + done, total }), saveNote)
       const result = {
-        saved: est.saved + (notApplicable.length - na.failures.length),
-        failures: [...na.failures, ...est.failures],
+        saved: est.saved + (notApplicable.length - na.failures.length) + rm.removed,
+        failures: [...rm.failures, ...na.failures, ...est.failures],
       }
       const failed = new Set(result.failures.map((f) => operationProductKey(f.operationId, f.productId)))
       // Saved cells leave the drafts (the reload shows them as saved estimates); failed ones stay,
@@ -624,8 +771,11 @@ export default function EstimateClient({ lines, userId, target }: Props) {
         setSaveNote('')
         setNotice({
           tone: est.noteFailures > 0 ? 'warn' : 'ok',
-          text: `Saved ${plural(writes.length, 'estimate')}` +
-            (notApplicable.length > 0 ? ` and marked ${notApplicable.length} not applicable` : '') + '.' + noteMiss,
+          text: [
+            writes.length > 0 ? `Saved ${plural(writes.length, 'estimate')}` : '',
+            notApplicable.length > 0 ? `marked ${notApplicable.length} not applicable` : '',
+            removals.length > 0 ? `removed ${plural(removals.length, 'estimate')}` : '',
+          ].filter(Boolean).join(', ').replace(/^./, (c) => c.toUpperCase()) + '.' + noteMiss,
         })
       } else {
         const opName = (id: string) => grid?.operations.find((o) => o.id === id)?.name ?? 'operation'
@@ -740,26 +890,30 @@ export default function EstimateClient({ lines, userId, target }: Props) {
     const measuredBefore = hasMeasured(o.id, p.id)
     const draft = drafts.get(key)
     const saved = state?.kind === 'estimated' ? state.minutes : null
-    const markedNa = draft != null && isNaText(draft.raw)
-    const raw = draft ? draft.raw : saved != null ? String(saved) : ''
+    const removing = !!draft?.remove && saved != null
+    const markedNa = draft != null && !draft.remove && isNaText(draft.raw)
+    const raw = draft && !draft.remove ? draft.raw : saved != null ? String(saved) : ''
     const parsed = raw.trim() === '' || markedNa ? null : parseMinutes(raw)
     // n/a over measured history is refused outright — flagged here, re-checked on save.
     const naBlocked = markedNa && measuredBefore
     const naPending = markedNa && !naBlocked && !excluded
     const invalid = (raw.trim() !== '' && !markedNa && parsed == null) || naBlocked
-    const dirty = draft != null && raw.trim() !== '' && !markedNa && parsed !== saved
+    const dirty = draft != null && !removing && raw.trim() !== '' && !markedNa && parsed !== saved
     // The stored decision, untouched: struck "n/a", hatched (typing "x" over it is no change).
     const showExcluded = excluded && !dirty && !invalid && (draft == null || markedNa || raw.trim() === '')
     const faint = !dirty && !naPending && !naBlocked && !showExcluded && saved == null && !linked
     const cls = ['est-td', 'est-td-input',
       showExcluded ? 'est-excluded' : '',
-      saved != null && !dirty && !markedNa ? 'est-estimated' : '',
+      saved != null && !dirty && !markedNa && !removing ? 'est-estimated' : '',
+      removing ? 'est-rm-pending' : '',
       faint ? 'est-unlinked' : '',
       dirty ? 'est-dirty' : '',
       dirty && !linked ? 'est-dirty-new' : '',
       naPending ? 'est-na-pending' : '',
       invalid ? 'est-invalid' : ''].filter(Boolean).join(' ')
-    const title = naBlocked
+    const title = removing
+      ? `Saved estimate ${fmtMinutes(saved as number)} marked for removal — Save hides it and leaves ${o.name} applying to ${p.model}, with no figure. Esc to undo.`
+      : naBlocked
       ? `${o.name} has a measured time recorded against ${p.model}, so it can’t be marked not applicable — Esc to undo`
       : invalid ? 'Not a number of minutes'
         : naPending ? `Marked not applicable — Save records the decision${linked ? ` and removes ${o.name}’s link to ${p.model}` : ''}${saved != null ? ', detaching the saved estimate' : ''}. Esc to undo.`
@@ -772,7 +926,10 @@ export default function EstimateClient({ lines, userId, target }: Props) {
     // The × wherever the decision isn't already recorded — and NOT AT ALL over measured history
     // (not even disabled): measured work is proof the operation applies. Typing "x" there is
     // flagged instead, and markNotApplicable refuses the pair regardless.
-    const canMarkNa = !excluded && !measuredBefore
+    const canMarkNa = !excluded && !measuredBefore && !removing
+    // The bin: a SAVED ESTIMATE only. Measured cells never reach this code — they return
+    // read-only above — so there is no measured cell to draw it on, disabled or otherwise.
+    const canRemove = saved != null && !markedNa && (!draft || removing)
     return (
       <td key={p.id} className={cls}>
         <input
@@ -786,6 +943,7 @@ export default function EstimateClient({ lines, userId, target }: Props) {
           aria-label={`${o.name} on ${p.model}, minutes`}
           placeholder={saved != null ? String(saved) : excluded ? NA_TEXT : ''}
           value={raw}
+          readOnly={removing}
           onChange={(e) => setDraft(o.id, p.id, e.target.value)}
           onFocus={(e) => { lastFocusedRef.current = { operationId: o.id, productId: p.id }; e.currentTarget.select() }}
           onKeyDown={(e) => onCellKey(e, r, c)}
@@ -807,6 +965,26 @@ export default function EstimateClient({ lines, userId, target }: Props) {
             }}
           >
             {markedNa ? '↺' : '×'}
+          </button>
+        )}
+        {canRemove && (
+          <button
+            type="button"
+            className="est-rm-btn"
+            tabIndex={-1}
+            aria-label={removing ? 'Undo remove' : `Remove the saved estimate for ${o.name} on ${p.model}`}
+            title={removing ? 'Undo — keep the estimate' : 'Remove this estimate on save — the operation still applies, the cell becomes a gap. The record is hidden, not deleted.'}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => {
+              if (removing) setDrafts((prev) => { const next = new Map(prev); next.delete(key); return next })
+              else { setDrafts((prev) => new Map(prev).set(key, { operationId: o.id, productId: p.id, raw: '', remove: true })); setNotice(null) }
+            }}
+          >
+            {removing ? '↺' : (
+              <svg width="9" height="10" viewBox="0 0 9 10" aria-hidden fill="none" stroke="currentColor" strokeWidth="1.2">
+                <path d="M0.5 2h8M3 2V0.8h3V2M1.5 2l.5 7.4h5L7.5 2M3.6 4v3.6M5.4 4v3.6" />
+              </svg>
+            )}
           </button>
         )}
       </td>
@@ -1004,13 +1182,24 @@ export default function EstimateClient({ lines, userId, target }: Props) {
                   <span className="est-tick-count">
                     {[selectedTargets.size > 0 ? plural(selectedTargets.size, 'model') : '', selectedOps.size > 0 ? plural(selectedOps.size, 'operation') : ''].filter(Boolean).join(' and ')} ticked
                     <button type="button" className="est-link" onClick={clearTicks}>Clear selection</button>
+                    {removableInSelection.length > 0 && (
+                      <button
+                        type="button"
+                        className="est-link est-link-rm"
+                        title="Marks them for removal — nothing changes until Save estimates. Measured times are never included."
+                        onClick={markSelectionForRemoval}
+                      >
+                        Remove {plural(removableInSelection.length, 'saved estimate')} in selection…
+                      </button>
+                    )}
                   </span>
                 )}
               </div>
             )}
             <span className="est-tools-hint">
-              Set up a copy here, check the grid, then <strong>Apply copy</strong> in the bar below — it fills cells, nothing is saved until <strong>Save estimates</strong> · Copy column and <strong>Fill →</strong> write into every empty cell, undecided ones included — skipping measured and not-applicable cells · tick model headings, a series, or operation rows to narrow them · ⇥ / arrows / Enter move · Esc reverts a cell ·
+              Set up a copy here, then <strong>Apply copy</strong> in the bar below — it shows what will be written and saves only when you confirm · Copy column and <strong>Fill →</strong> write into every empty cell, undecided ones included — skipping measured and not-applicable cells · tick model headings, a series, or operation rows to narrow them · ⇥ / arrows / Enter move · Esc reverts a cell ·
               {' '}<strong>×</strong> in the focused cell (or typing <strong>x</strong>) marks it not applicable
+              {' '}· the <strong>bin</strong> on a saved estimate removes its figure, keeping the work applying
             </span>
           </div>
 
@@ -1023,6 +1212,7 @@ export default function EstimateClient({ lines, userId, target }: Props) {
             <span><span className="est-swatch est-dirty" />Typed, not saved</span>
             <span><span className="est-swatch est-dirty est-dirty-new" />Typed into an unlinked cell — saving also links it</span>
             <span><span className="est-swatch est-na-pending" />Marked not applicable, not saved yet</span>
+            <span><span className="est-swatch est-rm-pending" />Saved estimate marked for removal, not saved yet — the work still applies</span>
             <span><span className="est-cell-info est-info-legend" aria-hidden>i</span>Notes on that recording — click to read</span>
           </div>
 
@@ -1144,6 +1334,9 @@ export default function EstimateClient({ lines, userId, target }: Props) {
             const list = grid.notes.get(operationProductKey(notesOpen.operationId, notesOpen.productId))
             if (!o || !p || !list) return null
             const kind = stateOf(o.id, p.id)?.kind
+            const rec = grid.records.get(operationProductKey(o.id, p.id))
+            // collected_by is only worth a line when it isn't simply the operator timing themselves.
+            const showCollector = rec?.collector != null && rec.collector.toLowerCase() !== rec.operator?.toLowerCase()
             return (
               <div className="est-notes-pop" role="dialog" aria-label={`Notes on ${o.name} for ${p.model}`} style={{ top: notesOpen.top, left: notesOpen.left }}>
                 <div className="est-notes-head">
@@ -1156,6 +1349,25 @@ export default function EstimateClient({ lines, userId, target }: Props) {
                   </div>
                   <button type="button" className="est-notes-close" aria-label="Close" onClick={() => { setNotesOpen(null); notesTriggerRef.current?.focus() }}>×</button>
                 </div>
+                {/* Who was timed, on which van — the pair that makes the figure interpretable. */}
+                {rec && (
+                  <div className="est-notes-who">
+                    {kind === 'estimated' ? (
+                      <div className="est-notes-who-name">Estimate — no operator was timed</div>
+                    ) : (
+                      <>
+                        <div className="est-notes-who-label">Operator timed</div>
+                        <div className={`est-notes-who-name${rec.operator ? '' : ' est-notes-who-none'}`}>{rec.operator ?? 'Operator not recorded'}</div>
+                      </>
+                    )}
+                    {(showCollector || rec.chassis) && (
+                      <div className="est-notes-who-meta">
+                        {showCollector && <span>{kind === 'estimated' ? 'Entered by' : 'Stopwatch run by'} {rec.collector}</span>}
+                        {rec.chassis && <span>Chassis {rec.chassis}</span>}
+                      </div>
+                    )}
+                  </div>
+                )}
                 <ul className="est-notes-list">
                   {list.map((n, i) => (
                     <li key={i}>
@@ -1165,6 +1377,103 @@ export default function EstimateClient({ lines, userId, target }: Props) {
                   ))}
                 </ul>
               </div>
+            )
+          })()}
+
+          {copyPlan && (() => {
+            const pl = copyPlan
+            const { skipped: sk, sourceKinds: sc } = pl
+            const nothing = pl.writes.length === 0
+            const why = pl.rows.length === 0 ? `${pl.sourceModel} has no figure in the rows being copied`
+              : 'Every cell in range is measured, not applicable, or already has a figure'
+            const kinds = [
+              sc.measured > 0 ? `${sc.measured} measured` : '',
+              sc.estimated > 0 ? `${sc.estimated} saved ${sc.estimated === 1 ? 'estimate' : 'estimates'}` : '',
+              sc.typed > 0 ? `${sc.typed} typed and not saved` : '',
+            ].filter(Boolean)
+            const close = () => { if (!saving) setCopyPlan(null) }
+            return (
+              <Modal
+                title={nothing ? `Copy from ${pl.sourceModel}` : `Copy ${pl.sourceModel} into ${plural(pl.targets.length, 'model')}`}
+                onClose={close}
+                maxWidth={620}
+                footer={<>
+                  {saving && <span className="est-copy-progress">Saving {saving.done} / {saving.total}…</span>}
+                  <button type="button" className="btn-ghost" disabled={!!saving} onClick={close}>Cancel</button>
+                  <span title={nothing ? `Nothing to write — ${why.charAt(0).toLowerCase()}${why.slice(1)}.` : undefined}>
+                    <button type="button" className="btn-primary" disabled={nothing || !!saving} onClick={saveCopy}>
+                      {saving ? 'Saving…' : nothing ? 'Save' : `Save ${plural(pl.writes.length, 'estimate')}`}
+                    </button>
+                  </span>
+                </>}
+              >
+                <div className="est-copy">
+                  <p className="est-copy-source">
+                    From <strong>{pl.sourceModel}</strong>
+                    {kinds.length > 0 && <> — {sc.measured > 0 && kinds.length === 1 ? 'measured' : kinds.join(', ')}</>}
+                    {pl.factor !== 1 && <>, scaled <strong>× {pl.factor}</strong></>}
+                  </p>
+                  {sc.typed > 0 && (
+                    <p className="est-copy-warn">
+                      {plural(sc.typed, 'figure')} on {pl.sourceModel} {sc.typed === 1 ? 'is' : 'are'} typed but not saved. The copies are saved now; {pl.sourceModel}{'’'}s own {sc.typed === 1 ? 'figure stays' : 'figures stay'} unsaved until Save estimates.
+                    </p>
+                  )}
+
+                  {!nothing && <>
+                    <div className="est-copy-label">To {plural(pl.targets.length, 'model')}</div>
+                    <p className="est-copy-models">{pl.targets.map((t) => t.model).join(', ')}</p>
+
+                    <div className="est-copy-label">What will be written</div>
+                    <table className="est-copy-rows">
+                      <tbody>
+                        {pl.rows.map((r) => (
+                          <tr key={r.operationId} className={r.models === 0 ? 'est-copy-row-none' : undefined}>
+                            <td>{r.name}</td>
+                            <td className="est-copy-min">{fmtMinutes(r.minutes)}</td>
+                            <td className="est-copy-arrow">→</td>
+                            <td className="est-copy-n">{r.models === 0 ? 'nothing to fill' : plural(r.models, 'model')}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    <p className="est-copy-total">{plural(pl.writes.length, 'estimate')} across {plural(pl.targets.length, 'model')}</p>
+
+                    {pl.newLinks > 0 && (
+                      <p className="est-copy-links">
+                        <strong>{pl.newLinks}</strong> will apply this work to a model for the first time
+                        <span> — {pl.newLinks === 1 ? 'that operation isn\u2019t' : 'those operations aren\u2019t'} linked to {pl.newLinks === 1 ? 'that model' : 'those models'} yet, and saving links {pl.newLinks === 1 ? 'it' : 'them'}.</span>
+                      </p>
+                    )}
+                  </>}
+                  {nothing && <p className="est-copy-warn">Nothing to write — {why.charAt(0).toLowerCase()}{why.slice(1)}.</p>}
+
+                  {(sk.measured + sk.notApplicable + sk.filled + sk.noSource > 0 || pl.targets.length < pl.rangeCount) && (
+                    <>
+                      <div className="est-copy-label">Skipped</div>
+                      <ul className="est-copy-skips">
+                        {sk.measured > 0 && <li>{plural(sk.measured, 'cell')} already measured — never overwritten</li>}
+                        {sk.notApplicable > 0 && <li>{plural(sk.notApplicable, 'cell')} marked not applicable</li>}
+                        {sk.filled > 0 && <li>{plural(sk.filled, 'cell')} already holding a figure (saved, typed, or marked for removal)</li>}
+                        {sk.noSource > 0 && <li>{plural(sk.noSource, 'operation')} with no figure on {pl.sourceModel}</li>}
+                        {pl.targets.length < pl.rangeCount && <li>{plural(pl.rangeCount - pl.targets.length, 'model')} in range receive nothing</li>}
+                      </ul>
+                    </>
+                  )}
+
+                  <label className="est-copy-label" htmlFor="est-copy-note">Why this copy (optional)</label>
+                  <textarea
+                    id="est-copy-note"
+                    className="est-copy-note"
+                    rows={2}
+                    maxLength={500}
+                    placeholder="e.g. scaled from 88A, same floor plan"
+                    value={copyNote}
+                    disabled={!!saving}
+                    onChange={(e) => setCopyNote(e.target.value)}
+                  />
+                  <div className="est-copy-hint">Kept on every record this copy writes.</div>
+                </div>
+              </Modal>
             )
           })()}
 
@@ -1181,8 +1490,10 @@ export default function EstimateClient({ lines, userId, target }: Props) {
                         ? ` (${[pending.updates > 0 ? `${pending.updates} updating a saved one` : '', pending.reopened > 0 ? `${pending.reopened} overturning a not-applicable decision` : ''].filter(Boolean).join(', ')})`
                         : ''}
                     </>}
-                    {pending.writes.length > 0 && pending.notApplicable.length > 0 && ' and '}
+                    {pending.writes.length > 0 && pending.notApplicable.length > 0 && ' · '}
                     {pending.notApplicable.length > 0 && <><strong>{pending.notApplicable.length}</strong> marked not applicable</>}
+                    {pending.removals.length > 0 && pending.writes.length + pending.notApplicable.length > 0 && ' · '}
+                    {pending.removals.length > 0 && <span className="est-savebar-rm"><strong>{pending.removals.length}</strong> removed</span>}
                     {' '}across <strong>{plural(pending.models, 'model')}</strong>
                     {/* The number to stop and look at: a bulk fill into undecided cells asserts the
                         work applies to those models, and saving creates each link. */}
@@ -1207,8 +1518,8 @@ export default function EstimateClient({ lines, userId, target }: Props) {
                 title="Kept on every record this save writes, so the reasoning is there when the figures are questioned"
               />
             )}
-            {/* Apply fills cells on screen; Save writes to the database. Set apart, and secondary,
-                so the two never read as a pair of equal buttons. */}
+            {/* Apply copy opens its own confirm-and-save dialog; Save estimates writes the typed
+                cells. Set apart, and secondary, so the two never read as a pair of equal buttons. */}
             <span className="est-savebar-apply">
               <button
                 type="button"
@@ -1217,8 +1528,8 @@ export default function EstimateClient({ lines, userId, target }: Props) {
                 title={!activeSource ? 'Choose a model to copy from, at the top'
                   : copyBlocked ? 'The ticked rows are in more than one job — bulk actions work within one job'
                     : !copyJob ? 'Choose the job to copy within, at the top'
-                      : `Fill empty cells from ${filteredProducts.find((x) => x.id === activeSource)?.model ?? ''}${factor != null && factor !== 1 ? ` × ${factor}` : ''} — not saved until Save estimates`}
-                onClick={copyColumn}
+                      : `Review copying ${filteredProducts.find((x) => x.id === activeSource)?.model ?? ''}${factor != null && factor !== 1 ? ` × ${factor}` : ''} into empty cells — nothing is saved until you confirm`}
+                onClick={openCopy}
               >
                 Apply copy
               </button>

@@ -4,7 +4,8 @@ import { unlinkOperationsFromModel } from './modelLinks'
 import { fetchLinksForOperations, linkOperationsToModels } from './modelOperations'
 import {
   TIME_FLAG_COLUMNS, currentForOperation, fetchOperationTimeModelLinks, isMeasuredCurrent,
-  addOperationTimeNote, operationProductKey, recordOperationTime, splitOperationTimeForModel, updateOperationTime,
+  PLACEHOLDER_OPERATOR_NAME, addOperationTimeNote, operationProductKey, recordOperationTime,
+  splitOperationTimeForModel, updateOperationTime,
   type TimeRow,
 } from './operationTimes'
 import { fetchAllChunked, READ_CHUNK, type RangeableQuery } from './supabaseRead'
@@ -28,6 +29,8 @@ import type { OperationTime, Product } from './types'
  *                                "this doesn't apply to this model" path — behind a guard that
  *                                refuses any pair with a measured time (markNotApplicable), then a
  *                                model_operation_exclusions row recording the decision.
+ *   REMOVING AN ESTIMATE         updateOperationTime setting is_hidden (removeEstimates) — the
+ *                                figure leaves the cell, the record and the link stay.
  *
  * ── Applicability is asserted here, not only read ──────────────────────────────────────────
  * On a line where each operation is linked to two or three models, a screen that only let you
@@ -51,6 +54,18 @@ export interface EstimateOperation { id: string; name: string; job_id: string }
 
 /** A note on the record behind a cell (operation_time_notes): what, who wrote it, when. */
 export interface EstimateCellNote { content: string; author: string | null; createdAt: string }
+
+/** The employee_id of the shared "Unassigned" operator — the row a time is stored against when
+ * nobody said who was timed (see resolvePlaceholderOperatorId). Read as "not recorded". */
+export const UNASSIGNED_EMPLOYEE_ID = '999999'
+
+/**
+ * Who and which van, for the record behind a cell's figure. Two different people:
+ *   operator   operator_id — WHO WAS TIMED, the person doing the work. null when not recorded:
+ *              operator_id null, or the Unassigned placeholder (employee_id 999999).
+ *   collector  collected_by — whoever ran the stopwatch (or, on an estimate, saved the figure).
+ */
+export interface EstimateCellRecord { operator: string | null; collector: string | null; chassis: string | null }
 
 /**
  * What one (operation, model) cell holds when the grid loads. Absent from the map = nothing
@@ -79,6 +94,9 @@ export interface EstimateGrid {
   /** Keyed operationProductKey: the notes on the record that IS the cell's figure (measured or
    * estimated), oldest first. Only cells with at least one note appear. */
   notes: Map<string, EstimateCellNote[]>
+  /** Keyed operationProductKey: operator / collector / chassis of the record that IS the cell's
+   * figure. Every cell with a figure appears, notes or not. */
+  records: Map<string, EstimateCellRecord>
 }
 
 interface GridTimeRow extends TimeRow { is_estimated: boolean; created_at: string }
@@ -103,7 +121,7 @@ export async function fetchEstimateGrid(supabase: SupabaseClient, jobIds: string
   )
   operations.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id))
   const opIds = operations.map((o) => o.id)
-  if (opIds.length === 0) return { operations, products: [], links: new Set(), cells: new Map(), exclusions: new Set(), measuredHistory: new Set(), notes: new Map() }
+  if (opIds.length === 0) return { operations, products: [], links: new Set(), cells: new Map(), exclusions: new Set(), measuredHistory: new Set(), notes: new Map(), records: new Map() }
 
   const modelOperations = await fetchLinksForOperations(supabase, opIds)
   const exclusionRows = await fetchAllChunked<{ operation_id: string; product_id: string }>(
@@ -179,6 +197,33 @@ export async function fetchEstimateGrid(supabase: SupabaseClient, jobIds: string
     notes.set(key, list.map((n) => ({ content: n.content, author: n.profiles?.full_name ?? null, createdAt: n.created_at })))
   }
 
+  // Who was timed and on which van — read for the cell's own record only, like the notes.
+  type WhoRow = {
+    id: string
+    operators: { full_name: string | null; employee_id: string | null } | null
+    collector: { full_name: string | null } | null
+    chassis: { chassisnumber: string | null } | null
+  }
+  const whoRows = await fetchAllChunked<WhoRow>(
+    recordIds, READ_CHUNK,
+    (chunk) => supabase.from('operation_times')
+      .select('id, operators ( full_name, employee_id ), collector:profiles!collected_by ( full_name ), chassis ( chassisnumber )')
+      .in('id', chunk).order('id') as unknown as RangeableQuery<WhoRow>,
+    { table: 'operation_times (operator, collector, chassis)' },
+  )
+  const whoById = new Map(whoRows.map((w) => [w.id, w]))
+  const records = new Map<string, EstimateCellRecord>()
+  for (const [key, t] of recordByPair) {
+    const w = whoById.get(t.id)
+    const op = w?.operators
+    const unassigned = !op || op.employee_id === UNASSIGNED_EMPLOYEE_ID || op.full_name === PLACEHOLDER_OPERATOR_NAME
+    records.set(key, {
+      operator: unassigned ? null : op.full_name?.trim() || null,
+      collector: w?.collector?.full_name?.trim() || null,
+      chassis: w?.chassis?.chassisnumber?.trim() || null,
+    })
+  }
+
   const productIds = [...new Set([
     ...modelOperations.map((mo) => mo.product_id),
     ...timeModels.map((tm) => tm.product_id),
@@ -190,6 +235,7 @@ export async function fetchEstimateGrid(supabase: SupabaseClient, jobIds: string
     exclusions: new Set(exclusionRows.map((r) => operationProductKey(r.operation_id, r.product_id))),
     measuredHistory: measuredPairsOf(times, timeModels),
     notes,
+    records,
   }
 }
 
@@ -326,6 +372,100 @@ async function clearExclusions(supabase: SupabaseClient, pairs: EstimatePair[]):
     for (const r of data ?? []) cleared.add(operationProductKey(r.operation_id as string, r.product_id as string))
   }
   return { failed: pairs.filter((p) => !cleared.has(operationProductKey(p.operationId, p.productId))), error }
+}
+
+/** One saved estimate to remove from a cell. `timeId` is the record the grid read as the cell's
+ * figure — re-read before anything is touched. */
+export interface EstimateRemoval extends EstimatePair { timeId: string }
+
+/**
+ * "This figure shouldn't be here" — takes a saved estimate out of its cell and leaves the cell an
+ * applying gap. Not the same as markNotApplicable: model_operations is NOT touched, so the work
+ * still applies to the model; it just has no figure any more. Nor are exclusions.
+ *
+ * NOTHING IS DELETED. The record is hidden (is_hidden = true) through updateOperationTime, the one
+ * updater of operation_times: countsTowardLabour drops it from every figure and coverage number,
+ * and it stays — links, notes and all — listed as hidden in the times drawer. A figure typed into
+ * the cell later is recorded as usual, as a new record beside the hidden one — a save never
+ * archives anything, and the hidden one stays hidden, so it is still not part of the figure.
+ *
+ * NEVER A MEASURED TIME. Two fresh reads, made here immediately before the write — the grid's own
+ * read only decides whether the control is drawn:
+ *   the record     refused unless it is still an estimate, and still the current one (a newer
+ *                  figure saved since the grid loaded is not what was marked).
+ *   the pair       refused if ANY measured record is linked to it — the same guard, through the
+ *                  same read, as markNotApplicable.
+ *
+ * A record that counts for other models too (nothing on this screen writes one, but the times
+ * drawer can relink) is not hidden whole — that would take its neighbours' figures with it.
+ * splitOperationTimeForModel peels this model off into its own record first, and THAT is hidden;
+ * the original stays exactly as it is for the others.
+ *
+ * RLS on operation_times is "update own": an estimate someone else saved comes back as a per-cell
+ * failure, read back by updateOperationTime rather than assumed.
+ */
+export async function removeEstimates(
+  supabase: SupabaseClient,
+  items: EstimateRemoval[],
+  userId: string,
+): Promise<{ removed: number; failures: (EstimatePair & { message: string })[] }> {
+  const failures: (EstimatePair & { message: string })[] = []
+  if (items.length === 0) return { removed: 0, failures }
+  type Fresh = { id: string; is_estimated: boolean; is_hidden: boolean; superseded_by: string | null }
+  const ids = [...new Set(items.map((i) => i.timeId))]
+  const fresh = await fetchAllChunked<Fresh>(
+    ids, READ_CHUNK,
+    (chunk) => supabase.from('operation_times').select('id, is_estimated, is_hidden, superseded_by').in('id', chunk)
+      .order('id') as unknown as RangeableQuery<Fresh>,
+    { table: 'operation_times' },
+  )
+  const byId = new Map(fresh.map((t) => [t.id, t]))
+  const measured = await fetchMeasuredPairs(supabase, items.map((i) => i.operationId))
+  const links = await fetchOperationTimeModelLinks(supabase, ids)
+  let removed = 0
+  for (const item of items) {
+    const pair = { operationId: item.operationId, productId: item.productId }
+    const t = byId.get(item.timeId)
+    if (measured.has(operationProductKey(item.operationId, item.productId))) {
+      failures.push({ ...pair, message: 'a measured time has been recorded against this model since the screen loaded — measured times are never touched here' })
+      continue
+    }
+    if (!t) { failures.push({ ...pair, message: 'that estimate no longer exists — reload to see what is there now' }); continue }
+    if (!t.is_estimated) {
+      failures.push({ ...pair, message: 'it is a measured time, and measured times are never touched from this screen' })
+      continue
+    }
+    // Already hidden (from another tab, say): the outcome asked for.
+    if (t.is_hidden) { removed += 1; continue }
+    if (t.superseded_by != null) {
+      failures.push({ ...pair, message: 'a newer figure has been saved for this cell since the screen loaded — reload and check it first' })
+      continue
+    }
+    const models = links.filter((l) => l.operation_time_id === item.timeId).map((l) => l.product_id)
+    // No longer linked to this model: the cell has no figure from it already.
+    if (!models.includes(item.productId)) { removed += 1; continue }
+    try {
+      let target = item.timeId
+      if (models.length > 1) {
+        const { data: original, error } = await supabase.from('operation_times').select('*').eq('id', item.timeId).single()
+        if (error || !original) throw new Error(error?.message ?? 'That estimate no longer exists')
+        const { created } = await splitOperationTimeForModel(supabase, {
+          original: original as OperationTime,
+          productId: item.productId,
+          totalMinutes: (original as OperationTime).total_minutes as number,
+          operatorId: (original as OperationTime).operator_id,
+          collectedBy: userId,
+          noteContents: [],
+        })
+        target = created.id
+      }
+      await updateOperationTime(supabase, target, { isHidden: true })
+      removed += 1
+    } catch (err) {
+      failures.push({ ...pair, message: err instanceof Error ? err.message : 'could not be removed' })
+    }
+  }
+  return { removed, failures }
 }
 
 /** One cell to write. `existing` is the estimate already there, when there is one. */
