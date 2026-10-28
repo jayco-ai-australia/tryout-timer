@@ -1,13 +1,14 @@
 'use client'
 
 import type { RangeableQuery } from '@/lib/supabaseRead'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useRouter } from 'next/navigation'
 import { createClient } from '@/lib/supabase/client'
 import {
   TIME_FLAG_COLUMNS, currentForOperation, jobCompleteness, onlyCountedTimes, operationProductKey,
   type JobCompleteness, type OperationTimeStat, type TimeExclusionFlags,
 } from '@/lib/operationTimes'
-import { computeCoverageCombos, type CoverageCombo } from '@/lib/coverage'
+import { computeCoverageCombos, coverageComboKey, estimateOnlyComboKeys, type CoverageCombo } from '@/lib/coverage'
 import { chunked, fetchAllChunked, fetchAllRows, logSupabaseError, READ_CHUNK } from '@/lib/supabaseRead'
 import { selectIn } from '@/lib/chunkedIn'
 import { feedTargetsForLine, loadLineSplit, modelsForLine, type LineSplit } from '@/lib/lines'
@@ -23,6 +24,7 @@ import { usePersistedFilter, usePersistedState } from '@/lib/useLocalStorage'
 import { ModelSeriesPicker } from '@/components/ModelLinker'
 import AreaChips from '@/components/AreaChips'
 import MatrixCellDrawer from './MatrixCellDrawer'
+import { groupProducts } from '@/lib/productGroups'
 import type { Product, ProductionLine, UserRole } from '@/lib/types'
 
 /**
@@ -70,6 +72,9 @@ interface MatrixCell {
   totalOps: number
   /** Whether the job applies to this model at all. False renders BLANK, never 0. */
   applies: boolean
+  /** How many of the timedOps have an ESTIMATED current record (/estimate). Any at all and the
+   * cell reads as estimated — a figure partly inferred is inferred. See Cell's background. */
+  estimatedOps: number
 }
 
 /** The labour-source filter, with the same three meanings /model-total's toggle has: it splits
@@ -150,10 +155,10 @@ const EMPTY: React.CSSProperties = { textAlign: 'center', color: 'var(--text-mut
 /**
  * How many columns go on one printed A3 sheet before the grid starts again on the next.
  *
- * A3 landscape is 420mm wide; 10mm margins leave 400mm, of which the model name takes 38mm and
- * the model total 16mm — 346mm for the data columns. Each data column has a hard 13mm floor in
+ * A3 landscape is 420mm wide; 10mm margins leave 400mm, of which the model name takes 44mm and
+ * the model total 16mm — 340mm for the data columns. Each data column has a hard 13mm floor in
  * the print CSS (.lm-print-th-job — the widest figure, "2514.7*", is 10.3mm, and the rest is
- * padding and a guaranteed gap), so 346 / 13 = 26 columns is the most one sheet holds legibly.
+ * padding and a guaranteed gap), so 340 / 13 = 26 columns is the most one sheet holds legibly.
  * Past that the grid splits into bands and each band says "sheet n of m across"; it is never
  * squeezed further.
  *
@@ -171,6 +176,9 @@ const EMPTY: React.CSSProperties = { textAlign: 'center', color: 'var(--text-mut
  */
 const PRINT_BAND_COLUMNS_JOB = 22
 const PRINT_BAND_COLUMNS_ROLLUP = 26
+
+// groupProducts — the type → series row grouping — lives in lib/productGroups so /estimate's
+// model columns break the range the same way these rows do.
 
 interface Props {
   lines: ProductionLine[]
@@ -191,7 +199,7 @@ interface JobRow { id: string; name: string; section_id: string | null; producti
 interface SectionRow { id: string; name: string; team_id: string | null; sort_order: number | null }
 interface OperationRow { id: string; job_id: string }
 interface PairRow { operation_id: string; product_id: string }
-interface TimeRow extends TimeExclusionFlags { id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null }
+interface TimeRow extends TimeExclusionFlags { id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null; is_estimated: boolean }
 interface TimeModelRow { operation_time_id: string; product_id: string }
 /** production_line_id is what SCOPES the Team filter. A team belongs to exactly one line (it is
  * NOT NULL on the table — see lib/types' Team), and without the column the picker could only
@@ -222,6 +230,9 @@ interface MatrixSource {
   stats: Record<string, OperationTimeStat>
   /** lib/coverage's (job, model) applicability + covered flags. */
   combos: CoverageCombo[]
+  /** The covered combos covered ONLY by estimates — lib/coverage's estimateOnlyComboKeys. The
+   * "of which N estimated" beside the coverage figure; never subtracted from it. */
+  estimateOnlyKeys: Set<string>
   teams: TeamRow[]
   /** One entry per model with at least one build still ahead of it — lib/schedule's answer,
    * not a second one. Absence from this map is what "no future builds" means. */
@@ -230,7 +241,7 @@ interface MatrixSource {
 
 const EMPTY_SOURCE: MatrixSource = {
   products: [], feedTargetIds: [], jobs: [], sections: [], operations: [], modelOperations: [],
-  operationTimes: [], operationTimeModels: [], stats: {}, combos: [], teams: [],
+  operationTimes: [], operationTimeModels: [], stats: {}, combos: [], estimateOnlyKeys: new Set(), teams: [],
   futureByProductId: new Map(),
 }
 
@@ -500,7 +511,7 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
         const operationTimes = await fetchAllChunked<TimeRow>(
           timeIds, READ_CHUNK,
           (chunk) => onlyCountedTimes(supabase
-            .from('operation_times').select(`id, operation_id, total_minutes, superseded_by, ${TIME_FLAG_COLUMNS}`)
+            .from('operation_times').select(`id, operation_id, total_minutes, superseded_by, is_estimated, ${TIME_FLAG_COLUMNS}`)
             .in('id', chunk).is('superseded_by', null))
             .order('id') as unknown as RangeableQuery<TimeRow>,
           { table: 'operation_times' },
@@ -606,11 +617,14 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
           operationTimes,
           operationTimeModels,
         })
+        // Alongside coverage, not instead of it: which covered combos would be gaps again
+        // without the estimates. Same rows, same countsTowardLabour underneath.
+        const estimateOnlyKeys = estimateOnlyComboKeys(combos, { operations, operationTimes, operationTimeModels })
 
         if (!isCurrent()) return
         setSource({
           products, feedTargetIds, jobs, sections, operations, modelOperations,
-          operationTimes, operationTimeModels, stats, combos, teams,
+          operationTimes, operationTimeModels, stats, combos, estimateOnlyKeys, teams,
           futureByProductId: future.byProductId,
         })
         loadedLineRef.current = lineId
@@ -956,12 +970,16 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
   const cells = useMemo(() => {
     const jobIdByOp = new Map(source.operations.map((o) => [o.id, o.job_id]))
 
-    interface Acc { minutes: number; timed: Set<string>; required: Set<string> }
+    // Which current records are estimates — asked of the record the shared helper PICKED
+    // (stat.currentId), never decided here, so the colour describes the very figure in the cell.
+    const estimatedTimeIds = new Set(source.operationTimes.filter((t) => t.is_estimated).map((t) => t.id))
+
+    interface Acc { minutes: number; timed: Set<string>; required: Set<string>; estimated: number }
     const acc = new Map<string, Acc>()
     const get = (jobId: string, productId: string): Acc => {
       const key = `${jobId}:${productId}`
       let a = acc.get(key)
-      if (!a) { a = { minutes: 0, timed: new Set(), required: new Set() }; acc.set(key, a) }
+      if (!a) { a = { minutes: 0, timed: new Set(), required: new Set(), estimated: 0 }; acc.set(key, a) }
       return a
     }
 
@@ -996,6 +1014,7 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
       if (a.timed.has(operationId)) continue
       a.timed.add(operationId)
       a.minutes += stat.minutes
+      if (estimatedTimeIds.has(stat.currentId)) a.estimated += 1
     }
 
     // Applicability comes from the shared combos, not from `required.size` — same answer today,
@@ -1015,10 +1034,11 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
         // those minutes in its total, so the cell has to show them rather than print a blank
         // over a number that is in the row total beside it.
         applies: appliesKeys.has(key) || a.timed.size > 0,
+        estimatedOps: a.estimated,
       })
     }
     return out
-  }, [source.operations, source.modelOperations, source.stats, source.combos, timedPairs])
+  }, [source.operations, source.modelOperations, source.operationTimes, source.stats, source.combos, timedPairs])
 
   /**
    * ── The area chips ────────────────────────────────────────────────────────────────────
@@ -1268,6 +1288,7 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
         let timedOps = 0
         let totalOps = 0
         let applies = false
+        let estimatedOps = 0
         for (const jobId of col.jobIds) {
           const cell = cells.get(`${jobId}:${p.id}`)
           if (!cell || !cell.applies) continue
@@ -1275,8 +1296,9 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
           minutes += cell.minutes
           timedOps += cell.timedOps
           totalOps += cell.totalOps
+          estimatedOps += cell.estimatedOps
         }
-        if (applies) out.set(`${col.key}:${p.id}`, { minutes, timedOps, totalOps, applies })
+        if (applies) out.set(`${col.key}:${p.id}`, { minutes, timedOps, totalOps, applies, estimatedOps })
       }
     }
     return out
@@ -1357,6 +1379,19 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
     [hierarchy],
   )
 
+  /**
+   * An untimed cell is where a gap gets noticed, so its click goes to /estimate with the cell's
+   * job and model already chosen — the page resolves the section (and line) from the job, so the
+   * URL can't name a section the job isn't in. At section and team grain the cell is several
+   * jobs, every one untimed for this model; the first that applies, in column order, is opened.
+   */
+  const router = useRouter()
+  const openEstimate = useCallback((col: MatrixColumn, productId: string) => {
+    const jobId = col.jobIds.find((id) => cells.get(`${id}:${productId}`)?.applies)
+    if (!jobId) return
+    router.push(`/estimate?job=${encodeURIComponent(jobId)}&model=${encodeURIComponent(productId)}`)
+  }, [cells, router])
+
   const grainNoun = GRAINS.find((g) => g.key === grain)?.noun ?? 'column'
 
   /**
@@ -1401,18 +1436,41 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
     const productIds = new Set(visibleProducts.map((p) => p.id))
     let required = 0
     let covered = 0
+    let estimated = 0
     for (const c of source.combos) {
       if (!jobIds.has(c.jobId) || !productIds.has(c.productId)) continue
       required += 1
       if (c.covered) covered += 1
+      if (source.estimateOnlyKeys.has(coverageComboKey(c.jobId, c.productId))) estimated += 1
     }
-    return { required, covered }
-  }, [source.combos, visibleJobs, visibleProducts])
+    return { required, covered, estimated }
+  }, [source.combos, source.estimateOnlyKeys, visibleJobs, visibleProducts])
 
   const gridTotal = useMemo(
     () => visibleProducts.reduce((sum, p) => sum + (rowTotals.get(p.id)?.minutes ?? 0), 0),
     [visibleProducts, rowTotals],
   )
+
+  /** The same rows, under type and series headings — display only; see groupProducts. */
+  const productGroups = useMemo(() => groupProducts(visibleProducts), [visibleProducts])
+
+  /**
+   * The thead's rendered height, as --lm-head-h on the table, so the group headings can stick
+   * directly beneath it. Measured rather than summed from constants: the column-heading row is
+   * as tall as its longest rotated label, which the CSS caps but does not fix.
+   */
+  const [headHeight, setHeadHeight] = useState(0)
+  const headObserver = useRef<ResizeObserver | null>(null)
+  // A callback ref, because the table mounts and unmounts with the loading and empty states.
+  // ResizeObserver reports once on observe, so that is the first measurement too.
+  const theadRef = useCallback((el: HTMLTableSectionElement | null) => {
+    headObserver.current?.disconnect()
+    headObserver.current = null
+    if (!el) return
+    const ro = new ResizeObserver(() => setHeadHeight(el.offsetHeight))
+    ro.observe(el)
+    headObserver.current = ro
+  }, [])
 
   /** The filter state as a sentence, for the printed sheet. Names "All labour" and "All teams"
    * explicitly rather than staying silent — a sheet with no scope line reads as unfiltered
@@ -1907,6 +1965,11 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
               <span>{filterPhrase.schedule}</span>
               <span>
                 coverage <strong>{coverage.covered} / {coverage.required}</strong> job×model cells timed
+                {coverage.estimated > 0 && (
+                  <span title="Covered only by estimates from the Estimate screen — they would be gaps again without them. Included in the coverage figure, not added to it.">
+                    , of which <strong>{coverage.estimated}</strong> estimated
+                  </span>
+                )}
               </span>
               <span>
                 <strong>{fmtMinutes(gridTotal)}m</strong> ({fmtHours(gridTotal)}h) across the grid
@@ -1931,8 +1994,11 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
                 relative to the nearest scrolling ancestor, so both axes have to scroll HERE and
                 not on the window, or the model column scrolls away with everything else. */}
             <div className="lm-scroll">
-              <table className={`lm-table${showAreaHeader ? ' lm-has-area' : ''}${showParentHeader ? ' lm-has-parent' : ''}`}>
-                <thead>
+              <table
+                className={`lm-table${showAreaHeader ? ' lm-has-area' : ''}${showParentHeader ? ' lm-has-parent' : ''}`}
+                style={{ '--lm-head-h': `${headHeight}px` } as React.CSSProperties}
+              >
+                <thead ref={theadRef}>
                   {/* Up to three rows: area → parent → column. Model and Total sit in whichever
                       row comes first and span them all, so they keep their corners; each row
                       below sticks BENEATH the ones above it (the lm-has-* classes on the table
@@ -1978,39 +2044,66 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
                   </tr>
                 </thead>
                 <tbody>
-                  {visibleProducts.map((p) => {
-                    const total = rowTotals.get(p.id) ?? NO_ROW_TOTAL
-                    return (
-                      <tr key={p.id}>
-                        {/* products.model, never product_code — see visibleProducts. */}
-                        <th scope="row" className="lm-td-model">
-                          <ModelLabel product={p} schedule={source.futureByProductId.get(p.id)} />
+                  {/* Type → series headings between the rows, each one a single cell across the
+                      whole grid so it reads as a divider. Sticky in both directions: the cell
+                      sticks beneath the thead (--lm-head-h) while its label sticks to the left
+                      edge — see .lm-grp in globals.css. */}
+                  {productGroups.map((g) => (
+                    <Fragment key={`t|${g.key}`}>
+                      <tr className="lm-grp-row">
+                        <th scope="colgroup" colSpan={columns.length + 2} className="lm-grp lm-grp-type">
+                          <span className="lm-grp-label">
+                            {g.label}<span className="lm-grp-count">{plural(g.count, 'model')}</span>
+                          </span>
                         </th>
-                        {columns.map((col) => (
-                          <Cell
-                            key={col.key}
-                            cell={columnCells.get(`${col.key}:${p.id}`)}
-                            columnLabel={col.label}
-                            jobCount={col.jobIds.length}
-                            grain={grain}
-                            model={p.model}
-                            // EVERY cell opens, including a blank one: "this doesn't apply" is a
-                            // state the drawer exists to change, so the cells with nothing in them
-                            // are the ones most worth clicking.
-                            onOpen={() => setCellTarget({ columnKey: col.key, productId: p.id })}
-                          />
-                        ))}
-                        {total.applies ? (
-                          <td className={`lm-td-total${total.incomplete ? ' lm-incomplete' : ''}`}>
-                            {fmtMinutes(total.minutes)}{total.incomplete ? '*' : ''}
-                          </td>
-                        ) : (
-                          // Nothing on this row applies, so there is no total to state — see RowTotal.
-                          <td className="lm-td-total lm-td-na" title={`Nothing in these columns applies to ${p.model}`} />
-                        )}
                       </tr>
-                    )
-                  })}
+                      {g.series.map((s) => (
+                        <Fragment key={`s|${s.key}`}>
+                          <tr className="lm-grp-row">
+                            <th scope="colgroup" colSpan={columns.length + 2} className="lm-grp lm-grp-series">
+                              <span className="lm-grp-label">
+                                {s.label}<span className="lm-grp-count">{plural(s.products.length, 'model')}</span>
+                              </span>
+                            </th>
+                          </tr>
+                          {s.products.map((p) => {
+                            const total = rowTotals.get(p.id) ?? NO_ROW_TOTAL
+                            return (
+                              <tr key={p.id}>
+                                {/* products.model, never product_code — see visibleProducts. */}
+                                <th scope="row" className="lm-td-model">
+                                  <ModelLabel product={p} schedule={source.futureByProductId.get(p.id)} />
+                                </th>
+                                {columns.map((col) => (
+                                  <Cell
+                                    key={col.key}
+                                    cell={columnCells.get(`${col.key}:${p.id}`)}
+                                    columnLabel={col.label}
+                                    jobCount={col.jobIds.length}
+                                    grain={grain}
+                                    model={p.model}
+                                    // EVERY cell opens, including a blank one: "this doesn't apply" is a
+                                    // state the drawer exists to change, so the cells with nothing in them
+                                    // are the ones most worth clicking.
+                                    onOpen={() => setCellTarget({ columnKey: col.key, productId: p.id })}
+                                    onEstimate={() => openEstimate(col, p.id)}
+                                  />
+                                ))}
+                                {total.applies ? (
+                                  <td className={`lm-td-total${total.incomplete ? ' lm-incomplete' : ''}`}>
+                                    {fmtMinutes(total.minutes)}{total.incomplete ? '*' : ''}
+                                  </td>
+                                ) : (
+                                  // Nothing on this row applies, so there is no total to state — see RowTotal.
+                                  <td className="lm-td-total lm-td-na" title={`Nothing in these columns applies to ${p.model}`} />
+                                )}
+                              </tr>
+                            )
+                          })}
+                        </Fragment>
+                      ))}
+                    </Fragment>
+                  ))}
                 </tbody>
               </table>
             </div>
@@ -2089,13 +2182,17 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
             <p className="lm-print-meta">
               {plural(visibleProducts.length, 'model')} × {plural(columns.length, grainNoun)}
               {' · '}coverage <strong>{coverage.covered} / {coverage.required}</strong> job×model cells timed
+              {coverage.estimated > 0 && <>, of which <strong>{coverage.estimated}</strong> estimated</>}
               {' · '}<strong>{fmtMinutes(gridTotal)}m</strong> ({fmtHours(gridTotal)}h) across the grid
               {printedAt ? ` · printed ${printedAt}` : ''}
             </p>
             <p className="lm-print-key">
               Blank = nothing in this column applies to this model · <span className="lm-print-key-none">0.0 in bold red</span> = applies,
               nothing timed beneath it · <span className="lm-print-key-partial">underlined*</span> = partly timed, the figure is
-              real but incomplete · <span className="lm-print-key-timed">green</span> = every applicable job beneath is timed · a figure is the
+              real but incomplete · <span className="lm-print-key-timed">green</span> = every applicable job beneath is timed ·{' '}
+              <span className="lm-print-key-bg lm-src-measured">shaded green</span> = the figure is measured ·{' '}
+              <span className="lm-print-key-bg lm-src-estimated">shaded orange</span> = the figure is estimated, or partly
+              estimated — a cell mixing both counts as estimated · a figure is the
               sum of that job’s operations’ current recorded times, and superseded runs are kept
               but never counted. The number in brackets beside a model is how many builds it has
               booked on line from {fmtScheduleDate(todayIsoDate())}; a model with none has no
@@ -2106,6 +2203,44 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
           {printBands.map((band, bandIndex) => {
             const from = bandIndex * printBandSize + 1
             const to = from + band.length - 1
+            const colgroup = (
+              <colgroup>
+                <col className="lm-print-col-model" />
+                {band.map((col) => <col key={col.key} className="lm-print-col-job" />)}
+                <col className="lm-print-col-total" />
+              </colgroup>
+            )
+            const printRow = (p: Product) => {
+              const total = rowTotals.get(p.id) ?? NO_ROW_TOTAL
+              return (
+                <tr key={p.id}>
+                  <th scope="row" className="lm-print-td-model">
+                    <ModelLabel product={p} schedule={source.futureByProductId.get(p.id)} forPrint />
+                  </th>
+                  {band.map((col) => (
+                    <Cell
+                      key={col.key}
+                      cell={columnCells.get(`${col.key}:${p.id}`)}
+                      columnLabel={col.label}
+                      jobCount={col.jobIds.length}
+                      grain={grain}
+                      model={p.model}
+                      forPrint
+                    />
+                  ))}
+                  {/* The model's total across EVERY visible job, repeated on each band
+                      rather than recomputed for the band — it is the figure /model-total
+                      would show for this model under this filter, and a per-band subtotal
+                      would be a number that exists nowhere else in the app. The heading
+                      says "Model total" for exactly that reason. */}
+                  {/* Blank when nothing on the row applies — blank on paper means blank,
+                      the same as a cell. See RowTotal. */}
+                  <td className={`lm-print-td-total${total.incomplete ? ' lm-incomplete' : ''}`}>
+                    {total.applies ? `${fmtMinutes(total.minutes)}${total.incomplete ? '*' : ''}` : ''}
+                  </td>
+                </tr>
+              )
+            }
             return (
               <section key={from} className="lm-print-band">
                 {/* Every band says which columns it holds, so a sheet on its own can never be
@@ -2119,85 +2254,90 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
                   {filterPhrase.subset ? ` · ${filterPhrase.models}` : ''}
                   {futureOnly ? ' · future builds only' : ''}
                 </p>
-                <table className="lm-print-table">
-                  {/* Explicit columns. Under table-layout: fixed the widths are read off the
-                      FIRST row, and when that row is the area headings its cells are colspans
-                      with no width of their own — the 13mm floor would be lost exactly when the
-                      area row is on. A colgroup outranks any row. */}
-                  <colgroup>
-                    <col className="lm-print-col-model" />
-                    {band.map((col) => <col key={col.key} className="lm-print-col-job" />)}
-                    <col className="lm-print-col-total" />
-                  </colgroup>
-                  {/* display: table-header-group in the print CSS — a band with 101 models runs
-                      down several sheets, and the job names come back at the top of each. */}
-                  <thead>
-                    {showAreaHeader && (
-                      <tr>
-                        <th className="lm-print-th-model" rowSpan={headerRows}>Model</th>
-                        {areaSpansOf(band).map((a) => (
-                          <th key={a.areaId} className="lm-print-th-area" colSpan={a.span}>{a.name}</th>
-                        ))}
-                        <th className="lm-print-th-total" rowSpan={headerRows}>Model total</th>
-                      </tr>
-                    )}
-                    {/* Spans worked out per band, like the area row's — a section or team cut by
-                        the band boundary is headed again on the next sheet. */}
-                    {showParentHeader && (
-                      <tr>
-                        {!showAreaHeader && <th className="lm-print-th-model" rowSpan={headerRows}>Model</th>}
-                        {parentSpansOf(band).map((s, i) => (
-                          <th key={`${i}|${s.key}`} className="lm-print-th-parent" colSpan={s.span}>
-                            <span className="lm-print-th-parent-text">{s.label}</span>
-                          </th>
-                        ))}
-                        {!showAreaHeader && <th className="lm-print-th-total" rowSpan={headerRows}>Model total</th>}
-                      </tr>
-                    )}
-                    <tr>
-                      {headerRows === 1 && <th className="lm-print-th-model">Model</th>}
-                      {band.map((col) => (
-                        <th key={col.key} className="lm-print-th-job">
-                          <span className="lm-print-th-job-text">{col.label}</span>
-                        </th>
-                      ))}
-                      {headerRows === 1 && <th className="lm-print-th-total">Model total</th>}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {visibleProducts.map((p) => {
-                      const total = rowTotals.get(p.id) ?? NO_ROW_TOTAL
-                      return (
-                        <tr key={p.id}>
-                          <th scope="row" className="lm-print-td-model">
-                            <ModelLabel product={p} schedule={source.futureByProductId.get(p.id)} forPrint />
-                          </th>
-                          {band.map((col) => (
-                            <Cell
-                              key={col.key}
-                              cell={columnCells.get(`${col.key}:${p.id}`)}
-                              columnLabel={col.label}
-                              jobCount={col.jobIds.length}
-                              grain={grain}
-                              model={p.model}
-                              forPrint
-                            />
+                {/* ONE TABLE PER PRODUCT TYPE, each starting a fresh sheet (.lm-print-type in
+                    globals.css) — except the first in the band, which follows the band heading
+                    on the band's opening sheet, so no sheet is left blank.
+
+                    The job names AND the type heading are this table's thead, so in Chromium
+                    both come back at the top of every sheet the type runs onto. Safari never
+                    repeats a thead on paper, but because each type starts its own sheet, the
+                    type's first sheet at least always opens with its job names and its heading,
+                    and a type heading can never be stranded at the foot of a sheet.
+
+                    Each series is a NESTED table inside it whose thead is the series heading — a
+                    series broken by a page resumes (in Chromium) under the job names, its type and
+                    its series. Every nested table repeats the band's colgroup and is laid out
+                    fixed at 100%, so the columns line up exactly with the headings above them. */}
+                {productGroups.map((g) => (
+                  <table key={`t|${g.key}`} className="lm-print-table lm-print-type">
+                    {/* Explicit columns. Under table-layout: fixed the widths are read off the
+                        FIRST row, and when that row is the area headings its cells are colspans
+                        with no width of their own — the 13mm floor would be lost exactly when the
+                        area row is on. A colgroup outranks any row. */}
+                    {colgroup}
+                    {/* display: table-header-group in the print CSS — a type with 90 models runs
+                        down several sheets, and the job names come back at the top of each. */}
+                    <thead>
+                      {showAreaHeader && (
+                        <tr>
+                          <th className="lm-print-th-model" rowSpan={headerRows}>Model</th>
+                          {areaSpansOf(band).map((a) => (
+                            <th key={a.areaId} className="lm-print-th-area" colSpan={a.span}>{a.name}</th>
                           ))}
-                          {/* The model's total across EVERY visible job, repeated on each band
-                              rather than recomputed for the band — it is the figure /model-total
-                              would show for this model under this filter, and a per-band subtotal
-                              would be a number that exists nowhere else in the app. The heading
-                              says "Model total" for exactly that reason. */}
-                          {/* Blank when nothing on the row applies — blank on paper means blank,
-                              the same as a cell. See RowTotal. */}
-                          <td className={`lm-print-td-total${total.incomplete ? ' lm-incomplete' : ''}`}>
-                            {total.applies ? `${fmtMinutes(total.minutes)}${total.incomplete ? '*' : ''}` : ''}
+                          <th className="lm-print-th-total" rowSpan={headerRows}>Model total</th>
+                        </tr>
+                      )}
+                      {/* Spans worked out per band, like the area row's — a section or team cut by
+                          the band boundary is headed again on the next sheet. */}
+                      {showParentHeader && (
+                        <tr>
+                          {!showAreaHeader && <th className="lm-print-th-model" rowSpan={headerRows}>Model</th>}
+                          {parentSpansOf(band).map((s, i) => (
+                            <th key={`${i}|${s.key}`} className="lm-print-th-parent" colSpan={s.span}>
+                              <span className="lm-print-th-parent-text">{s.label}</span>
+                            </th>
+                          ))}
+                          {!showAreaHeader && <th className="lm-print-th-total" rowSpan={headerRows}>Model total</th>}
+                        </tr>
+                      )}
+                      <tr>
+                        {headerRows === 1 && <th className="lm-print-th-model">Model</th>}
+                        {band.map((col) => (
+                          <th key={col.key} className="lm-print-th-job">
+                            <span className="lm-print-th-job-text">{col.label}</span>
+                          </th>
+                        ))}
+                        {headerRows === 1 && <th className="lm-print-th-total">Model total</th>}
+                      </tr>
+                      <tr>
+                        <th colSpan={band.length + 2} className="lm-print-grp lm-print-grp-type">
+                          {g.label}<span className="lm-print-grp-count">{plural(g.count, 'model')}</span>
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {g.series.map((s) => (
+                        <tr key={`s|${s.key}`} className="lm-print-nest-row">
+                          <td colSpan={band.length + 2} className="lm-print-nest-cell">
+                            <table className="lm-print-table lm-print-nest">
+                              {colgroup}
+                              <thead>
+                                <tr>
+                                  <th colSpan={band.length + 2} className="lm-print-grp lm-print-grp-series">
+                                    {s.label}<span className="lm-print-grp-count">{plural(s.products.length, 'model')}</span>
+                                  </th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {s.products.map(printRow)}
+                              </tbody>
+                            </table>
                           </td>
                         </tr>
-                      )
-                    })}
-                  </tbody>
-                </table>
+                      ))}
+                    </tbody>
+                  </table>
+                ))}
               </section>
             )
           })}
@@ -2216,7 +2356,7 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
  * mono office printer it lands as a mid-grey LIGHTER than the black around it. Bold is what
  * survives that, and it is why the red is never the only cue.
  */
-function Cell({ cell, columnLabel, jobCount, grain, model, onOpen, forPrint = false }: {
+function Cell({ cell, columnLabel, jobCount, grain, model, onOpen, onEstimate, forPrint = false }: {
   cell: MatrixCell | undefined
   columnLabel: string
   /** How many visible jobs the column covers — 1 at job grain. Only used in the tooltip, to say
@@ -2227,6 +2367,9 @@ function Cell({ cell, columnLabel, jobCount, grain, model, onOpen, forPrint = fa
   /** Open the cell drawer. Absent on the printed sheet, which is paper — the `forPrint` copy
    * renders the same figures with no interaction at all. */
   onOpen?: () => void
+  /** Where an UNTIMED cell's click goes instead: /estimate, with this cell's job and model
+   * selected. That is where the gap gets filled; every other cell still opens the drawer. */
+  onEstimate?: () => void
   forPrint?: boolean
 }) {
   const base = forPrint ? 'lm-print-td' : 'lm-td'
@@ -2234,7 +2377,8 @@ function Cell({ cell, columnLabel, jobCount, grain, model, onOpen, forPrint = fa
   // The cell is a control on screen and a figure on paper. role/tabIndex rather than a <button>
   // inside the <td>: a button would need its own box model in a 13mm-wide cell and would fight the
   // sticky column's overflow, and the whole cell is the target anyway.
-  const open = forPrint ? undefined : onOpen
+  const untimed = !!cell && cell.applies && cell.timedOps === 0
+  const open = forPrint ? undefined : (untimed && onEstimate ? onEstimate : onOpen)
   const interactive = open
     ? {
       onClick: open,
@@ -2262,12 +2406,22 @@ function Cell({ cell, columnLabel, jobCount, grain, model, onOpen, forPrint = fa
   // The SAME rule at every grain — at job grain the counts are the job's operations, at coarser
   // grains they are those counts summed. See columnCells for why summing them is sufficient.
   const state: JobCompleteness = jobCompleteness(cell.timedOps, cell.totalOps)
-  const cls = ` ${base}-${state === 'none' ? 'none' : state === 'partial' ? 'partial' : 'timed'}`
+  // WHERE the figure came from, as a background — on top of, never instead of, the text colour
+  // and underline above. Measured only if every timed operation beneath is measured; one estimate
+  // anywhere and the figure is partly inferred, so it reads as estimated. An untimed cell has no
+  // figure to source and gets no background, which is what keeps the red 0.0 on white.
+  const source = cell.timedOps === 0 ? '' : cell.estimatedOps > 0 ? ' lm-src-estimated' : ' lm-src-measured'
+  const cls = ` ${base}-${state === 'none' ? 'none' : state === 'partial' ? 'partial' : 'timed'}${source}`
+  const sourceNote = cell.timedOps === 0 ? ''
+    : cell.estimatedOps === 0 ? ' · measured'
+      : cell.estimatedOps === cell.timedOps ? ' · estimated'
+        : ` · ${cell.estimatedOps} of ${cell.timedOps} timed operations estimated, so the figure counts as estimated`
   const title = forPrint ? undefined
     : (state === 'none' ? `${scope} · ${model} — applies, nothing timed yet (${plural(cell.totalOps, 'operation')})`
       : state === 'partial' ? `${scope} · ${model} — ${cell.timedOps} of ${cell.totalOps} operations timed; the figure is incomplete`
         : `${scope} · ${model} — ${plural(cell.totalOps, 'operation')}, all timed`)
-      + ' · click to open'
+      + sourceNote
+      + (untimed && onEstimate ? ' · click to estimate it from measured models' : ' · click to open')
 
   return (
     <td className={`${base}${cls}${open ? ' lm-td-open' : ''}`} title={title} {...interactive}>
@@ -2323,6 +2477,9 @@ function Legend() {
       <span className="lm-legend-item"><span className="lm-td-none lm-legend-fig">0.0</span> Applies, nothing timed</span>
       <span className="lm-legend-item"><span className="lm-td-partial lm-legend-fig">142.5*</span> Partly timed — figure incomplete</span>
       <span className="lm-legend-item"><span className="lm-td-timed lm-legend-fig">142.5</span> Fully timed</span>
+      <span className="lm-legend-sep" aria-hidden />
+      <span className="lm-legend-item"><span className="lm-legend-fig lm-src-measured">142.5</span> Measured</span>
+      <span className="lm-legend-item"><span className="lm-legend-fig lm-src-estimated">142.5</span> Estimated — or a mix of measured and estimated, which counts as estimated</span>
     </div>
   )
 }

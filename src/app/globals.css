@@ -3097,7 +3097,7 @@ body {
 .lm-table th, .lm-table td { border-right: 1px solid #f0f1f2; border-bottom: 1px solid #f0f1f2; }
 
 .lm-table thead th {
-  position: sticky; top: 0; z-index: 2;
+  position: sticky; top: 0; z-index: 3;
   background: var(--surface);
   border-bottom: 1.5px solid var(--border);
   font-size: 11px; font-weight: 700; color: var(--text-mid);
@@ -3220,10 +3220,10 @@ body {
 .lm-table.lm-has-parent { --lm-parent-h: 26px; }
 .lm-table thead tr.lm-th-row-parent th.lm-th-parent { top: var(--lm-area-h); }
 .lm-table thead tr.lm-th-row-cols th.lm-th-job { top: calc(var(--lm-area-h) + var(--lm-parent-h)); }
-/* Qualified to outrank `.lm-table thead th` (z-index 2, text-align left). As bare classes these
+/* Qualified to outrank `.lm-table thead th` (z-index 3, text-align left). As bare classes these
    lost to it: the corners sat at the same level as every other heading, and the headings that
    come later in the markup slid over the top of "Model" on a sideways scroll. */
-.lm-table thead th.lm-th-corner, .lm-table thead th.lm-th-total { z-index: 3; }
+.lm-table thead th.lm-th-corner, .lm-table thead th.lm-th-total { z-index: 4; }
 .lm-th-corner { left: 0; }
 .lm-table thead th.lm-th-total { right: 0; text-align: center; }
 .lm-th-corner, .lm-td-model { position: sticky; left: 0; width: 210px; min-width: 210px; }
@@ -3234,7 +3234,8 @@ body {
   z-index: 1;
   background: var(--surface);
   border-right: 1.5px solid var(--border);
-  padding: 5px 12px;
+  /* 32px on the left: indented under its series heading (22px), which is under its type (12px). */
+  padding: 5px 12px 5px 32px;
   text-align: left; font-weight: 600; font-size: 12px; color: var(--text);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 210px;
 }
@@ -3245,6 +3246,52 @@ body {
   padding: 5px 12px;
   /* The row total follows the same rule as the cells feeding it — see .lm-td. */
   text-align: center; font-weight: 700; color: var(--blue);
+}
+
+/* ── Type → series group headings ──────────────────────────────────────────────────────
+   One cell across the whole grid per heading, so it reads as a divider, never as a data row.
+
+   Vertically the cell sticks directly beneath the thead: --lm-head-h is the thead's MEASURED
+   height, set on the table by the component (the column row is as tall as its longest rotated
+   label). The series heading sticks beneath the type heading, so the type's height is fixed here
+   and the two must change together. Later headings sit later in the DOM at the same z-index, so
+   the next group's heading slides over the stuck one and takes its place.
+
+   z-index 2: above the sticky model and total cells (1) that scroll under it, below the thead (3)
+   and its corners (4) that it scrolls under. Horizontally the CELL scrolls with the grid but its
+   LABEL is sticky at left: 0, so the name stays on screen however far right the grid is. */
+.lm-table { --lm-grp-type-h: 30px; --lm-grp-series-h: 26px; }
+.lm-table tbody th.lm-grp {
+  position: sticky; z-index: 2;
+  padding: 0; text-align: left; white-space: nowrap;
+  box-sizing: border-box;
+}
+.lm-table tbody th.lm-grp-type {
+  top: var(--lm-head-h, 0px);
+  height: var(--lm-grp-type-h);
+  background: var(--blue-light);
+  border-top: 2px solid var(--blue);
+  border-bottom: 1px solid var(--border);
+  font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--text-mid);
+}
+.lm-table tbody th.lm-grp-series {
+  top: calc(var(--lm-head-h, 0px) + var(--lm-grp-type-h));
+  height: var(--lm-grp-series-h);
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px; font-weight: 600;
+  color: var(--text-mid);
+}
+.lm-grp-label {
+  position: sticky; left: 0;
+  display: inline-flex; align-items: baseline; gap: 8px;
+}
+.lm-grp-type .lm-grp-label { padding: 0 12px; }
+.lm-grp-series .lm-grp-label { padding: 0 12px 0 22px; }
+.lm-grp-count {
+  font-size: 11px; font-weight: 500; letter-spacing: 0; text-transform: none;
+  color: var(--text-muted);
 }
 
 /* 64px: the floor at which a one-word parent label over a single column fits unbroken. Never
@@ -3258,6 +3305,15 @@ body {
    under", not "where is the decimal point". */
 .lm-td { padding: 5px 6px; text-align: center; color: var(--text); }
 .lm-table tbody tr:hover .lm-td, .lm-table tbody tr:hover .lm-td-model { background: #fbfcfd; }
+
+/* Where the figure came from — a BACKGROUND under the existing text cues (colour, weight, the
+   partial underline), never a replacement for them. Light green: every timed operation beneath is
+   measured. Light orange: at least one is an estimate from /estimate — a figure partly inferred is
+   inferred, so a mixed cell is orange. An untimed 0.0 has no figure to source and stays on white,
+   so its red is never sat on a tint. The hover rule above would otherwise wipe these out. */
+.lm-src-measured, .lm-table tbody tr:hover .lm-td.lm-src-measured { background: var(--measured-bg); }
+.lm-src-estimated, .lm-table tbody tr:hover .lm-td.lm-src-estimated { background: var(--estimated-bg); }
+.lm-legend-sep { width: 1px; height: 16px; background: var(--border); }
 
 /* ── The three marked states ─────────────────────────────────────────────────────────────
    BLANK is the job not applying to this model — genuinely empty, never 0, because 0 is a claim
@@ -3388,11 +3444,12 @@ body {
     vertical-align: bottom;
   }
 
-  /* Sized to the codes, which are one fixed shape: "88.88-8.OB.DY-MY26 (888)" — the widest form,
-     every digit an 8 — measures 34.2mm at 7pt bold, plus 1.4mm of padding. 38mm leaves ~2mm
-     over. See PRINT_BAND_COLUMNS_ROLLUP for what the rest of the width buys. */
+  /* Sized to the codes. The longest in use, "24.75-4.48V.OB.4T.SL-MY26 (88)", measures ~38mm at
+     7pt bold; add the 2.5mm indent under the series heading and 0.7mm of right padding and 44mm
+     leaves ~2mm over. (38mm was sized to "88.88-8.OB.DY-MY26" and already clipped the 48V/4T
+     codes.) 44mm still leaves 26 × 13mm data columns — see PRINT_BAND_COLUMNS_ROLLUP. */
   .lm-print-th-model, .lm-print-td-model {
-    width: 38mm;
+    width: 44mm;
     text-align: left;
     font-weight: 700;
     border-right: 0.75pt solid #444;
@@ -3401,7 +3458,7 @@ body {
   .lm-print-td-model { font-size: 7pt; }
   /* The same three widths, on the columns themselves — see the <colgroup> note in the component
      for why the cells' own widths stop being enough once the area row is the first row. */
-  .lm-print-col-model { width: 38mm; }
+  .lm-print-col-model { width: 44mm; }
   .lm-print-col-job { width: 13mm; }
   .lm-print-col-total { width: 16mm; }
   /* The area heading over its columns. A rule down its left edge is what separates one area's
@@ -3488,6 +3545,56 @@ body {
      cell renders, and no colour at all. */
   .lm-print-td-partial { text-decoration: underline; }
   .lm-print-table .lm-incomplete { text-decoration: underline; }
+  /* The source backgrounds reach the paper because .lm-print sets print-color-adjust: exact, and
+     they are restated here so nothing in the print block can flatten them. Both tints are light
+     enough that a mono printer renders them as a faint grey under black figures — and the red 0.0
+     never carries one (see .lm-src-*). */
+  .lm-print .lm-src-measured { background: #e2f4e8 !important; }
+  .lm-print .lm-src-estimated { background: #fde7cc !important; }
+  .lm-print-key-bg { padding: 0 3px; border-radius: 2px; }
+
+  /* ── Type → series group headings ──────────────────────────────────────────────────────
+     Every rule here is anchored on .lm-print, the matrix's print root, and not only on an
+     lm-print-* class: another printable view that borrows a class name (or a nested table, or a
+     heading pattern) must not pick up the matrix's page breaks along with it.
+
+     Each product type is its own table and starts a fresh sheet. The adjacent-sibling selector is
+     what keeps the first sheet from being blank: the band's first type follows the band heading
+     (a <p>), not another type, so it never breaks — only the second type onwards does. The
+     band itself already starts its own sheet (.lm-print-band above). */
+  .lm-print .lm-print-type + .lm-print-type { break-before: page; page-break-before: always; }
+  /* Each series is a nested table whose thead is its heading — see the component for why. The
+     wrapper row and cell are invisible: no padding, no rule, and allowed to break across a
+     sheet, which the `tr { break-inside: avoid }` above would otherwise forbid (a whole series on
+     one sheet or nothing). The model rows inside still never split. */
+  .lm-print .lm-print-table tr.lm-print-nest-row { break-inside: auto; page-break-inside: auto; }
+  .lm-print .lm-print-table td.lm-print-nest-cell { padding: 0; border: 0; }
+  /* A heading is never the last thing on a sheet with its rows on the next. */
+  .lm-print .lm-print-table > thead > tr { break-after: avoid; page-break-after: avoid; }
+  .lm-print .lm-print-table thead th.lm-print-grp {
+    text-align: left; vertical-align: middle;
+    white-space: nowrap; overflow: hidden;
+  }
+  /* The stronger break: a heavy black rule above, uppercase. No tint — a mono printer turns
+     tints to mud, so the weight of the rule carries the hierarchy. */
+  .lm-print .lm-print-table thead th.lm-print-grp-type {
+    border-top: 1.5pt solid #000;
+    border-bottom: 0.5pt solid #444;
+    padding: 3pt 2pt 1.5pt;
+    font-size: 8pt; letter-spacing: 0.06em; text-transform: uppercase;
+  }
+  .lm-print .lm-print-table thead th.lm-print-grp-series {
+    border-bottom: 0.5pt solid #888;
+    padding: 2pt 2pt 1pt 1.5mm;
+    font-size: 7.5pt;
+  }
+  .lm-print .lm-print-grp-count {
+    margin-left: 4pt;
+    font-weight: 400; letter-spacing: 0; text-transform: none;
+    color: #444;
+  }
+  /* Indented under the series heading — the column width above allows for it. */
+  .lm-print .lm-print-table th.lm-print-td-model { padding-left: 2.5mm; }
 }
 
 /* ── /labour-matrix: the model filter ────────────────────────────────────────────────────────
