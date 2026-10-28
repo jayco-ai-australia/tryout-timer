@@ -1,0 +1,146 @@
+/*
+ * /structure-review — paper and document styles, route-scoped.
+ *
+ * The paper is a bare @page (named pages are ignored by Safari, size and margins included). It is
+ * repeated, with the running footer, by StructureReviewClient through lib/usePageSetup, which pins
+ * it last in <head> so another route's @page left behind by client-side navigation can't win.
+ * Keep the size and margins here identical to that copy.
+ *
+ * The document styles below apply on SCREEN as well as in print: the screen is the print preview.
+ * A working document, so plain — black text, thin rules, amber only for the flags.
+ */
+@page {
+  size: A4 portrait;
+  margin: 12mm 12mm 14mm;
+}
+
+.sr-shell { min-height: 100vh; background: var(--bg); }
+
+.sr-controls {
+  display: flex;
+  align-items: flex-end;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 20px;
+}
+.sr-controls > div { width: 240px; max-width: 100%; }
+.sr-controls .select { width: 100%; }
+.sr-message { color: var(--text-muted); font-size: 13px; padding: 24px 0; }
+.sr-error { color: var(--red); }
+
+/* ── The sheets ─────────────────────────────────────────────────────────────────────────── */
+.sr-doc {
+  --sr-amber: #fdecc8;
+  --sr-amber-ink: #8a4b00;
+  color: #000;
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-size: 9.5pt;
+  line-height: 1.35;
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+/* On screen, each sheet is an A4-width page with the print margins as padding. */
+.sr-sheet {
+  background: #fff;
+  max-width: 210mm;
+  box-sizing: border-box;
+  padding: 12mm;
+  margin: 0 auto 24px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+}
+
+.sr-kicker { margin: 0; font-size: 9pt; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #555; }
+.sr-title { margin: 4px 0 2px; font-size: 24pt; font-weight: 700; line-height: 1.15; }
+.sr-date { margin: 0 0 10mm; font-size: 11pt; }
+
+.sr-figures {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  border-top: 0.75pt solid #000;
+  margin-bottom: 10mm;
+}
+.sr-figure { padding: 4mm 3mm 4mm 0; border-bottom: 0.5pt solid #bbb; }
+.sr-figure-value { font-size: 18pt; font-weight: 700; font-variant-numeric: tabular-nums; }
+.sr-figure-label { font-size: 8.5pt; color: #444; }
+
+.sr-howto h2 { font-size: 11pt; font-weight: 700; margin: 0 0 6px; }
+.sr-howto ul { margin: 0; padding-left: 18px; }
+.sr-howto li { margin: 0 0 5px; }
+
+.sr-h2 { font-size: 14pt; font-weight: 700; margin: 0 0 2px; }
+.sr-meta { margin: 0 0 8px; font-size: 9pt; color: #333; }
+.sr-section-head { border-bottom: 0.75pt solid #000; margin-bottom: 8px; }
+
+.sr-job { margin: 0 0 10px; }
+.sr-h3 {
+  font-size: 10.5pt;
+  font-weight: 700;
+  margin: 0;
+  padding: 3px 4px 3px 0;
+  break-after: avoid;
+  page-break-after: avoid;
+}
+.sr-h3.sr-flag-row { padding-left: 4px; }
+.sr-job-meta { font-weight: 400; font-size: 8.5pt; color: #333; margin-left: 10px; }
+
+/* ── Tables ─────────────────────────────────────────────────────────────────────────────── */
+.sr-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 8.5pt; }
+.sr-table thead { display: table-header-group; }
+.sr-table tr { break-inside: avoid; page-break-inside: avoid; }
+.sr-table th {
+  text-align: left;
+  font-size: 7pt;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 3px 5px;
+  border-bottom: 0.75pt solid #000;
+  vertical-align: bottom;
+}
+.sr-table td {
+  padding: 3px 5px;
+  border-bottom: 0.5pt solid #bbb;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+.sr-table th:first-child, .sr-table td:first-child { padding-left: 0; }
+/* In the contents, a continuation row's job cell is its row's first child, but not the table's
+   left edge — the team and section cells span down beside it. */
+.sr-table td.sr-job-cell { padding-left: 5px; }
+.sr-ops td { height: 6.5mm; vertical-align: middle; }
+.sr-ops tr.sr-flag-row td:first-child { padding-left: 4px; }
+.sr-num { text-align: right !important; font-variant-numeric: tabular-nums; }
+td.sr-num { white-space: nowrap; }
+.sr-center { text-align: center !important; }
+.sr-muted { color: #777; }
+.sr-span { border-right: 0.5pt solid #ddd; }
+.sr-team-cell { font-weight: 700; }
+.sr-team-group > tr:first-child > td { border-top: 0.75pt solid #000; }
+.sr-rollup { font-size: 7.5pt; color: #777; margin-top: 1px; }
+.sr-notes { border-left: 0.5pt solid #bbb; }
+
+/* ── Flags: amber, and the red 0 ───────────────────────────────────────────────────────── */
+.sr-flag-row { background: var(--sr-amber); }
+.sr-flag-text { color: var(--sr-amber-ink); }
+.sr-flag-swatch { background: var(--sr-amber); padding: 0 3px; }
+.sr-zero { color: #c00; font-weight: 700; }
+
+/* ── Tick boxes ────────────────────────────────────────────────────────────────────────── */
+.sr-boxes { display: inline-flex; gap: 5px; }
+.sr-box-slot { display: inline-flex; flex-direction: column; align-items: center; width: 11px; }
+.sr-box { display: block; width: 9px; height: 9px; border: 0.75pt solid #000; background: #fff; }
+.sr-box-key { font-size: 5.5pt; color: #666; line-height: 1; margin-top: 1px; }
+
+@media (max-width: 640px) {
+  .sr-sheet { padding: 16px; }
+  .sr-figures { grid-template-columns: repeat(2, 1fr); }
+  .sr-ops, .sr-contents .sr-table { min-width: 560px; }
+  .sr-job, .sr-contents { overflow-x: auto; }
+}
+
+@media print {
+  .sr-shell { background: #fff !important; }
+  .sr-sheet { max-width: none; padding: 0; margin: 0; box-shadow: none; }
+  /* Cover, contents, then one section per sheet. */
+  .sr-sheet + .sr-sheet { break-before: page; page-break-before: always; }
+}

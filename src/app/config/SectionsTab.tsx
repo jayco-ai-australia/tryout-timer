@@ -1,6 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import Link from 'next/link'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import ConfirmDialog from '@/components/ConfirmDialog'
 import Modal from '@/components/Modal'
@@ -264,6 +265,12 @@ export default function SectionsTab({
           <button className="btn-primary" disabled={busy || !canEdit || lineTeams.length === 0} title={lockedReason ?? undefined} onClick={() => setDialog({ kind: 'add' })}>
             + Add Section
           </button>
+        )}
+        {lineId && (
+          // Carries this tab's line and team filters to the printable review (app/structure-review).
+          <Link className="btn-ghost" href={`/structure-review?line=${lineId}${teamId ? `&team=${teamId}` : ''}`}>
+            Print structure review
+          </Link>
         )}
       </div>
 
