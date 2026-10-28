@@ -1972,7 +1972,10 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
                 )}
               </span>
               <span>
-                <strong>{fmtMinutes(gridTotal)}m</strong> ({fmtHours(gridTotal)}h) across the grid
+                {/* Named as a total over every model shown, because it is one: /structure-review's
+                    "minutes per van" for the same line is an average per model and reads far lower. */}
+                <strong>{fmtMinutes(gridTotal)}m</strong> ({fmtHours(gridTotal)}h) across the grid, all{' '}
+                {plural(visibleProducts.length, 'model')} added together
               </span>
             </div>
 
@@ -2183,7 +2186,8 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
               {plural(visibleProducts.length, 'model')} × {plural(columns.length, grainNoun)}
               {' · '}coverage <strong>{coverage.covered} / {coverage.required}</strong> job×model cells timed
               {coverage.estimated > 0 && <>, of which <strong>{coverage.estimated}</strong> estimated</>}
-              {' · '}<strong>{fmtMinutes(gridTotal)}m</strong> ({fmtHours(gridTotal)}h) across the grid
+              {' · '}<strong>{fmtMinutes(gridTotal)}m</strong> ({fmtHours(gridTotal)}h) across the grid, all{' '}
+              {plural(visibleProducts.length, 'model')} added together
               {printedAt ? ` · printed ${printedAt}` : ''}
             </p>
             <p className="lm-print-key">
