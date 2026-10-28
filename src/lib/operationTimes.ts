@@ -80,8 +80,8 @@ export interface OperationTimeStat {
    * has to count the recordings behind them without counting a multi-model record once per model
    * — /structure-review's Times column. */
   recordIds: string[]
-  /** How many observations were averaged: one per chassis (its records summed), plus one for the
-   * newest record with no chassis. 1 in the ordinary case. */
+  /** How many observations were averaged: one per chassis (its records summed), plus one for all
+   * the records with no chassis (also summed). 1 in the ordinary case. */
   observations: number
   /** How many superseded records sit behind it. Displayed as history, never averaged in.
    * Hidden records are not included — they are not part of the figure's history either. */
@@ -275,17 +275,18 @@ function newerFirst(a: TimeRow, b: TimeRow): number {
  * How a pair's CURRENT records combine into one figure — THE rule, written once:
  *
  *   for each chassis with records   sum its records         = one observation
- *   records with no chassis         the NEWEST one          = one observation
+ *   all records with no chassis     sum them                = one observation
  *   the figure                      the average of the observations
  *
  * Within one van, records on the same operation are parts of the work: a merge folds several
  * operations' runs onto one, and parallel operators each time their own share. They add up.
  * Across vans they are repeat observations of the same work, so they average.
  *
- * Chassis-less records — estimates, imported standards — are NEVER summed with each other, and
- * not averaged either: the newest stands. Summing them would multiply a model's figure by however
- * many times it was loaded; averaging would blend a stale load into a newer one (a standard
- * imported twice is the case in the data).
+ * Chassis-less records — estimates, imported standards — add up the same way, as one more
+ * observation. They are parts of one job too: a merge carries each source operation's estimate
+ * across as its own record, and those are the pieces of the merged operation, not competing
+ * figures for it. A load that wrote the same standard twice would double here, so a duplicate
+ * load is a data problem to fix at the source, not something this rule hides.
  *
  * Repeat measurements of one van do not double here because a re-time is never silently added:
  * recordOperationTime's same-chassis guard asks whoever is saving whether it corrects the
@@ -294,13 +295,13 @@ function newerFirst(a: TimeRow, b: TimeRow): number {
  */
 function combineCurrentRecords(rows: TimeRow[]): { minutes: number; observations: number } {
   const byChassis = new Map<string, number>()
-  let unattached: TimeRow | null = null
+  let unattached: number | null = null
   for (const r of rows) {
     if (r.chassis_id != null) byChassis.set(r.chassis_id, (byChassis.get(r.chassis_id) ?? 0) + (r.total_minutes as number))
-    else if (!unattached || newerFirst(r, unattached) < 0) unattached = r
+    else unattached = (unattached ?? 0) + (r.total_minutes as number)
   }
   const observations = [...byChassis.values()]
-  if (unattached) observations.push(unattached.total_minutes as number)
+  if (unattached != null) observations.push(unattached)
   return { minutes: observations.reduce((a, b) => a + b, 0) / observations.length, observations: observations.length }
 }
 
