@@ -31,11 +31,12 @@ import {
   UnlinkedOperationError, type OperationTimeStat,
 } from '@/lib/operationTimes'
 import {
-  elapsedSecondsNow, saveTimerRun, useStopwatches, type ActiveTimer,
+  completeTimer, elapsedSecondsNow, saveTimerRun, useStopwatches, type ActiveTimer,
 } from '@/lib/stopwatch'
 import {
   CompleteTimerDialog, StartTimerDialog, TimerRail, type CompleteTimerResult, type StartTimerChoice,
 } from '@/components/TimerRail'
+import { useSameChassisPrompt } from '@/components/SameChassisPrompt'
 import { fmtClock, fmtDate, fmtDateTime, fmtMinutes } from '@/lib/format'
 import { operationProductKey } from '@/lib/operationTimes'
 import {
@@ -432,6 +433,9 @@ export default function TryOutsClient({ userId, role }: Props) {
     timers, nowMs, start: startStopwatch, togglePause, restart: restartTimer, discard: discardTimer,
     addNote: addTimerNote, removeNote: removeTimerNote,
   } = useStopwatches(TIMERS_KEY)
+  /** "Already timed on this van" — asked when a completed run meets a current record for the same
+   * operation on the same chassis. See SameChassisPrompt. */
+  const { withSameChassisPrompt, sameChassisPrompt } = useSameChassisPrompt()
   /** The Start confirmation — operator and an opening note, both optional, asked BEFORE the
    * clock begins. Holds labels rather than the Operation/Job rows so an operation created
    * inline can be started from here without waiting for the reload that puts it in the panes. */
@@ -1343,13 +1347,22 @@ export default function TryOutsClient({ userId, role }: Props) {
         )
         if (error) throw new Error(`The time was not saved yet — linking the operation to this model failed: ${error}`)
       }
-      await saveTimerRun(supabase, timer, {
+      // A time already current for this operation on this van is asked about before anything is
+      // written — see SameChassisPrompt. Cancel writes nothing and leaves the timer running in
+      // the rail and this dialog open, so the run can still be saved.
+      const recorded = await withSameChassisPrompt((sameChassis) => saveTimerRun(supabase, timer, {
         userId,
         operatorId: result.operatorId,
         notes: result.notes,
         note: result.note,
         atMs: result.atMs,
+        sameChassis,
+      }), {
+        operationName: timer.operationName,
+        chassisNumber: timer.chassisNumber ?? null,
+        minutes: completeTimer(timer, result.atMs ?? Date.now()).totalMinutes,
       })
+      if (!recorded) return
       // The timer is dropped only once the save has resolved — a failed save leaves it running
       // in the rail rather than throwing the elapsed time away.
       discardTimer(timer.timerId)
@@ -2055,6 +2068,8 @@ export default function TryOutsClient({ userId, role }: Props) {
           onCancel={() => { if (!completing) cancelComplete() }}
         />
       )}
+      {/* Over the complete dialog, which stays open (and ignores Escape while saving) beneath it. */}
+      {sameChassisPrompt}
 
       {cancelingTimerId && (
         <ConfirmDialog
@@ -3104,6 +3119,7 @@ function CapturePanel({
   const [note, setNote] = useState('')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const { withSameChassisPrompt, sameChassisPrompt } = useSameChassisPrompt()
 
   const minutesValue = Number(minutes)
   const canSave = minutes.trim() !== '' && !Number.isNaN(minutesValue) && minutesValue > 0
@@ -3112,16 +3128,24 @@ function CapturePanel({
     if (!canSave || !van.productId) return
     setSaving(true); setError(null)
     try {
-      const { created } = await recordOperationTime(supabase, {
+      // A time already current for this operation on this van is asked about — correct it, or
+      // add this as separate work — before anything is written. See SameChassisPrompt.
+      const productId = van.productId
+      const recorded = await withSameChassisPrompt((sameChassis) => recordOperationTime(supabase, {
         operationId: target.operationId,
-        productIds: [van.productId],
+        productIds: [productId],
         // Blank → null → recorded against the placeholder operator, since
         // operation_times.operator_id is NOT NULL.
         operatorId: operatorId || null,
         collectedBy: userId,
         totalMinutes: minutesValue,
         chassisId: van.chassisId,
-      })
+        sameChassis,
+      }), { operationName: target.operationName, chassisNumber: van.chassisNumber, minutes: minutesValue })
+      // Cancelled: nothing was written, and what was typed stays in the form.
+      if (!recorded) { setSaving(false); return }
+      const { created } = recorded
+      // On a correction `created` is the corrected record, so the note lands on it.
       if (note.trim()) {
         await addOperationTimeNote(supabase, created.id, note, userId)
       }
@@ -3193,6 +3217,7 @@ function CapturePanel({
       <button className="btn-primary" disabled={!canSave || saving} onClick={handleSave}>
         {saving ? 'Saving…' : 'Save Time'}
       </button>
+      {sameChassisPrompt}
     </div>
   )
 }

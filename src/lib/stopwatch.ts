@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import type { SupabaseClient } from '@supabase/supabase-js'
-import { addOperationTimeNote, recordOperationTime, type RecordedOperationTime } from './operationTimes'
+import { addOperationTimeNote, recordOperationTime, type RecordedOperationTime, type SameChassisResolution } from './operationTimes'
 import { usePersistedState } from './useLocalStorage'
 
 /**
@@ -213,6 +213,8 @@ export async function saveTimerRun(
      */
     notes?: string[]
     atMs?: number
+    /** Passed through to recordOperationTime — the answer to SameChassisRecordError. */
+    sameChassis?: SameChassisResolution
   }
 ): Promise<RecordedOperationTime> {
   const { totalMinutes, pausedDurationSeconds, startedAt, completedAt } = completeTimer(timer, opts.atMs ?? Date.now())
@@ -230,6 +232,7 @@ export async function saveTimerRun(
     completedAt,
     pausedDurationSeconds,
     chassisId: timer.chassisId,
+    sameChassis: opts.sameChassis,
   })
 
   const notes = [...(opts.notes ?? timer.notes ?? []), opts.note ?? '']

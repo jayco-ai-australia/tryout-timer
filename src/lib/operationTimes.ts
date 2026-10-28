@@ -283,9 +283,9 @@ function newerFirst(a: TimeRow, b: TimeRow): number {
  * many times it was loaded; averaging would blend a stale load into a newer one (a standard
  * imported twice is the case in the data).
  *
- * Repeat measurements of one van are NOT told apart here: recordOperationTime archives nothing,
- * so a re-time of a van sits current beside the original and the two sum. Until a re-time is
- * asked about at save, a re-time that replaces a record has to be corrected in place instead.
+ * Repeat measurements of one van do not double here because a re-time is never silently added:
+ * recordOperationTime's same-chassis guard asks whoever is saving whether it corrects the
+ * existing record (edited in place — still one record) or is separate work (summed, as above).
  * Hand it current, counted rows with a figure; pickCurrent does that filtering.
  */
 function combineCurrentRecords(rows: TimeRow[]): { minutes: number; observations: number } {
@@ -798,6 +798,91 @@ export interface RecordOperationTimeInput {
    * differs for a row whose filing predates the current structure, e.g. an import.
    */
   provenance?: TimeProvenance
+  /**
+   * The answer to "there's already a time for this on this van" — see THE SAME-CHASSIS GUARD in
+   * recordOperationTime. Leave it undefined and a save that meets a current record on the same
+   * chassis is refused with SameChassisRecordError, which carries the records so the caller can
+   * ask (SameChassisPrompt) and call again with the answer:
+   *   add-separate   write a new record alongside — merged sub-tasks, parallel operators
+   *   correct        edit THAT record's minutes in place (updateOperationTime); nothing new
+   * Only a save with a chassis can meet the guard, so a chassis-less caller never needs this.
+   */
+  sameChassis?: SameChassisResolution
+}
+
+export type SameChassisResolution = { action: 'add-separate' } | { action: 'correct'; recordId: string }
+
+/** A current, counted record already on the chassis — what the prompt shows to decide by. */
+export interface ExistingChassisRecord {
+  id: string
+  totalMinutes: number
+  operatorName: string | null
+  createdAt: string
+  /** Newest first. Empty when the record has none. */
+  notes: string[]
+}
+
+/**
+ * recordOperationTime met a current record for the same operation on the same chassis and was
+ * not told whether this save corrects it or is separate work. Nothing was written. A human
+ * decides — the record cannot say whether two runs are one task timed twice or merged sub-tasks
+ * that sum — so the caller shows SameChassisPrompt and calls again with `sameChassis`.
+ */
+export class SameChassisRecordError extends Error {
+  constructor(
+    public readonly operationId: string,
+    public readonly chassisId: string,
+    public readonly existing: ExistingChassisRecord[]
+  ) {
+    super(
+      'There is already a time for this operation on this van, so nothing was saved yet — ' +
+      'choose whether this corrects it or is separate work.'
+    )
+    this.name = 'SameChassisRecordError'
+  }
+}
+
+/**
+ * The records the same-chassis guard asks about: CURRENT (not superseded) and COUNTED
+ * (countsTowardLabour — not hidden, not retired, live operation and job) records for this
+ * operation on this chassis, newest first, with operator name and notes for the prompt.
+ */
+export async function fetchCurrentRecordsOnChassis(
+  supabase: SupabaseClient,
+  operationId: string,
+  chassisId: string
+): Promise<ExistingChassisRecord[]> {
+  type Row = TimeExclusionFlags & { id: string; total_minutes: number | null; operator_id: string | null; created_at: string; superseded_by: string | null }
+  const { data, error } = await supabase
+    .from('operation_times')
+    .select(`id, total_minutes, operator_id, created_at, superseded_by, ${TIME_FLAG_COLUMNS}`)
+    .eq('operation_id', operationId)
+    .eq('chassis_id', chassisId)
+    .is('superseded_by', null)
+    .order('created_at', { ascending: false })
+    .order('id', { ascending: false })
+  if (error) throw new Error(error.message)
+  const rows = ((data ?? []) as unknown as Row[]).filter((r) => countsTowardLabour(r) && r.total_minutes != null)
+  if (rows.length === 0) return []
+
+  const operatorIds = [...new Set(rows.map((r) => r.operator_id).filter((id): id is string => id != null))]
+  const [{ data: operators, error: opError }, notes] = await Promise.all([
+    operatorIds.length > 0
+      ? supabase.from('operators').select('id, full_name').in('id', operatorIds)
+      : Promise.resolve({ data: [] as { id: string; full_name: string }[], error: null }),
+    fetchOperationTimeNotes(supabase, rows.map((r) => r.id)),
+  ])
+  if (opError) throw new Error(opError.message)
+  const nameById = new Map((operators ?? []).map((o) => [o.id as string, o.full_name as string]))
+
+  return rows.map((r) => ({
+    id: r.id,
+    totalMinutes: r.total_minutes as number,
+    // The placeholder is "nobody said", not a person — shown as no operator.
+    operatorName: r.operator_id && nameById.get(r.operator_id) !== PLACEHOLDER_OPERATOR_NAME ? nameById.get(r.operator_id) ?? null : null,
+    createdAt: r.created_at,
+    notes: notes.filter((n) => n.operation_time_id === r.id).map((n) => n.content),
+  }))
 }
 
 /**
@@ -815,6 +900,9 @@ export interface RecordedOperationTime {
    * — measured always wins. Always empty for a measured write. A subset of nothing else: these
    * are not in refusedProductIds, which means "doesn't apply". */
   measuredProductIds: string[]
+  /** true when the save CORRECTED an existing record in place (sameChassis: correct): `created`
+   * is that record, edited, and no new record exists. A caller adding a note adds it there. */
+  corrected: boolean
 }
 
 /**
@@ -1219,6 +1307,39 @@ export async function recordOperationTime(
     if (savedProductIds.length === 0) throw new MeasuredTimeExistsError(operationId, measuredProductIds)
   }
 
+  /**
+   * ── THE SAME-CHASSIS GUARD: a re-time on the same van is asked about, never assumed ───────
+   *
+   * Two current records for one operation on one van SUM (combineCurrentRecords). That is right
+   * for merged sub-tasks and parallel operators, and doubles the van's figure when the second
+   * run was really the first one timed again. Nothing in the record says which — same operator,
+   * same van, separate clock runs is both cases — so the person saving is asked, here, at the
+   * boundary every time-recording screen goes through, so none of them can skip it.
+   *
+   * Fires only with a chassis: a chassis-less save (paper entry, estimate, import, copy) has no
+   * van to collide on. Asks about current, counted records only — a hidden, archived or retired
+   * one is not part of the figure, so a new record beside it doubles nothing. Like the guards
+   * above it fails closed: a failed read throws before anything is written.
+   */
+  if (chassisId != null && input.sameChassis?.action !== 'add-separate') {
+    const existing = await fetchCurrentRecordsOnChassis(supabase, operationId, chassisId)
+    const correction = input.sameChassis
+    if (!correction) {
+      if (existing.length > 0) throw new SameChassisRecordError(operationId, chassisId, existing)
+    } else {
+      // Re-checked against the fresh read: the record picked in the prompt may have been
+      // corrected, hidden or deleted since. Asking again beats editing the wrong thing.
+      if (!existing.some((r) => r.id === correction.recordId)) {
+        if (existing.length > 0) throw new SameChassisRecordError(operationId, chassisId, existing)
+        throw new Error('The record you chose to correct is no longer current on this van, so nothing was saved. Save again to record the time.')
+      }
+      // A correction is an edit of THAT record, through the one updater — no new record, and its
+      // operator, timestamps and links stay as they were.
+      const updated = await updateOperationTime(supabase, correction.recordId, { totalMinutes })
+      return { created: updated, savedProductIds, refusedProductIds, measuredProductIds, corrected: true }
+    }
+  }
+
   // Resolved BEFORE provenance so the degraded "fall back to the operator's team/line" path
   // below still has a real operator row to read, rather than being handed a null it can't use.
   const resolvedOperatorId = operatorId ?? await resolvePlaceholderOperatorId(supabase)
@@ -1275,7 +1396,7 @@ export async function recordOperationTime(
    * Those, and only those, write superseded_by (via setSupersededBy).
    */
 
-  return { created: created as OperationTime, savedProductIds, refusedProductIds, measuredProductIds }
+  return { created: created as OperationTime, savedProductIds, refusedProductIds, measuredProductIds, corrected: false }
 }
 
 // ── operation_time_models: the junction, and the only three functions that touch it ────────
@@ -1780,6 +1901,10 @@ export async function splitOperationTimeForModel(
       provenance: original.team_id !== null || original.production_line_id !== null
         ? { teamId: original.team_id, productionLineId: original.production_line_id }
         : undefined,
+      // A split divides a run that already exists between models — it is not a re-time, so
+      // there is nothing to ask. It carries the original's chassis, and without this the guard
+      // would ask about the original itself.
+      sameChassis: { action: 'add-separate' },
     }))
   } catch (err) {
     // 3. Put the model back on the original rather than leaving it short a run.
