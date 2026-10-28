@@ -191,9 +191,9 @@ export default function CopyToModelsPanel({
   // FILTERED to `superseded_by is null`, and this one matters. A copy means "give these models
   // the labour content this one has", and that content is now the current record per operation —
   // not every measurement ever taken. Unfiltered, an operation with three archived records would
-  // write three times onto each target, each superseding the last, leaving the target's figure
-  // set by whichever historical row happened to be written final. Copying history forward as
-  // though it were current is exactly the error this filter prevents.
+  // write all three onto each target as current records — a save never archives anything — so
+  // the target's figure would be built from history nobody counts any more. Copying history
+  // forward as though it were current is exactly the error this filter prevents.
   //
   // HIDDEN records are excluded for the same reason, and more so: a copy is written as an ordinary
   // (not hidden) record, so copying a hidden one would launder a figure nobody trusts back into
@@ -320,8 +320,9 @@ export default function CopyToModelsPanel({
       const timeIds = [...new Set(linkRows.map((l) => l.operation_time_id))]
       // NOT filtered to the current record: this is the "already timed" warning, and a target
       // whose only records are archived has still been timed. Same existence question coverage
-      // asks — see lib/coverage.ts. Hidden records are counted here too: they exist, the copy
-      // will supersede them, and the warning is about what is already there.
+      // asks — see lib/coverage.ts. Hidden records are counted here too: they exist, and the
+      // warning is about what is already there. The copy is written ALONGSIDE whatever the target
+      // has — a save never archives anything — so the warning is what tells the user so.
       //
       // Identity lookup by primary key, so selectIn is complete — see the source read above.
       const timeRows = await selectIn<{ id: string; operation_id: string }>(

@@ -724,7 +724,7 @@ export interface RecordOperationTimeInput {
   /**
    * Defaults to false. true for a figure nobody observed — /estimate's extrapolation from the
    * measured models of a range. An estimate is held to one extra rule a measured time is not: it
-   * may never become the current record over a MEASURED one, and it never archives one. See the
+   * may never become the current record over a MEASURED one. See the
    * estimate guard in recordOperationTime.
    */
   isEstimated?: boolean
@@ -1147,7 +1147,7 @@ export async function recordOperationTime(
    * applicability guard: a failed read throws before anything is written.
    *
    * Hidden and retired measured records do not block (they are not a figure — isMeasuredCurrent
-   * goes through countsTowardLabour), and they are not archived either: see the supersede step.
+   * goes through countsTowardLabour). Nothing is archived by an insert, estimate or not.
    */
   let measuredProductIds: string[] = []
   if (isEstimated) {
@@ -1197,43 +1197,25 @@ export async function recordOperationTime(
   await linkOperationTimeToModels(supabase, created.id, savedProductIds)
 
   /**
-   * A NEW time is the current one for every model it was recorded against, and whatever was
-   * current for those pairs becomes history. Done HERE, in the single write path, rather than at
-   * the seven call sites that record a time — /collect's complete, /tryouts' complete and manual
-   * entry, /model-total's Add Time, CopyToModelsPanel, ModelLinker, the split — because a caller
-   * that forgot would leave two current records for the pair and a labour figure that flips
-   * between them depending on row order.
+   * ── A NEW RECORD NEVER ARCHIVES ANOTHER ───────────────────────────────────────────────────
    *
-   * Per product, because the pairs are independent: a run recorded against four models supersedes
-   * four different previous records, and a model with no previous record supersedes nothing.
+   * From 28 Sep to 28 Oct 2026 this step pointed every other current record for each
+   * (operation, model) pair at the new one — whatever the van, whatever the operator. A second
+   * van's time archived the first van's; a second operator on the same van archived the first
+   * operator's share. Nobody was told. That was a bug: two vans are two observations, and two
+   * operators on one van are two records that sum.
    *
-   * Deliberately AFTER the insert and the links, and deliberately not fatal to them: the time is
-   * banked and linked by this point, and throwing here would report a save that actually
-   * succeeded as a failure. A pair briefly holding two current records resolves to the newest —
-   * which is this one — so the figure is right even in the failure case; the warning is what says
-   * the history behind it is not.
+   * Nothing a caller passes here says "this replaces that" — a stopwatch completion, a paper
+   * entry and a re-time all arrive looking identical — so this function cannot tell a correction
+   * from a new observation, and it does not guess. Every new record is current and stays current.
+   *
+   * Replacing a record is a deliberate act done to THAT record, from the times drawer:
+   *   - edit its minutes in place          updateOperationTime
+   *   - make an earlier one current        promoteOperationTime (archives what was current)
+   *   - take it out of the figure          updateOperationTime({ isHidden: true })
+   *   - remove it                          deleteOperationTime
+   * Those, and only those, write superseded_by (via setSupersededBy).
    */
-  for (const productId of savedProductIds) {
-    try {
-      const pairTimes = await fetchOperationTimesForModel(supabase, operationId, productId)
-      // An estimate archives only earlier ESTIMATES. A measured record — even a hidden or retired
-      // one, which the guard above let through because it is not a figure — is never pointed at
-      // an estimate: superseded_by is the record of what replaced what, and an estimate does not
-      // replace an observation.
-      const previousCurrent = pairTimes
-        .filter((t) => t.id !== created.id && t.superseded_by == null && (!isEstimated || t.is_estimated))
-        .map((t) => t.id)
-      await setSupersededBy(supabase, previousCurrent, created.id)
-    } catch (err) {
-      console.warn(
-        '[recordOperationTime] time', created.id, 'was saved and linked, but the previous current',
-        'record for product', productId, 'could not be archived:',
-        err instanceof Error ? err.message : err,
-        '— the new record is the newest, so it is the figure being shown, but this pair now has',
-        'more than one record marked current. Promote the right one from the times drawer.'
-      )
-    }
-  }
 
   return { created: created as OperationTime, savedProductIds, refusedProductIds, measuredProductIds }
 }
@@ -1396,7 +1378,8 @@ function newestFirst<T extends { id: string; created_at: string }>(rows: T[]): T
 
 /**
  * Make an ARCHIVED record the current one for its operation+model, archiving whatever was
- * current behind it. The inverse of what recording a new time does automatically.
+ * current behind it. This is the deliberate "this record replaces that one" — recording a new
+ * time never archives anything (see recordOperationTime).
  *
  * All-or-nothing, and the order is chosen for which transient state is survivable:
  *   1. Clear the promoted record's pointer. The pair now briefly has TWO current records.

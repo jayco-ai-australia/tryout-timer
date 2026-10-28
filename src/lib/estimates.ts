@@ -352,7 +352,7 @@ export interface EstimateSaveResult {
 }
 
 /** How many writes run at once. Each new estimate is ~8 round trips inside recordOperationTime
- * (applicability, the estimate guard, provenance, insert, link, supersede); one at a time, a
+ * (applicability, the estimate guard, provenance, insert, link); one at a time, a
  * 90-cell save would sit for half a minute. Small enough not to look like a flood to PostgREST. */
 const SAVE_CONCURRENCY = 6
 

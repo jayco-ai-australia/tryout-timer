@@ -51,7 +51,7 @@ import type { Operation, Product, ProductionLine, Section } from '@/lib/types'
  *
  * ── Every write goes through the existing single-writer helpers ───────────────────────────
  * recordOperationTime for the times (never a direct insert into operation_times — it is what
- * derives team/line provenance from the job and supersedes the previous current record),
+ * derives team/line provenance from the job and applies the save-time guards),
  * addOperationTimeNote for notes, createJob / createOperations for the structure
  * created along the way. Nothing here writes a table directly.
  */
@@ -830,8 +830,8 @@ export default function AddTimeDrawer({
         }
         try {
           // THE single insert path. Never a direct .insert() into operation_times: this is what
-          // derives the team/line provenance from the operation's job and supersedes whatever
-          // was the current record for each (operation, model) pair.
+          // derives the team/line provenance from the operation's job and applies the save-time
+          // guards. It archives nothing: the new record stands beside what is already there.
           const { created, refusedProductIds } = await recordOperationTime(supabase, {
             operationId: operation.id,
             productIds: targets.map((m) => m.id),
