@@ -14,7 +14,7 @@ import {
   TIME_FLAG_COLUMNS, countsTowardLabour, modelTotalMinutes, onlyCountedTimes, operationProductKey, selectCountedTimes,
 } from '@/lib/operationTimes'
 import {
-  aggregateCoverage, computeCoverageCombos, modelCoverageFromCombos, timedOperationProductKeys, type ModelCoverage,
+  aggregateCoverage, computeCoverageCombos, estimateOnlyComboKeys, modelCoverageFromCombos, timedOperationProductKeys, type ModelCoverage,
 } from '@/lib/coverage'
 import { fetchFutureBuilds, fmtScheduleDate, todayIsoDate } from '@/lib/schedule'
 import { periodBounds, periodRangeLabel } from '@/lib/periods'
@@ -99,6 +99,9 @@ interface CoverageSummary {
   /** Required (job, model) combos in scope. */
   requiredCombos: number
   coveredCombos: number
+  /** Of coveredCombos, how many are covered ONLY by estimates (/estimate) — a split alongside the
+   * headline, never subtracted from it. lib/coverage's estimateOnlyComboKeys. */
+  estimatedCombos: number
   /** Uncovered COMBOS — job-level, not operations. */
   gaps: number
   pct: number | null
@@ -304,12 +307,12 @@ export default function DashboardClient({ role, lines, initialLineId }: Props) {
       // aggregates. The flags are still selected — the helpers' types require them, and
       // modelTotalMinutes and computeCoverageCombos apply the same rule again.
       const timeIds = [...new Set(operationTimeModels.map((tm) => tm.operation_time_id))]
-      const operationTimes = await fetchAllChunked<{ id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null }>(
+      const operationTimes = await fetchAllChunked<{ id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null; is_estimated: boolean; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null }>(
         timeIds, READ_CHUNK,
         (chunk) => onlyCountedTimes(supabase
-          .from('operation_times').select(`id, operation_id, total_minutes, superseded_by, ${TIME_FLAG_COLUMNS}`)
+          .from('operation_times').select(`id, operation_id, total_minutes, superseded_by, is_estimated, ${TIME_FLAG_COLUMNS}`)
           .in('id', chunk).is('superseded_by', null))
-          .order('id') as unknown as RangeableQuery<{ id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null }>,
+          .order('id') as unknown as RangeableQuery<{ id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null; is_estimated: boolean; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null }>,
         { table: 'operation_times' }
       )
 
@@ -353,6 +356,7 @@ export default function DashboardClient({ role, lines, initialLineId }: Props) {
         operationTimeModels,
       })
       const aggregate = aggregateCoverage(combos)
+      const estimatedCombos = estimateOnlyComboKeys(combos, { operations, operationTimes, operationTimeModels }).size
       const perModel = modelCoverageFromCombos(combos)
 
       // ── TEMPORARY coverage diagnostics — remove once confirmed ──────────────────────
@@ -415,6 +419,7 @@ export default function DashboardClient({ role, lines, initialLineId }: Props) {
       setCoverage({
         requiredCombos: aggregate.totalRequired,
         coveredCombos: aggregate.totalCovered,
+        estimatedCombos,
         gaps: aggregate.gapsRemaining,
         pct: aggregate.coveragePct,
         models: perModel.length,
@@ -648,7 +653,13 @@ export default function DashboardClient({ role, lines, initialLineId }: Props) {
                     <strong style={{ color: 'var(--text)' }}>{coverage.models}</strong>{' '}
                     model{coverage.models === 1 ? '' : 's'}.{' '}
                     <strong style={{ color: 'var(--text)' }}>{coverage.coveredCombos.toLocaleString()}</strong>{' '}
-                    covered &rarr; <strong style={{ color: 'var(--text)' }}>{pctLabel(coverage.pct)}</strong>.{' '}
+                    covered
+                    {coverage.estimatedCombos > 0 && (
+                      <span title="Covered only by estimates from the Estimate screen — included in the covered figure, not added to it">
+                        {' '}(of which <strong style={{ color: 'var(--text)' }}>{coverage.estimatedCombos.toLocaleString()}</strong> estimated)
+                      </span>
+                    )}{' '}
+                    &rarr; <strong style={{ color: 'var(--text)' }}>{pctLabel(coverage.pct)}</strong>.{' '}
                     <strong style={{ color: 'var(--text)' }}>{coverage.modelsAtFull}</strong> of{' '}
                     {coverage.models} model{coverage.models === 1 ? '' : 's'} fully covered.
                   </div>

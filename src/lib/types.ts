@@ -184,6 +184,15 @@ export interface OperationTime {
    * archived, hidden, both or neither. Set in the database; the app has no control for it yet.
    */
   is_hidden: boolean
+  /**
+   * true = nobody timed this: it was extrapolated on /estimate from measured models of the same
+   * range, so started_at/completed_at are null. It COUNTS exactly as a measured record does —
+   * countsTowardLabour does not look at it — because it is still the work. What differs is only
+   * that it is never allowed to replace a measured record (see lib/operationTimes'
+   * recordOperationTime), and that coverage and the Labour Matrix can say how much of a figure
+   * is inferred. Not null, default false.
+   */
+  is_estimated: boolean
   team_id: string | null
   production_line_id: string | null
   created_at: string

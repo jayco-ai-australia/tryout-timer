@@ -3,7 +3,7 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import { createClient } from '@/lib/supabase/client'
-import { computeCoverageCombos, type CoverageOperationInput, type CoverageModelOperationInput } from '@/lib/coverage'
+import { computeCoverageCombos, estimateOnlyComboKeys, type CoverageOperationInput, type CoverageModelOperationInput } from '@/lib/coverage'
 import { addOperationTimeNote, fetchModelTotal, historyLabel, jobCompleteness, parseCopiedFrom, recordOperationTime, type ModelTotalFetchResult, type ModelTotalOperationRow } from '@/lib/operationTimes'
 import { fmtDate, fmtHours, fmtMinutes, plural } from '@/lib/format'
 // The preview and the write now happen inside ModelUnlinkConfirm; this screen only names the
@@ -639,8 +639,8 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
   // that SAME fetch's raw operationTimes/operationTimeModels. Both "required" and "covered" now
   // walk the identical product_id → operation_time_models → operation_times join, so this can't
   // disagree with the breakdown/total the way a line-scoped fetch did.
-  const modelCombos = useMemo(() => {
-    if (!productId) return []
+  const modelCoverage = useMemo(() => {
+    if (!productId) return { combos: [], estimated: 0 }
     const opMap = new Map<string, { id: string; job_id: string }>()
     for (const o of requiredOps) opMap.set(o.id, { id: o.id, job_id: o.job_id })
     for (const o of modelTotal?.raw.operations ?? []) opMap.set(o.id, o)
@@ -651,13 +651,19 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
     // the x/y on the card equal to the number of job cards below it under every selection.
     const scopedOperations = [...opMap.values()].filter((o) => jobPassesFilter(o.job_id))
 
-    return computeCoverageCombos({
+    const inputs = {
       operations: scopedOperations as CoverageOperationInput[],
-      modelOperations: requiredModelOps,
       operationTimes: modelTotal?.raw.operationTimes ?? [],
       operationTimeModels: modelTotal?.raw.operationTimeModels ?? [],
-    }).filter((c) => c.productId === productId)
+    }
+    const combos = computeCoverageCombos({ ...inputs, modelOperations: requiredModelOps })
+      .filter((c) => c.productId === productId)
+    // Of the timed jobs, those timed ONLY by estimates — said beside the coverage, never taken
+    // out of it (lib/coverage's estimateOnlyComboKeys, over the same inputs).
+    return { combos, estimated: estimateOnlyComboKeys(combos, inputs).size }
   }, [productId, requiredOps, requiredModelOps, modelTotal, jobPassesFilter])
+  const modelCombos = modelCoverage.combos
+  const jobsEstimated = modelCoverage.estimated
 
   const jobsRequired = modelCombos.length
   const jobsTimed = modelCombos.filter((c) => c.covered).length
@@ -1431,7 +1437,8 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
               <div className="stat-card-label">Coverage{scopeLabel && <> · {scopeLabel}</>}</div>
               <div className="stat-card-value">{jobsTimed} / {jobsRequired}</div>
               <div className="stat-card-sub">
-                {scopeLabel ? `${scopeLabel.toLowerCase()} jobs` : 'jobs'} timed for this model — timed
+                {scopeLabel ? `${scopeLabel.toLowerCase()} jobs` : 'jobs'} timed for this model
+                {jobsEstimated > 0 && <>, of which <strong>{jobsEstimated}</strong> estimated</>} — timed
                 so far, not full labour content. Untimed operations contribute 0.
               </div>
             </div>

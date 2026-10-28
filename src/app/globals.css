@@ -45,6 +45,11 @@ table { text-indent: 0; border-color: inherit; border-collapse: collapse; }
   --amber-bg:   #fffbeb;
   --red:        #dc2626;
   --red-bg:     #fef2f2;
+  /* Where a figure CAME FROM, as a cell background — /labour-matrix and /estimate. Light enough
+     that every text colour the Matrix already uses (--text, --green-deep, and --red on an untimed
+     0.0, which never carries one) keeps its contrast: black on either is >15:1, --green-deep >6:1. */
+  --measured-bg:  #e2f4e8;
+  --estimated-bg: #fde7cc;
 }
 
 /* ── Base ──────────────────────────────────────────────────── */
@@ -3812,3 +3817,204 @@ body {
 .lm-cell-fig-timed { color: #166534; }
 .lm-cell-tag { font-size: 11px; color: var(--text-muted); white-space: nowrap; }
 .lm-cell-tag-none { color: var(--amber); font-weight: 600; }
+
+/* ── /estimate ──────────────────────────────────────────────────────────────────────────────
+   One job's operations × a range of models. A data-entry grid first: every input is the full
+   cell, so Tab and the arrows land on something the size of the figure. */
+.est-controls { padding: 14px 20px; margin-bottom: 16px; display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+.est-controls-sep { width: 1px; align-self: stretch; background: var(--border); margin: 0 4px; }
+.est-summary {
+  display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: baseline;
+  font-size: 13px; color: var(--text-muted); margin-bottom: 10px;
+}
+.est-summary strong { color: var(--text); font-size: 15px; }
+.est-tools {
+  padding: 10px 16px; margin-bottom: 10px; display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center;
+  font-size: 13px; color: var(--text-mid);
+}
+.est-tools-label { font-weight: 600; color: var(--text); }
+.est-tools-to strong { color: var(--text); }
+.est-tools-hint { flex-basis: 100%; font-size: 11.5px; color: var(--text-muted); }
+.est-btn { padding: 7px 14px; font-size: 13px; }
+.est-factor { display: inline-flex; align-items: center; gap: 4px; font-weight: 600; }
+.est-factor-input {
+  width: 56px; font-size: 13px; font-family: inherit; text-align: right; font-variant-numeric: tabular-nums;
+  border: 1.5px solid var(--border); border-radius: 8px; padding: 7px 8px; outline: none; background: var(--surface);
+}
+.est-factor-input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(0, 121, 193, 0.12); }
+.est-link { color: var(--blue); font-size: 12.5px; font-weight: 600; background: none; border: 0; padding: 2px 4px; cursor: pointer; white-space: nowrap; }
+.est-link:hover:not(:disabled) { text-decoration: underline; }
+.est-link:disabled { color: var(--text-muted); opacity: 0.5; cursor: default; }
+
+.est-legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 11.5px; color: var(--text-muted); margin-bottom: 10px; }
+.est-legend > span { display: inline-flex; align-items: center; gap: 6px; }
+.est-swatch { width: 18px; height: 13px; border: 1px solid var(--border); border-radius: 3px; display: inline-block; }
+
+.est-scroll { overflow: auto; max-height: calc(100vh - 360px); border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.est-table { border-collapse: separate; border-spacing: 0; font-size: 13px; font-variant-numeric: tabular-nums; }
+.est-table th, .est-table td { border-bottom: 1px solid var(--border); border-right: 1px solid var(--border); }
+.est-table thead th { position: sticky; background: var(--surface); z-index: 2; }
+.est-table thead tr:first-child th { top: 0; }
+.est-table thead tr:nth-child(2) th { top: 29px; }
+.est-th-corner, .est-td-op { position: sticky; left: 0; z-index: 1; background: var(--surface); text-align: left; }
+.est-table thead .est-th-corner { z-index: 3; vertical-align: bottom; }
+.est-th-corner { padding: 6px 12px; font-size: 11.5px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.est-th-group {
+  height: 29px; padding: 5px 8px; font-size: 11.5px; font-weight: 700; color: var(--text-mid);
+  text-align: left; white-space: nowrap; background: var(--bg) !important;
+}
+/* Model codes run to ~16 characters ("MS.24-4.DS-MY26"); they wrap at their own punctuation onto
+   a second line rather than being cut, because the code is what a column is found by. */
+.est-th-model { padding: 6px 4px; min-width: 88px; width: 88px; font-size: 11.5px; font-weight: 600; color: var(--text); vertical-align: bottom; }
+.est-th-model label { display: flex; flex-direction: column; align-items: center; gap: 4px; cursor: pointer; }
+.est-th-model input { width: 15px; height: 15px; accent-color: var(--blue); cursor: pointer; }
+.est-th-model span { max-width: 84px; text-align: center; line-height: 1.25; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+/* A model with measured times is the evidence the rest is reasoned from — marked at the head of
+   its column as well as in its cells. */
+.est-th-evidence { box-shadow: inset 0 -3px 0 var(--green); }
+.est-th-selected { background: var(--blue-light) !important; }
+.est-td-op { padding: 5px 12px; max-width: 260px; min-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; color: var(--text); }
+.est-td { text-align: right; padding: 0; height: 32px; }
+.est-td.est-measured { padding: 0 10px; color: var(--green-deep); font-weight: 600; }
+.est-input {
+  width: 100%; height: 32px; border: 0; padding: 0 10px; text-align: right; font: inherit;
+  font-variant-numeric: tabular-nums; background: transparent; color: var(--text); outline: none;
+}
+.est-input::placeholder { color: var(--text-muted); }
+.est-td-input:focus-within { box-shadow: inset 0 0 0 2px var(--blue); }
+.est-td-action { padding: 0 6px; background: var(--surface); }
+.est-th-action { background: var(--surface); }
+
+.est-measured { background: var(--measured-bg); }
+.est-estimated { background: var(--estimated-bg); }
+.est-dirty { background: var(--blue-light); }
+.est-dirty .est-input { font-weight: 700; color: var(--blue-dark); }
+.est-invalid { box-shadow: inset 0 0 0 2px var(--red); }
+.est-invalid .est-input { color: var(--red); }
+.est-na { background: repeating-linear-gradient(135deg, #f8f9fa 0 5px, #eef0f2 5px 10px); }
+/* Not linked: as things stand the work isn't done on this model. Faint, not hatched — it is still
+   an input, and typing into it is how applicability gets asserted. */
+.est-unlinked { background: #f6f7f9; }
+.est-unlinked .est-input::placeholder { color: transparent; }
+.est-td.est-unlinked { box-shadow: inset 0 0 0 1px #eef0f3; }
+/* A figure typed where there was no link — saving adds the link, so it is called out. */
+.est-dirty-new { box-shadow: inset 0 0 0 1.5px var(--blue); background-image: none; }
+.est-swatch.est-dirty-new { border: 1.5px dashed var(--blue); }
+/* Marked not applicable: the link goes on save. Hatched like the Matrix's "doesn't apply", with the
+   text struck through so it can't be read as a figure. */
+.est-na-pending { background: repeating-linear-gradient(135deg, #f8f9fa 0 5px, #e6e8eb 5px 10px); }
+.est-na-pending .est-input { color: var(--text-muted); text-decoration: line-through; }
+/* Decided not applicable (model_operation_exclusions) — the stored decision. Same hatch, plus the
+   placeholder "n/a" struck through, so it reads as settled rather than empty. A pending mark
+   (above) differs only in its dashed outline: not saved yet. */
+.est-excluded { background: repeating-linear-gradient(135deg, #f4f5f7 0 5px, #e6e8eb 5px 10px); }
+.est-excluded .est-input::placeholder { color: var(--text-muted); text-decoration: line-through; opacity: 1; }
+.est-na-pending { outline: 1.5px dashed #b8bcc4; outline-offset: -3px; }
+.est-swatch.est-na-pending { border-style: dashed; }
+/* The per-cell not-applicable control: out of the way until the cell is hovered or focused. */
+.est-td-input { position: relative; }
+.est-na-btn {
+  position: absolute; top: 1px; left: 2px; width: 15px; height: 15px; line-height: 13px;
+  font-size: 12px; font-weight: 700; color: var(--text-muted); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 4px; padding: 0; text-align: center;
+  opacity: 0; transition: opacity 0.1s;
+}
+/* Only inside the FOCUSED cell (or one already marked, for its undo) — never on hover. Revealed on
+   hover, it sat 2px from the figure in the cell to its left and read as that cell's control. */
+.est-na-btn { pointer-events: none; }
+.est-td-input:focus-within .est-na-btn, .est-na-pending .est-na-btn { opacity: 1; pointer-events: auto; }
+.est-na-btn:hover { color: var(--red); border-color: var(--red); }
+
+.est-table tfoot td, .est-table tfoot th { position: sticky; bottom: 0; background: var(--bg); border-top: 2px solid var(--text-muted); z-index: 1; }
+.est-table tfoot .est-td-op { z-index: 2; }
+.est-tf-label { font-weight: 700; }
+.est-tf-note { display: block; font-size: 10.5px; font-weight: 500; color: var(--text-muted); }
+.est-tf { text-align: right; padding: 5px 10px; font-weight: 700; white-space: nowrap; }
+.est-tf-count { display: block; font-size: 10.5px; font-weight: 500; color: var(--text-muted); }
+/* A wholly measured column's total is the anchor — the job figure the Labour Matrix shows. */
+.est-tf-measured { color: var(--green-deep); }
+.est-tf-est { color: var(--text); }
+
+.est-savebar {
+  position: sticky; bottom: 0; z-index: 4; margin-top: 12px;
+  display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: center; justify-content: flex-end;
+  padding: 12px 16px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: 0 -2px 10px rgba(0,0,0,0.05);
+}
+.est-savebar-on { border-color: var(--blue); }
+.est-savebar-count { margin-right: auto; font-size: 13.5px; color: var(--text-mid); }
+/* Apply (fills cells) sits left of, and apart from, Discard + Save estimates (writes). */
+.est-savebar-apply { display: inline-flex; padding-right: 14px; border-right: 1px solid var(--border); }
+.est-savebar-save { display: inline-flex; gap: 10px; }
+.est-savebar-count strong { color: var(--text); }
+.est-savebar-invalid { color: var(--red); font-weight: 600; }
+/* First-time applicability: the figure to stop and check before saving a bulk fill. */
+.est-savebar-links { color: #9a4a00; font-weight: 600; }
+.est-savebar-links strong {
+  color: #9a4a00; font-size: 15px;
+  padding: 1px 7px; border-radius: 4px; background: var(--estimated-bg);
+}
+.est-notice { font-size: 12.5px; padding: 6px 10px; border-radius: 8px; }
+
+/* Round 2: Apply on its own line under the controls it acts on; ticks on series and rows. */
+.est-tools-apply { flex-basis: 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.est-tools-job { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; }
+.est-tools-warn { color: var(--red); font-size: 12.5px; font-weight: 600; }
+.est-tick-count { display: inline-flex; align-items: center; gap: 4px; font-size: 12.5px; color: var(--text-mid); }
+.est-group-tick { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.est-group-tick input, .est-op-label input { width: 14px; height: 14px; margin: 0; accent-color: var(--blue); cursor: pointer; flex: none; }
+.est-op-label { display: flex; align-items: center; gap: 8px; min-width: 0; cursor: pointer; }
+.est-op-label span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.est-row-selected .est-td-op { background: var(--blue-light); }
+
+/* Section view: each job a block — a heading row, its operations, its own total. */
+.est-job-head th, .est-job-head td { background: var(--bg); border-top: 2px solid var(--border); height: 30px; }
+.est-job-name { font-weight: 700; font-size: 13px; color: var(--text); background: var(--bg) !important; }
+.est-job-total th, .est-job-total td { background: var(--bg); border-top: 2px solid var(--text-muted); }
+.est-job-total .est-td-op { background: var(--bg); }
+
+/* Notes on one recording: an "i" in the cell's top-right corner, absolutely placed so the figure
+   and the column width never move for it. Hidden while the cell's input has focus (being
+   edited); Tab from the input lands on it. */
+.est-td.est-measured { position: relative; }
+.est-cell-info {
+  position: absolute; top: 2px; right: 2px; width: 12px; height: 12px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  font: italic 700 9px/1 Georgia, serif; color: var(--blue); background: var(--surface);
+  border: 1px solid var(--blue); border-radius: 50%; cursor: pointer; z-index: 1;
+}
+.est-cell-info:hover, .est-cell-info:focus-visible, .est-info-on { background: var(--blue); color: #fff; }
+.est-cell-info:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+.est-input:focus ~ .est-cell-info { visibility: hidden; }
+.est-info-legend { position: static; cursor: default; }
+.est-notes-pop {
+  position: fixed; z-index: 50; width: 360px; max-height: 380px; overflow: auto;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0,0,0,0.14); font-size: 13px;
+}
+.est-notes-head {
+  position: sticky; top: 0; display: flex; align-items: flex-start; gap: 8px;
+  padding: 10px 12px; background: var(--surface); border-bottom: 1px solid var(--border);
+}
+.est-notes-sub { display: flex; align-items: center; gap: 6px; margin-top: 2px; color: var(--text-muted); font-size: 12px; }
+.est-notes-close { margin-left: auto; border: 0; background: none; font-size: 18px; line-height: 1; color: var(--text-muted); cursor: pointer; }
+.est-notes-close:hover { color: var(--text); }
+.est-notes-list { list-style: none; margin: 0; padding: 4px 12px 10px; }
+.est-notes-list li { padding: 8px 0; border-bottom: 1px solid var(--border); }
+.est-notes-list li:last-child { border-bottom: 0; }
+.est-notes-list p { margin: 0; color: var(--text); white-space: pre-wrap; }
+.est-notes-meta { margin-top: 3px; font-size: 11.5px; color: var(--text-muted); }
+.est-notes-kind { padding: 1px 6px; border-radius: 4px; font-weight: 600; }
+.est-notes-measured { background: var(--measured-bg); color: var(--green-deep); }
+.est-notes-estimated { background: var(--estimated-bg); color: #9a4a00; }
+
+/* One note for the whole save. */
+.est-savebar-note {
+  flex: 1 1 300px; min-width: 220px; font: inherit; font-size: 13px;
+  border: 1.5px solid var(--border); border-radius: 8px; padding: 7px 10px; outline: none; background: var(--surface);
+}
+.est-savebar-note:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(0, 121, 193, 0.12); }
+.est-notice-ok { background: var(--green-bg); color: var(--green-deep); }
+.est-notice-warn { background: var(--amber-bg); color: #92400e; border: 1px solid #fde68a; margin-bottom: 8px; }
+.est-savebar .est-notice-warn { margin-bottom: 0; }
+.est-foot { margin-top: 16px; font-size: 12px; color: var(--text-muted); }

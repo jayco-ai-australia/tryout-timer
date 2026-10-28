@@ -44,6 +44,14 @@ import type { OperationTime, OperationTimeNote } from './types'
  * re-collected (Caravan: 645 live records against 758 retired and 882 hidden), and the retired
  * batch is exactly the labour that must no longer appear in a total. The rule was reversed on
  * purpose; a coverage figure that drops because of it is the honest one.
+ *
+ * ── is_estimated is NOT an exclusion flag ────────────────────────────────────────────────────
+ * An estimate (/estimate — a figure extrapolated from measured models, never observed) counts
+ * toward labour and coverage exactly as a measured record does, so countsTowardLabour and
+ * onlyCountedTimes do not look at it. It is held to one rule of its own, enforced in the single
+ * writer: it never replaces or archives a measured record (recordOperationTime's estimate guard).
+ * Reporting splits measured from estimated ALONGSIDE the existing figures — lib/coverage's
+ * estimateOnlyComboKeys — and never by changing them.
  */
 
 /**
@@ -469,7 +477,7 @@ export interface ModelTotalFetchResult extends ModelTotalResult {
     operations: { id: string; job_id: string; primary_operator_id: string | null; secondary_operator_id: string | null }[]
     /** is_active and is_hidden ride along so coverage built from these rows drops retired and
      * hidden records exactly as the total did (computeCoverageCombos requires both). */
-    operationTimes: (TimeExclusionFlags & { id: string; operation_id: string })[]
+    operationTimes: (TimeExclusionFlags & { id: string; operation_id: string; is_estimated: boolean })[]
     operationTimeModels: TimeModelRow[]
     /** Hop 3's jobs, with the line each one belongs to. `jobs.production_line_id` is the source
      * of truth for which line a piece of labour sits on (operation_times carries a copy stamped
@@ -560,14 +568,17 @@ export async function fetchModelTotal(supabase: SupabaseClient, productId: strin
   // A primary-key lookup, so chunking alone is complete: 100 ids can return at most 100 rows,
   // well under the response cap. Order is not asked for here and not relied on — the rows are
   // grouped by operation_id downstream, never read positionally.
-  const times = await selectIn<TimeRow>(timeIds, async (chunk) => {
+  // is_estimated rides along for lib/coverage's measured/estimated split; nothing in the total
+  // reads it — an estimate is labour like any other record.
+  type ModelTotalTimeRow = TimeRow & { is_estimated: boolean }
+  const times = await selectIn<ModelTotalTimeRow>(timeIds, async (chunk) => {
     const res = await supabase
       .from('operation_times')
-      .select(`id, operation_id, total_minutes, superseded_by, ${TIME_FLAG_COLUMNS}, created_at`)
+      .select(`id, operation_id, total_minutes, superseded_by, is_estimated, ${TIME_FLAG_COLUMNS}, created_at`)
       .in('id', chunk)
     if (res.error) logSupabaseError('hop 2 — operation_times WHERE id IN (…)', res.error)
     // The row shape is stated here, not inferred — see TIME_PARENT_JOIN.
-    return res as unknown as { data: TimeRow[] | null; error: typeof res.error }
+    return res as unknown as { data: ModelTotalTimeRow[] | null; error: typeof res.error }
   })
   console.log(
     '[modelTotalMinutes] hop 2 — operation_times WHERE id IN (…):',
@@ -676,7 +687,7 @@ export async function fetchModelTotal(supabase: SupabaseClient, productId: strin
     },
     raw: {
       operations: operations.map((o) => ({ id: o.id, job_id: o.job_id, primary_operator_id: o.primary_operator_id, secondary_operator_id: o.secondary_operator_id })),
-      operationTimes: times.map((t) => ({ id: t.id, operation_id: t.operation_id, is_active: t.is_active, is_hidden: t.is_hidden, operations: t.operations })),
+      operationTimes: times.map((t) => ({ id: t.id, operation_id: t.operation_id, is_estimated: t.is_estimated, is_active: t.is_active, is_hidden: t.is_hidden, operations: t.operations })),
       operationTimeModels: linkRows,
       jobs: jobs.map((j) => ({ id: j.id, name: j.name, production_line_id: j.production_line_id, is_active: j.is_active })),
     },
@@ -711,6 +722,13 @@ export interface RecordOperationTimeInput {
   /** Defaults to false — set true only for bulk-imported historical data. */
   isImported?: boolean
   /**
+   * Defaults to false. true for a figure nobody observed — /estimate's extrapolation from the
+   * measured models of a range. An estimate is held to one extra rule a measured time is not: it
+   * may never become the current record over a MEASURED one, and it never archives one. See the
+   * estimate guard in recordOperationTime.
+   */
+  isEstimated?: boolean
+  /**
    * Filing carried forward from an EXISTING run, for the one caller that is re-recording one
    * rather than observing new work: splitOperationTimeForModel.
    *
@@ -735,6 +753,37 @@ export interface RecordedOperationTime {
   created: OperationTime
   savedProductIds: string[]
   refusedProductIds: string[]
+  /** An ESTIMATE's models that already hold a measured current record, and so were not written
+   * — measured always wins. Always empty for a measured write. A subset of nothing else: these
+   * are not in refusedProductIds, which means "doesn't apply". */
+  measuredProductIds: string[]
+}
+
+/**
+ * recordOperationTime was asked for an estimate and every model it was handed already has a
+ * measured figure for the operation, so nothing was written. Distinct so /estimate can say "this
+ * was measured while you were typing" rather than report a database failure.
+ */
+export class MeasuredTimeExistsError extends Error {
+  constructor(public readonly operationId: string, public readonly productIds: string[]) {
+    super(
+      productIds.length === 1
+        ? 'This operation has been measured on this model, so the estimate was not saved — a ' +
+          'measured time is never replaced by an estimate.'
+        : `This operation has been measured on all ${productIds.length} of these models, so no ` +
+          'estimate was saved — a measured time is never replaced by an estimate.'
+    )
+    this.name = 'MeasuredTimeExistsError'
+  }
+}
+
+/**
+ * Does this pair already hold a MEASURED figure — a record that counts, is current and was not
+ * estimated? The one test behind "measured always wins": recordOperationTime refuses an estimate
+ * where it is true, and /estimate makes the cell read-only where it is true.
+ */
+export function isMeasuredCurrent(time: TimeExclusionFlags & { superseded_by: string | null; is_estimated: boolean }): boolean {
+  return time.superseded_by == null && !time.is_estimated && countsTowardLabour(time)
 }
 
 /**
@@ -1051,7 +1100,7 @@ export async function recordOperationTime(
   const {
     operationId, productIds, operatorId, collectedBy, totalMinutes,
     startedAt = null, completedAt = null, pausedDurationSeconds = 0,
-    chassisId = null, isImported = false,
+    chassisId = null, isImported = false, isEstimated = false,
   } = input
 
   if (!(totalMinutes > 0)) {
@@ -1082,10 +1131,34 @@ export async function recordOperationTime(
    * round trip, and it also covers the case where a pair was unlinked while a stopwatch ran.
    */
   const linkedIds = await fetchLinkedProductIds(supabase, operationId, productIds)
-  const savedProductIds = [...new Set(productIds)].filter((id) => linkedIds.has(id))
+  let savedProductIds = [...new Set(productIds)].filter((id) => linkedIds.has(id))
   const refusedProductIds = [...new Set(productIds)].filter((id) => !linkedIds.has(id))
   if (savedProductIds.length === 0) {
     throw new UnlinkedOperationError(operationId, refusedProductIds)
+  }
+
+  /**
+   * ── THE ESTIMATE GUARD: measured always wins ──────────────────────────────────────────────
+   *
+   * An estimate is only written for a pair with no MEASURED current record. /estimate already
+   * makes such a cell read-only, but its grid is a read from when the page loaded, and a time
+   * can be recorded on the floor while somebody types — so the question is asked again here,
+   * against the database, immediately before the insert. Same failure posture as the
+   * applicability guard: a failed read throws before anything is written.
+   *
+   * Hidden and retired measured records do not block (they are not a figure — isMeasuredCurrent
+   * goes through countsTowardLabour), and they are not archived either: see the supersede step.
+   */
+  let measuredProductIds: string[] = []
+  if (isEstimated) {
+    const operationTimes = await fetchOperationTimesWithModels(supabase, operationId)
+    const measured = new Set<string>()
+    for (const t of operationTimes) {
+      if (isMeasuredCurrent(t)) for (const id of t.productIds) measured.add(id)
+    }
+    measuredProductIds = savedProductIds.filter((id) => measured.has(id))
+    savedProductIds = savedProductIds.filter((id) => !measured.has(id))
+    if (savedProductIds.length === 0) throw new MeasuredTimeExistsError(operationId, measuredProductIds)
   }
 
   // Resolved BEFORE provenance so the degraded "fall back to the operator's team/line" path
@@ -1108,6 +1181,7 @@ export async function recordOperationTime(
       completed_at: completedAt,
       total_minutes: totalMinutes,
       is_imported: isImported,
+      is_estimated: isEstimated,
       // Written explicitly, never left to the column defaults: a new record counts, and says so.
       is_active: true,
       is_hidden: false,
@@ -1142,8 +1216,12 @@ export async function recordOperationTime(
   for (const productId of savedProductIds) {
     try {
       const pairTimes = await fetchOperationTimesForModel(supabase, operationId, productId)
+      // An estimate archives only earlier ESTIMATES. A measured record — even a hidden or retired
+      // one, which the guard above let through because it is not a figure — is never pointed at
+      // an estimate: superseded_by is the record of what replaced what, and an estimate does not
+      // replace an observation.
       const previousCurrent = pairTimes
-        .filter((t) => t.id !== created.id && t.superseded_by == null)
+        .filter((t) => t.id !== created.id && t.superseded_by == null && (!isEstimated || t.is_estimated))
         .map((t) => t.id)
       await setSupersededBy(supabase, previousCurrent, created.id)
     } catch (err) {
@@ -1157,7 +1235,7 @@ export async function recordOperationTime(
     }
   }
 
-  return { created: created as OperationTime, savedProductIds, refusedProductIds }
+  return { created: created as OperationTime, savedProductIds, refusedProductIds, measuredProductIds }
 }
 
 // ── operation_time_models: the junction, and the only three functions that touch it ────────
@@ -1379,6 +1457,17 @@ export async function fetchOperationTimesForModel(
   operationId: string,
   productId: string
 ): Promise<OperationTimeWithModels[]> {
+  const times = await fetchOperationTimesWithModels(supabase, operationId)
+  return times.filter((t) => t.productIds.includes(productId))
+}
+
+/** Every recorded run of one operation, across all its models, each with its full fan-out —
+ * fetchOperationTimesForModel before its narrowing, for a caller asking about several models of
+ * the same operation at once (recordOperationTime's estimate guard) in one read. */
+async function fetchOperationTimesWithModels(
+  supabase: SupabaseClient,
+  operationId: string
+): Promise<OperationTimeWithModels[]> {
   const times = await fetchAllRows<OperationTime & TimeExclusionFlags>(
     () => supabase
       // The parent flags ride along (TIME_PARENT_JOIN): the times drawer marks a record whose
@@ -1399,9 +1488,7 @@ export async function fetchOperationTimesForModel(
     else productIdsByTime.set(link.operation_time_id, [link.product_id])
   }
 
-  return times
-    .map((t) => ({ ...t, productIds: productIdsByTime.get(t.id) ?? [] }))
-    .filter((t) => t.productIds.includes(productId))
+  return times.map((t) => ({ ...t, productIds: productIdsByTime.get(t.id) ?? [] }))
 }
 
 /** What an edit may change on an existing run. Every field optional: an omitted one is left
@@ -1646,6 +1733,9 @@ export async function splitOperationTimeForModel(
       pausedDurationSeconds: original.paused_duration_seconds ?? 0,
       chassisId: original.chassis_id,
       isImported: original.is_imported,
+      // A split is the same run, so an estimate stays an estimate — otherwise peeling one model
+      // off would quietly turn an inferred figure into a measured one.
+      isEstimated: original.is_estimated,
       provenance: original.team_id !== null || original.production_line_id !== null
         ? { teamId: original.team_id, productionLineId: original.production_line_id }
         : undefined,

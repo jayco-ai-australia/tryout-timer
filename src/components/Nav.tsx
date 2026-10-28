@@ -213,6 +213,9 @@ export default function Nav() {
       items: [
         { href: '/collect', label: 'Collect', icon: <ClipboardCheckIcon /> },
         { href: '/tryouts', label: 'Try Outs', icon: <TruckIcon /> },
+        // Filling a range from what was measured is still collecting — it is where the floor's
+        // knowledge of the models that weren't timed gets written down.
+        { href: '/estimate', label: 'Estimate', icon: <CalculatorIcon /> },
       ],
     },
     {
@@ -546,6 +549,9 @@ function PackageIcon() {
       <path d="M12 22V12" />
     </Icon>
   )
+}
+function CalculatorIcon() {
+  return <Icon><rect x="4" y="2" width="16" height="20" rx="2" /><path d="M8 6h8" /><path d="M8 11h.01M12 11h.01M16 11h.01M8 15h.01M12 15h.01M16 15h.01M8 19h.01M12 19h.01M16 19h.01" /></Icon>
 }
 function PrinterIcon() {
   return <Icon><path d="M6 9V2h12v7" /><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2" /><path d="M6 14h12v8H6z" /></Icon>

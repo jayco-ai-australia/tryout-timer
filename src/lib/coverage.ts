@@ -121,6 +121,60 @@ export function computeCoverageCombos(input: {
   return [...required.values()]
 }
 
+/** The key a (job, model) combo is addressed by — the one computeCoverageCombos builds. */
+export function coverageComboKey(jobId: string, productId: string): string {
+  return `${jobId}:${productId}`
+}
+
+/** A time row as the measured/estimated split needs it: the coverage input plus is_estimated.
+ * Required, for the same reason the exclusion flags are — a read that forgot to select it would
+ * report every estimate as measured and nothing would say so. */
+export interface CoverageEstimatedTimeInput extends CoverageOperationTimeInput { is_estimated: boolean }
+
+/**
+ * ── Measured vs estimated: a split ALONGSIDE coverage, never a change to it ────────────────
+ *
+ * An estimate covers a combo exactly as a measured time does — computeCoverageCombos does not
+ * look at is_estimated, and must not. This answers the second question every coverage figure can
+ * now carry: "of the covered combos, how many are covered ONLY by estimates?" — i.e. how many
+ * would turn back into gaps if every estimate were taken away. "coverage 1115 / 1683, of which 402
+ * estimated".
+ *
+ * Built on the same countsTowardLabour as the coverage itself, so a hidden or retired record is
+ * neither measured nor estimated here, and the result is always a subset of the covered combos
+ * handed in. A combo covered by one measured operation and one estimated one is MEASURED here:
+ * it would stay covered without the estimate. (The Labour Matrix colours a mixed CELL as
+ * estimated — that is a statement about how much of a FIGURE is inferred, a different question
+ * from whether the combo is covered at all.)
+ */
+export function estimateOnlyComboKeys(
+  combos: CoverageCombo[],
+  input: {
+    operations: CoverageOperationInput[]
+    operationTimes: CoverageEstimatedTimeInput[]
+    operationTimeModels: CoverageOperationTimeModelInput[]
+  }
+): Set<string> {
+  const jobIdByOperationId = new Map(input.operations.map((o) => [o.id, o.job_id]))
+  const measuredJobByTimeId = new Map<string, string>()
+  for (const t of input.operationTimes) {
+    if (t.is_estimated || !countsTowardLabour(t)) continue
+    const jobId = jobIdByOperationId.get(t.operation_id)
+    if (jobId) measuredJobByTimeId.set(t.id, jobId)
+  }
+  const measuredKeys = new Set<string>()
+  for (const tm of input.operationTimeModels) {
+    const jobId = measuredJobByTimeId.get(tm.operation_time_id)
+    if (jobId) measuredKeys.add(coverageComboKey(jobId, tm.product_id))
+  }
+  const out = new Set<string>()
+  for (const c of combos) {
+    const key = coverageComboKey(c.jobId, c.productId)
+    if (c.covered && !measuredKeys.has(key)) out.add(key)
+  }
+  return out
+}
+
 export function aggregateCoverage(combos: CoverageCombo[]): AggregateCoverage {
   const totalRequired = combos.length
   const totalCovered = combos.filter((c) => c.covered).length
