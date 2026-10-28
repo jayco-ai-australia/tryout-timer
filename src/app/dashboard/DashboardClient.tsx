@@ -307,12 +307,12 @@ export default function DashboardClient({ role, lines, initialLineId }: Props) {
       // aggregates. The flags are still selected — the helpers' types require them, and
       // modelTotalMinutes and computeCoverageCombos apply the same rule again.
       const timeIds = [...new Set(operationTimeModels.map((tm) => tm.operation_time_id))]
-      const operationTimes = await fetchAllChunked<{ id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null; is_estimated: boolean; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null }>(
+      const operationTimes = await fetchAllChunked<{ id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null; chassis_id: string | null; is_estimated: boolean; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null }>(
         timeIds, READ_CHUNK,
         (chunk) => onlyCountedTimes(supabase
-          .from('operation_times').select(`id, operation_id, total_minutes, superseded_by, is_estimated, ${TIME_FLAG_COLUMNS}`)
+          .from('operation_times').select(`id, operation_id, total_minutes, superseded_by, chassis_id, is_estimated, ${TIME_FLAG_COLUMNS}`)
           .in('id', chunk).is('superseded_by', null))
-          .order('id') as unknown as RangeableQuery<{ id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null; is_estimated: boolean; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null }>,
+          .order('id') as unknown as RangeableQuery<{ id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null; chassis_id: string | null; is_estimated: boolean; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null }>,
         { table: 'operation_times' }
       )
 

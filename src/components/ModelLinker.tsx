@@ -385,7 +385,7 @@ export default function ModelLinker({ operationId, operationName, productionLine
       // the shared helper and each record labelled with what it is.
       supabase
         .from('operation_times')
-        .select(`id, total_minutes, created_at, collected_by, superseded_by, ${TIME_FLAG_COLUMNS}`)
+        .select(`id, total_minutes, created_at, collected_by, superseded_by, chassis_id, ${TIME_FLAG_COLUMNS}`)
         .eq('operation_id', operationId)
         .order('created_at', { ascending: false }),
     ])
@@ -396,7 +396,7 @@ export default function ModelLinker({ operationId, operationName, productionLine
     // The row shape is stated here, not inferred — see lib/operationTimes' TIME_PARENT_JOIN.
     const times = (timeData ?? []) as unknown as {
       id: string; total_minutes: number | null; created_at: string; collected_by: string | null
-      superseded_by: string | null; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null
+      superseded_by: string | null; chassis_id: string | null; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null
     }[]
     const timeIds = times.map((t) => t.id)
     const [timeModelsResult, notesResult] = await Promise.all([
@@ -445,7 +445,7 @@ export default function ModelLinker({ operationId, operationName, productionLine
     // to plain productId, since this component is always scoped to one operation.
     const rawTimes = times.map((t) => ({
       id: t.id, operation_id: operationId, total_minutes: t.total_minutes,
-      superseded_by: t.superseded_by, is_active: t.is_active, is_hidden: t.is_hidden, operations: t.operations, created_at: t.created_at,
+      superseded_by: t.superseded_by, chassis_id: t.chassis_id, is_active: t.is_active, is_hidden: t.is_hidden, operations: t.operations, created_at: t.created_at,
     }))
     const pairStats = currentForOperation(rawTimes, timeModels)
     const nextStats: Record<string, OperationTimeStat> = {}

@@ -116,7 +116,7 @@ export async function fetchEstimateGrid(supabase: SupabaseClient, jobIds: string
     opIds, READ_CHUNK,
     (chunk) => supabase
       .from('operation_times')
-      .select(`id, operation_id, total_minutes, superseded_by, is_estimated, created_at, ${TIME_FLAG_COLUMNS}`)
+      .select(`id, operation_id, total_minutes, superseded_by, chassis_id, is_estimated, created_at, ${TIME_FLAG_COLUMNS}`)
       .in('operation_id', chunk)
       .order('id') as unknown as RangeableQuery<GridTimeRow>,
     { table: 'operation_times' },
@@ -131,26 +131,22 @@ export async function fetchEstimateGrid(supabase: SupabaseClient, jobIds: string
 
   // Measured always wins, including in the one state where the figure alone would not say so: a
   // pair briefly holding a measured AND an estimated current record (a time recorded on the floor
-  // in the same moment an estimate was saved). currentForOperation takes the newest; the grid
-  // still treats the pair as measured, so nothing here offers to edit over an observation.
-  const measuredByPair = new Map<string, GridTimeRow>()
-  for (const tm of timeModels) {
-    const t = timeById.get(tm.operation_time_id)
-    if (!t || !isMeasuredCurrent(t) || t.total_minutes == null) continue
-    const key = operationProductKey(t.operation_id, tm.product_id)
-    const prev = measuredByPair.get(key)
-    if (!prev || t.created_at > prev.created_at) measuredByPair.set(key, t)
-  }
+  // in the same moment an estimate was saved). The grid still treats the pair as measured, so
+  // nothing here offers to edit over an observation. Its figure is the shared rule run over the
+  // measured records alone — summed per van, averaged across vans — never a pick of its own.
+  const measuredStats = currentForOperation(times.filter((t) => !t.is_estimated), timeModels)
 
   const cells = new Map<string, EstimateCellState>()
-  /** The record behind each cell's figure — whose notes the cell carries. */
+  /** The record behind each cell's figure — whose notes the cell carries. With several records
+   * behind a figure, the newest. */
   const recordByPair = new Map<string, GridTimeRow>()
-  const pairKeys = new Set([...Object.keys(stats), ...measuredByPair.keys()])
+  const pairKeys = new Set([...Object.keys(stats), ...Object.keys(measuredStats)])
   for (const key of pairKeys) {
-    const measured = measuredByPair.get(key)
-    if (measured) {
-      cells.set(key, { kind: 'measured', minutes: measured.total_minutes as number })
-      recordByPair.set(key, measured)
+    const measured = measuredStats[key]
+    const measuredRow = measured ? timeById.get(measured.currentId) : undefined
+    if (measured && measuredRow) {
+      cells.set(key, { kind: 'measured', minutes: measured.minutes })
+      recordByPair.set(key, measuredRow)
       continue
     }
     const stat = stats[key]

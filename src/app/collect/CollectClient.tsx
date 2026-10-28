@@ -456,7 +456,7 @@ export default function CollectClient({ lines, userId }: Props) {
         // behind the figure, and currentForOperation counts that from the rows it is handed. It
         // picks the current record itself — the query's job is to select the column, not to
         // pre-decide the answer.
-        supabase.from('operation_times').select(`id, operation_id, total_minutes, superseded_by, ${TIME_FLAG_COLUMNS}, created_at`).eq('operation_id', opId),
+        supabase.from('operation_times').select(`id, operation_id, total_minutes, superseded_by, chassis_id, ${TIME_FLAG_COLUMNS}, created_at`).eq('operation_id', opId),
       ])
       if (timesError) throw new Error(timesError.message)
 

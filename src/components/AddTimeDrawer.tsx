@@ -393,11 +393,11 @@ export default function AddTimeDrawer({
         // record per pair — the badge shows labour content, not the sum of every run ever taken.
         // Retired and hidden records are filtered at the query (onlyCountedTimes): this read only
         // feeds a badge, and a model whose only records are excluded has to keep reading as a gap.
-        type RawTime = { id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null; created_at: string }
+        type RawTime = { id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null; chassis_id: string | null; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null; created_at: string }
         const times = await fetchAllChunked<RawTime>(
           opIds, READ_CHUNK,
           (chunk) => onlyCountedTimes(supabase.from('operation_times')
-            .select(`id, operation_id, total_minutes, superseded_by, ${TIME_FLAG_COLUMNS}, created_at`)
+            .select(`id, operation_id, total_minutes, superseded_by, chassis_id, ${TIME_FLAG_COLUMNS}, created_at`)
             .in('operation_id', chunk)).order('id') as unknown as RangeableQuery<RawTime>,
           { table: 'operation_times' }
         )

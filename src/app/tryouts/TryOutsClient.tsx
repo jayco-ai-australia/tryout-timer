@@ -239,6 +239,8 @@ interface VanTime {
   /** null = the current record for its model; set = archived behind that one. Carried so the
    * van log can pick the figure through the shared helper and label the rest as history. */
   supersededBy: string | null
+  /** The van it was timed on — needed by the shared helper to combine several current records. */
+  chassisId: string | null
   /** Listed and marked, never counted — the shared helper drops it from the figure. */
   isHidden: boolean
   /** is_active = false. Listed and marked, never counted — dropped by the same helper. */
@@ -670,11 +672,11 @@ export default function TryOutsClient({ userId, role }: Props) {
     // it feeds shows history. superseded_by is selected so currentByOperation can pick the figure.
     const { data: timeRows, error: timesError } = await supabase
       .from('operation_times')
-      .select(`id, operation_id, operator_id, total_minutes, created_at, superseded_by, ${TIME_FLAG_COLUMNS}, collected_by`)
+      .select(`id, operation_id, operator_id, total_minutes, created_at, superseded_by, chassis_id, ${TIME_FLAG_COLUMNS}, collected_by`)
       .eq('chassis_id', context.chassisId)
       .order('created_at', { ascending: false })
     if (timesError) { setVanError(timesError.message); setLoadingVan(false); return }
-    const times = (timeRows ?? []) as unknown as { id: string; operation_id: string; operator_id: string | null; total_minutes: number | null; created_at: string; superseded_by: string | null; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null; collected_by: string | null }[]
+    const times = (timeRows ?? []) as unknown as { id: string; operation_id: string; operator_id: string | null; total_minutes: number | null; created_at: string; superseded_by: string | null; chassis_id: string | null; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null; collected_by: string | null }[]
 
     const operatorIds = [...new Set(times.map((t) => t.operator_id).filter((id): id is string => !!id))]
     const operatorNameById = new Map<string, string>()
@@ -692,6 +694,7 @@ export default function TryOutsClient({ userId, role }: Props) {
       totalMinutes: t.total_minutes,
       createdAt: t.created_at,
       supersededBy: t.superseded_by,
+      chassisId: t.chassis_id,
       isHidden: t.is_hidden,
       isRetired: isRetiredTime(t),
       collectedBy: t.collected_by,
@@ -821,7 +824,7 @@ export default function TryOutsClient({ userId, role }: Props) {
   const vanStatByOperation = useMemo(
     () => currentByOperation(vanTimes.map((t) => ({
       id: t.id, operation_id: t.operationId, total_minutes: t.totalMinutes,
-      superseded_by: t.supersededBy, is_active: !t.isRetired, is_hidden: t.isHidden, operations: LIVE_PARENTS, created_at: t.createdAt,
+      superseded_by: t.supersededBy, chassis_id: t.chassisId, is_active: !t.isRetired, is_hidden: t.isHidden, operations: LIVE_PARENTS, created_at: t.createdAt,
     }))),
     [vanTimes]
   )

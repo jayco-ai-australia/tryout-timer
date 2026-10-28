@@ -57,17 +57,28 @@ import type { OperationTime, OperationTimeNote } from './types'
 /**
  * A labour figure for one operation (optionally scoped to one model), and the history behind it.
  *
- * `minutes` USED TO BE the mean of every recorded run. It is not any more: it is the CURRENT
- * record's total_minutes, full stop. A run is a measurement of the same work, not a sample of a
- * distribution — three runs of an operation are three attempts to state one figure, and the
- * latest agreed one is the answer. Averaging them made every re-measure drag the number halfway
- * back to a figure somebody had already decided was wrong.
+ * `minutes` USED TO BE the mean of every recorded run. It is not any more: it is built from the
+ * CURRENT records only. Superseded runs are history and never averaged back in — averaging them
+ * made every re-measure drag the number halfway back to a figure somebody had already decided was
+ * wrong. A record is superseded only by a deliberate act on it (promoting another, deleting it);
+ * recording a new time never archives anything (recordOperationTime).
+ *
+ * Usually a pair has ONE current record and the figure is simply its total_minutes. It can hold
+ * several — a merge moves records onto one operation without superseding any, and two operators
+ * working the same van in parallel each bank their own — and then they combine by the rule in
+ * pickCurrent: summed within a chassis, averaged across chassis. See combineCurrentRecords.
  */
 export interface OperationTimeStat {
-  /** The current record's total_minutes — THE labour content for this pair. */
+  /** THE labour content for this pair — see combineCurrentRecords. */
   minutes: number
-  /** Which record that is, so a caller can open or promote against it. */
+  /** The newest current record, so a caller can open or promote against it. When `combined` is
+   * more than 1 it is one of several records behind the figure, not the figure itself. */
   currentId: string
+  /** How many current records the figure is built from. 1 in the ordinary case. */
+  combined: number
+  /** How many observations were averaged: one per chassis (its records summed), plus one for the
+   * newest record with no chassis. 1 in the ordinary case. */
+  observations: number
   /** How many superseded records sit behind it. Displayed as history, never averaged in.
    * Hidden records are not included — they are not part of the figure's history either. */
   archived: number
@@ -82,9 +93,11 @@ export interface OperationTimeStat {
  * times, /tryouts' van log, /model-total's breakdown and the times drawer.
  */
 export function historyLabel(stat: OperationTimeStat): string {
+  const current = stat.combined <= 1 ? 'current'
+    : `${stat.combined} current records combined${stat.observations > 1 ? ` over ${stat.observations} observations` : ''}`
   return stat.archived === 0
-    ? 'current, no earlier records'
-    : `current + ${stat.archived} archived`
+    ? (stat.combined <= 1 ? 'current, no earlier records' : current)
+    : `${current} + ${stat.archived} archived`
 }
 
 /**
@@ -239,23 +252,65 @@ export interface TimeRow extends TimeExclusionFlags {
   operation_id: string
   total_minutes: number | null
   superseded_by: string | null
-  /** Only used to break a tie if the data ever holds two current rows for one pair. */
+  /** REQUIRED, for the same reason as superseded_by: it decides how several current records
+   * combine (combineCurrentRecords). A read that left it out would treat every record as having no
+   * chassis and average what should be summed. */
+  chassis_id: string | null
+  /** Only used to choose currentId when the data holds several current rows for one pair. */
   created_at?: string
 }
 interface TimeModelRow { operation_time_id: string; product_id: string }
 
+/** Sort order, newest record first; id breaks a created_at tie so the answer is deterministic. */
+function newerFirst(a: TimeRow, b: TimeRow): number {
+  const byDate = (b.created_at ?? '').localeCompare(a.created_at ?? '')
+  return byDate !== 0 ? byDate : b.id.localeCompare(a.id)
+}
+
 /**
- * Pick the current row out of a pair's rows, and count what it replaced.
+ * How a pair's CURRENT records combine into one figure — THE rule, written once:
  *
- * THE one implementation of "which of these is the figure". Both public helpers below call it,
- * and nothing else may re-derive it — this logic was inlined in seven places once and the copies
- * drifted, which is the whole reason for the rule.
+ *   for each chassis with records   sum its records         = one observation
+ *   records with no chassis         the NEWEST one          = one observation
+ *   the figure                      the average of the observations
  *
- * Exactly one row per pair should have superseded_by = null. Where the data holds more than one
- * (a half-applied write, a hand edit), the newest wins rather than the first encountered, so the
- * figure is at least deterministic between renders instead of depending on row order. Where it
- * holds none, there is no figure: null, and the caller renders the pair as untimed rather than
- * quietly promoting an archived run to headline status.
+ * Within one van, records on the same operation are parts of the work: a merge folds several
+ * operations' runs onto one, and parallel operators each time their own share. They add up.
+ * Across vans they are repeat observations of the same work, so they average.
+ *
+ * Chassis-less records — estimates, imported standards — are NEVER summed with each other, and
+ * not averaged either: the newest stands. Summing them would multiply a model's figure by however
+ * many times it was loaded; averaging would blend a stale load into a newer one (a standard
+ * imported twice is the case in the data).
+ *
+ * Repeat measurements of one van are NOT told apart here: recordOperationTime archives nothing,
+ * so a re-time of a van sits current beside the original and the two sum. Until a re-time is
+ * asked about at save, a re-time that replaces a record has to be corrected in place instead.
+ * Hand it current, counted rows with a figure; pickCurrent does that filtering.
+ */
+function combineCurrentRecords(rows: TimeRow[]): { minutes: number; observations: number } {
+  const byChassis = new Map<string, number>()
+  let unattached: TimeRow | null = null
+  for (const r of rows) {
+    if (r.chassis_id != null) byChassis.set(r.chassis_id, (byChassis.get(r.chassis_id) ?? 0) + (r.total_minutes as number))
+    else if (!unattached || newerFirst(r, unattached) < 0) unattached = r
+  }
+  const observations = [...byChassis.values()]
+  if (unattached) observations.push(unattached.total_minutes as number)
+  return { minutes: observations.reduce((a, b) => a + b, 0) / observations.length, observations: observations.length }
+}
+
+/**
+ * Build a pair's figure from its rows, and count what it replaced.
+ *
+ * THE one implementation of "what is the figure". Both public helpers below call it, and nothing
+ * else may re-derive it — this logic was inlined in seven places once and the copies drifted,
+ * which is the whole reason for the rule.
+ *
+ * The figure is the CURRENT records (superseded_by = null), combined by combineCurrentRecords.
+ * Usually there is exactly one. Where there are several, all of them make the figure, and the
+ * newest is reported as currentId. Where there are none, there is no figure: null, and the caller
+ * renders the pair as untimed rather than quietly promoting an archived run to headline status.
  *
  * Hidden rows are dropped FIRST, before anything else is asked: they are neither the figure nor
  * the history behind it. A pair whose current record is hidden therefore has no figure — its
@@ -265,17 +320,14 @@ interface TimeModelRow { operation_time_id: string; product_id: string }
 function pickCurrent(allRows: TimeRow[]): OperationTimeStat | null {
   const rows = allRows.filter(countsTowardLabour)
   const current = rows.filter((r) => r.superseded_by == null)
-  if (current.length === 0) return null
+  // A current record with no minutes carries no figure; it is neither summed nor averaged.
+  const timed = current.filter((r) => r.total_minutes != null)
+  if (timed.length === 0) return null
 
-  const winner = current.length === 1
-    ? current[0]
-    : [...current].sort((a, b) => {
-        const byDate = (b.created_at ?? '').localeCompare(a.created_at ?? '')
-        return byDate !== 0 ? byDate : b.id.localeCompare(a.id)
-      })[0]
+  const newest = [...timed].sort(newerFirst)[0]
 
-  if (winner.total_minutes == null) return null
-  return { minutes: winner.total_minutes, currentId: winner.id, archived: rows.length - 1 }
+  const { minutes, observations } = combineCurrentRecords(timed)
+  return { minutes, currentId: newest.id, combined: timed.length, observations, archived: rows.length - current.length }
 }
 
 /**
@@ -387,6 +439,10 @@ export interface ModelTotalOperationRow {
   minutes: number
   /** Superseded records behind it. History for the drawer; never part of the figure. */
   archived: number
+  /** Current records combined into `minutes`, and the observations averaged — see
+   * OperationTimeStat. Both 1 in the ordinary case. */
+  combined: number
+  observations: number
   /** WHICH record the figure came from — `stat.currentId`, already computed by
    * currentForOperation and previously thrown away here. Surfaced so a caller can ask something
    * about the record itself rather than only about its number: /model-total reads its note and
@@ -444,6 +500,8 @@ export function modelTotalMinutes(input: {
       jobName: jobNameById.get(op.job_id) ?? '—',
       minutes: stat.minutes,
       archived: stat.archived,
+      combined: stat.combined,
+      observations: stat.observations,
       currentTimeId: stat.currentId,
       primaryOperatorId: op.primary_operator_id,
       secondaryOperatorId: op.secondary_operator_id,
@@ -574,7 +632,7 @@ export async function fetchModelTotal(supabase: SupabaseClient, productId: strin
   const times = await selectIn<ModelTotalTimeRow>(timeIds, async (chunk) => {
     const res = await supabase
       .from('operation_times')
-      .select(`id, operation_id, total_minutes, superseded_by, is_estimated, ${TIME_FLAG_COLUMNS}, created_at`)
+      .select(`id, operation_id, total_minutes, superseded_by, chassis_id, is_estimated, ${TIME_FLAG_COLUMNS}, created_at`)
       .in('id', chunk)
     if (res.error) logSupabaseError('hop 2 — operation_times WHERE id IN (…)', res.error)
     // The row shape is stated here, not inferred — see TIME_PARENT_JOIN.

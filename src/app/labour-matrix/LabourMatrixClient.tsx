@@ -199,7 +199,7 @@ interface JobRow { id: string; name: string; section_id: string | null; producti
 interface SectionRow { id: string; name: string; team_id: string | null; sort_order: number | null }
 interface OperationRow { id: string; job_id: string }
 interface PairRow { operation_id: string; product_id: string }
-interface TimeRow extends TimeExclusionFlags { id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null; is_estimated: boolean }
+interface TimeRow extends TimeExclusionFlags { id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null; chassis_id: string | null; is_estimated: boolean }
 interface TimeModelRow { operation_time_id: string; product_id: string }
 /** production_line_id is what SCOPES the Team filter. A team belongs to exactly one line (it is
  * NOT NULL on the table — see lib/types' Team), and without the column the picker could only
@@ -511,7 +511,7 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
         const operationTimes = await fetchAllChunked<TimeRow>(
           timeIds, READ_CHUNK,
           (chunk) => onlyCountedTimes(supabase
-            .from('operation_times').select(`id, operation_id, total_minutes, superseded_by, is_estimated, ${TIME_FLAG_COLUMNS}`)
+            .from('operation_times').select(`id, operation_id, total_minutes, superseded_by, chassis_id, is_estimated, ${TIME_FLAG_COLUMNS}`)
             .in('id', chunk).is('superseded_by', null))
             .order('id') as unknown as RangeableQuery<TimeRow>,
           { table: 'operation_times' },

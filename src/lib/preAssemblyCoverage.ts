@@ -56,7 +56,7 @@ import { selectIn } from './chunkedIn'
 interface JobRow { id: string; name: string; production_line_id: string | null }
 interface OperationRow { id: string; job_id: string }
 interface ModelOperationRow { operation_id: string; product_id: string }
-interface TimeRow extends TimeExclusionFlags { id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null }
+interface TimeRow extends TimeExclusionFlags { id: string; operation_id: string; total_minutes: number | null; superseded_by: string | null; chassis_id: string | null }
 interface TimeModelRow { operation_time_id: string; product_id: string }
 interface ProductRow { id: string; model: string; product_series: string | null; production_line_id: string | null }
 
@@ -234,7 +234,7 @@ export async function fetchPreAssemblyCoverage(supabase: SupabaseClient): Promis
   const operationTimes = await fetchAllChunked<TimeRow>(
     operationIds, READ_CHUNK,
     (chunk) => onlyCountedTimes(supabase
-      .from('operation_times').select(`id, operation_id, total_minutes, superseded_by, ${TIME_FLAG_COLUMNS}`)
+      .from('operation_times').select(`id, operation_id, total_minutes, superseded_by, chassis_id, ${TIME_FLAG_COLUMNS}`)
       .in('operation_id', chunk).is('superseded_by', null))
       .order('id') as unknown as RangeableQuery<TimeRow>,
     { table: 'operation_times' }

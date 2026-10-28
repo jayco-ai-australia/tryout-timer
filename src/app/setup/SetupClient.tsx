@@ -1641,7 +1641,7 @@ function OperationCoverageTimesPanel({
           // the figure and so each row can say which one it is.
           supabase
             .from('operation_times')
-            .select(`id, total_minutes, created_at, operator_id, superseded_by, ${TIME_FLAG_COLUMNS}`)
+            .select(`id, total_minutes, created_at, operator_id, superseded_by, chassis_id, ${TIME_FLAG_COLUMNS}`)
             .eq('operation_id', operationId)
             .order('created_at', { ascending: false }),
         ])
@@ -1649,7 +1649,7 @@ function OperationCoverageTimesPanel({
         if (timeError) throw new Error(timeError.message)
 
         const linkedIds = new Set((linkRows ?? []).map((r) => r.product_id as string))
-        const times = (timeRows ?? []) as unknown as { id: string; total_minutes: number | null; created_at: string; operator_id: string | null; superseded_by: string | null; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null }[]
+        const times = (timeRows ?? []) as unknown as { id: string; total_minutes: number | null; created_at: string; operator_id: string | null; superseded_by: string | null; chassis_id: string | null; is_active: boolean | null; is_hidden: boolean; operations: TimeParentFlags | null }[]
         const timeIds = times.map((t) => t.id)
 
         // Which model(s) each time belongs to — operation_times carries no product_id of its
@@ -1713,7 +1713,7 @@ function OperationCoverageTimesPanel({
         const stats = currentForOperation(
           times.map((t) => ({
             id: t.id, operation_id: operationId, total_minutes: t.total_minutes,
-            superseded_by: t.superseded_by, is_active: t.is_active, is_hidden: t.is_hidden, operations: t.operations, created_at: t.created_at,
+            superseded_by: t.superseded_by, chassis_id: t.chassis_id, is_active: t.is_active, is_hidden: t.is_hidden, operations: t.operations, created_at: t.created_at,
           })),
           timeModels
         )
