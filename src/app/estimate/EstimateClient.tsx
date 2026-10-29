@@ -3,9 +3,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import { createClient } from '@/lib/supabase/client'
-import { fetchEstimateGrid, markNotApplicable, removeEstimates, saveEstimates, type EstimateCellState, type EstimateRemoval, type EstimateGrid, type EstimateOperation, type EstimatePair, type EstimateWrite } from '@/lib/estimates'
+import { fetchEstimateGrid, markNotApplicable, removeEstimates, saveEstimates, type EstimateCellRecord, type EstimateCellState, type EstimateRemoval, type EstimateGrid, type EstimateOperation, type EstimatePair, type EstimateWrite } from '@/lib/estimates'
 import { modelsForLine } from '@/lib/lines'
-import { operationProductKey } from '@/lib/operationTimes'
+import { addOperationTimeNote, operationProductKey } from '@/lib/operationTimes'
 import { groupProducts } from '@/lib/productGroups'
 import { fetchSectionsForLine } from '@/lib/sections'
 import { fetchAllRows } from '@/lib/supabaseRead'
@@ -244,8 +244,16 @@ export default function EstimateClient({ lines, userId, target }: Props) {
   /** One note for the whole save, written onto every record it writes. Optional. */
   const [saveNote, setSaveNote] = useState('')
   /** The notes popover for one cell's record, positioned off the clicked icon. */
-  const [notesOpen, setNotesOpen] = useState<{ operationId: string; productId: string; top: number; left: number } | null>(null)
+  const [notesOpen, setNotesOpen] = useState<{ operationId: string; productId: string; top?: number; bottom?: number; left: number; maxHeight: number } | null>(null)
   const notesTriggerRef = useRef<HTMLButtonElement | null>(null)
+  const notesPopRef = useRef<HTMLDivElement | null>(null)
+  /** A note being typed in the popover, keyed by the RECORD it will be written against. Kept when
+   * the popover closes, so Esc or a stray click doesn't throw away a half-written note. */
+  const [noteDrafts, setNoteDrafts] = useState<Map<string, string>>(new Map())
+  const [noteSaving, setNoteSaving] = useState<string | null>(null)
+  const [noteError, setNoteError] = useState<{ recordId: string; message: string } | null>(null)
+  /** The signed-in user's name, for the author line of a note they've just added. */
+  const [myName, setMyName] = useState<string | null>(null)
   const [factorRaw, setFactorRaw] = useState('1.0')
   const [saving, setSaving] = useState<{ done: number; total: number } | null>(null)
   const [notice, setNotice] = useState<{ tone: 'ok' | 'warn'; text: string } | null>(null)
@@ -825,8 +833,9 @@ export default function EstimateClient({ lines, userId, target }: Props) {
   }, [grid, viewJobs, allOps, columns, stateOf, isLinked, isExcluded, isMarkedNa, valueOf])
 
   // ── Notes on a figure ────────────────────────────────────────────────────────────────────
-  // A note belongs to one recording: the cell whose record carries notes gets an "i", and the
-  // popover lists that record's notes. Esc closes it and hands focus back to the icon.
+  // A note belongs to one recording, never to a cell. Every cell with a time gets the icon; the
+  // popover lists each record behind the figure with its notes, and an Add note under each one
+  // writes against THAT record. Esc closes it and hands focus back to the icon.
   useEffect(() => {
     if (!notesOpen) return
     const close = (e: Event) => {
@@ -834,7 +843,10 @@ export default function EstimateClient({ lines, userId, target }: Props) {
         if (e.key !== 'Escape') return
         setNotesOpen(null); notesTriggerRef.current?.focus(); return
       }
-      if (e.type === 'mousedown' && (e.target as HTMLElement).closest?.('.est-notes-pop, .est-cell-info')) return
+      const target = e.target as HTMLElement
+      if (e.type === 'mousedown' && target.closest?.('.est-notes-pop, .est-cell-info')) return
+      // Scrolling the popover's own list is reading it, not leaving it.
+      if (e.type === 'scroll' && target.closest?.('.est-notes-pop')) return
       setNotesOpen(null)
     }
     document.addEventListener('mousedown', close)
@@ -846,30 +858,157 @@ export default function EstimateClient({ lines, userId, target }: Props) {
       document.removeEventListener('scroll', close, true)
     }
   }, [notesOpen])
+  // Opening moves focus into the popover — it sits after the grid in the page, so Tab from the
+  // icon would otherwise walk on through the cells. Into the note box when there is nothing to
+  // read yet (the icon was "write here"), onto the dialog itself when there is.
+  useEffect(() => {
+    if (!notesOpen) return
+    const pop = notesPopRef.current
+    if (!pop) return
+    const box = pop.querySelector<HTMLTextAreaElement>('.est-notes-add textarea')
+    if (box && !pop.querySelector('.est-notes-list li')) box.focus()
+    else pop.focus()
+  }, [notesOpen])
+  useEffect(() => {
+    let cancelled = false
+    supabase.from('profiles').select('full_name').eq('id', userId).maybeSingle()
+      .then(({ data }) => { if (!cancelled) setMyName((data?.full_name as string | null)?.trim() || null) })
+    return () => { cancelled = true }
+  }, [supabase, userId])
   function toggleNotes(operationId: string, productId: string, el: HTMLButtonElement) {
     if (notesOpen?.operationId === operationId && notesOpen.productId === productId) { setNotesOpen(null); return }
     notesTriggerRef.current = el
     const r = el.getBoundingClientRect()
-    setNotesOpen({ operationId, productId, top: r.bottom + 6, left: Math.max(8, Math.min(r.right - 360, window.innerWidth - 368)) })
+    // Below the icon, unless the cell sits low enough that the note box would fall off the
+    // window — then above it, anchored by its bottom edge.
+    const below = window.innerHeight - r.bottom - 18
+    const above = r.top - 18
+    const left = Math.max(8, Math.min(r.right - 360, window.innerWidth - 368))
+    setNoteError(null)
+    setNotesOpen(below >= 320 || below >= above
+      ? { operationId, productId, left, top: r.bottom + 6, maxHeight: Math.min(480, below) }
+      : { operationId, productId, left, bottom: window.innerHeight - r.top + 6, maxHeight: Math.min(480, above) })
   }
-  /** The "i" on a cell whose record has notes. Absolutely placed, so the figure and the column
-   * width never move for it. Not offered while the cell holds an unsaved edit — the notes are the
-   * saved record's, and the figure on screen no longer is. */
+  /**
+   * Add one note to one record — straight through addOperationTimeNote, the same writer the
+   * Complete timer dialog uses (lib/stopwatch). Written now, not held for the save bar: a note
+   * changes no figure, so there is nothing to review first. It inserts one operation_time_notes
+   * row and touches nothing on operation_times — minutes, operator, timestamps and links stay as
+   * they are, which is why a measured record can carry one.
+   */
+  async function addNote(recordId: string) {
+    const text = (noteDrafts.get(recordId) ?? '').trim()
+    if (!text || noteSaving) return
+    setNoteSaving(recordId)
+    setNoteError(null)
+    try {
+      const created = await addOperationTimeNote(supabase, recordId, text, userId)
+      const note = { content: created.content, author: myName, createdAt: created.created_at }
+      setGrid((g) => {
+        if (!g) return g
+        const records = new Map(g.records)
+        for (const [key, list] of records) {
+          if (!list.some((rec) => rec.id === recordId)) continue
+          records.set(key, list.map((rec) => (rec.id === recordId ? { ...rec, notes: [...rec.notes, note] } : rec)))
+        }
+        return { ...g, records }
+      })
+      setNoteDrafts((m) => { const next = new Map(m); next.delete(recordId); return next })
+    } catch (err) {
+      setNoteError({ recordId, message: err instanceof Error ? err.message : 'Could not save the note' })
+    } finally {
+      setNoteSaving(null)
+    }
+  }
+  /**
+   * The icon on a cell with a time. Two states that must not be mistaken for each other:
+   *   notes      the "i" as it always was — blue, visible at rest: there is something to read.
+   *   no notes   a "+" with no colour and no ring, invisible until the cell is hovered or the
+   *              button focused — an affordance to write, not a marker, so the grid reads as it
+   *              did without it.
+   * Absolutely placed, so the figure and the column width never move for it. Not offered while
+   * the cell holds an unsaved edit — the records are the saved figure's, and the figure on screen
+   * no longer is. No time record, no icon: there is nothing to attach a note to.
+   */
   function noteButton(o: EstimateOperation, p: Product, editing: boolean) {
-    const notes = grid?.notes.get(operationProductKey(o.id, p.id))
-    if (!notes || editing) return null
+    const recs = grid?.records.get(operationProductKey(o.id, p.id))
+    if (!recs || recs.length === 0 || editing) return null
+    const count = recs.reduce((n, rec) => n + rec.notes.length, 0)
     const open = notesOpen?.operationId === o.id && notesOpen.productId === p.id
     return (
       <button
         type="button"
-        className={`est-cell-info${open ? ' est-info-on' : ''}`}
-        aria-label={`${plural(notes.length, 'note')} on ${o.name} for ${p.model}`}
+        className={`est-cell-info${count === 0 ? ' est-cell-add' : ''}${open ? ' est-info-on' : ''}`}
+        aria-label={count > 0 ? `${plural(count, 'note')} on ${o.name} for ${p.model}` : `Add a note to ${o.name} for ${p.model}`}
         aria-expanded={open}
-        title={plural(notes.length, 'note') + ' on this recording'}
+        aria-haspopup="dialog"
+        title={count > 0 ? plural(count, 'note') + ' on this recording' : 'Add a note to this recording'}
         onClick={(e) => toggleNotes(o.id, p.id, e.currentTarget)}
       >
-        i
+        {count > 0 ? 'i' : '+'}
       </button>
+    )
+  }
+  /** One record's block in the popover: who and which van, its notes, and the box to add one. */
+  function renderNoteRecord(rec: EstimateCellRecord, kind: EstimateCellState['kind'] | undefined, several: boolean) {
+    // collected_by is only worth a line when it isn't simply the operator timing themselves.
+    const showCollector = rec.collector != null && rec.collector.toLowerCase() !== rec.operator?.toLowerCase()
+    const draft = noteDrafts.get(rec.id) ?? ''
+    const busy = noteSaving === rec.id
+    const boxId = `est-note-${rec.id}`
+    return (
+      <section key={rec.id} className="est-notes-rec">
+        {/* Who was timed, on which van — the pair that makes the figure interpretable. */}
+        <div className="est-notes-who">
+          {several && <div className="est-notes-rec-min">{fmtMinutes(rec.minutes)} of the figure</div>}
+          {kind === 'estimated' ? (
+            <div className="est-notes-who-name">Estimate — no operator was timed</div>
+          ) : (
+            <>
+              <div className="est-notes-who-label">Operator timed</div>
+              <div className={`est-notes-who-name${rec.operator ? '' : ' est-notes-who-none'}`}>{rec.operator ?? 'Operator not recorded'}</div>
+            </>
+          )}
+          {(showCollector || rec.chassis) && (
+            <div className="est-notes-who-meta">
+              {showCollector && <span>{kind === 'estimated' ? 'Entered by' : 'Stopwatch run by'} {rec.collector}</span>}
+              {rec.chassis && <span>Chassis {rec.chassis}</span>}
+            </div>
+          )}
+        </div>
+        {rec.notes.length > 0 && (
+          <ul className="est-notes-list">
+            {rec.notes.map((n, i) => (
+              <li key={i}>
+                <p>{n.content}</p>
+                <div className="est-notes-meta">{n.author ?? 'Unknown'} · {fmtDateTime(n.createdAt)}</div>
+              </li>
+            ))}
+          </ul>
+        )}
+        <div className="est-notes-add">
+          <label className="est-notes-add-label" htmlFor={boxId}>Add note</label>
+          <textarea
+            id={boxId}
+            rows={2}
+            value={draft}
+            disabled={busy}
+            placeholder={kind === 'estimated' ? 'e.g. scaled from 88A, same floor plan' : 'e.g. this van had the slide-out'}
+            onChange={(e) => {
+              const v = e.target.value
+              setNoteDrafts((m) => new Map(m).set(rec.id, v))
+            }}
+            onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void addNote(rec.id) } }}
+          />
+          {noteError?.recordId === rec.id && <div className="est-notes-add-err" role="alert">{noteError.message}</div>}
+          <div className="est-notes-add-row">
+            <span className="est-notes-add-hint">Saves now — the figure doesn’t change</span>
+            <button type="button" className="btn-primary est-notes-add-btn" disabled={busy || !draft.trim()} onClick={() => void addNote(rec.id)}>
+              {busy ? 'Saving…' : 'Save note'}
+            </button>
+          </div>
+        </div>
+      </section>
     )
   }
 
@@ -1213,7 +1352,7 @@ export default function EstimateClient({ lines, userId, target }: Props) {
             <span><span className="est-swatch est-dirty est-dirty-new" />Typed into an unlinked cell — saving also links it</span>
             <span><span className="est-swatch est-na-pending" />Marked not applicable, not saved yet</span>
             <span><span className="est-swatch est-rm-pending" />Saved estimate marked for removal, not saved yet — the work still applies</span>
-            <span><span className="est-cell-info est-info-legend" aria-hidden>i</span>Notes on that recording — click to read</span>
+            <span><span className="est-cell-info est-info-legend" aria-hidden>i</span>Notes on that recording — click to read; hover any figure to add one</span>
           </div>
 
           <div className="est-scroll">
@@ -1331,14 +1470,19 @@ export default function EstimateClient({ lines, userId, target }: Props) {
           {notesOpen && (() => {
             const o = grid.operations.find((x) => x.id === notesOpen.operationId)
             const p = columns.find((x) => x.id === notesOpen.productId)
-            const list = grid.notes.get(operationProductKey(notesOpen.operationId, notesOpen.productId))
-            if (!o || !p || !list) return null
+            const recs = grid.records.get(operationProductKey(notesOpen.operationId, notesOpen.productId))
+            if (!o || !p || !recs || recs.length === 0) return null
             const kind = stateOf(o.id, p.id)?.kind
-            const rec = grid.records.get(operationProductKey(o.id, p.id))
-            // collected_by is only worth a line when it isn't simply the operator timing themselves.
-            const showCollector = rec?.collector != null && rec.collector.toLowerCase() !== rec.operator?.toLowerCase()
+            const several = recs.length > 1
             return (
-              <div className="est-notes-pop" role="dialog" aria-label={`Notes on ${o.name} for ${p.model}`} style={{ top: notesOpen.top, left: notesOpen.left }}>
+              <div
+                ref={notesPopRef}
+                className="est-notes-pop"
+                role="dialog"
+                tabIndex={-1}
+                aria-label={`Notes on ${o.name} for ${p.model}`}
+                style={{ top: notesOpen.top, bottom: notesOpen.bottom, left: notesOpen.left, maxHeight: notesOpen.maxHeight }}
+              >
                 <div className="est-notes-head">
                   <div>
                     <strong>{o.name}</strong>
@@ -1346,36 +1490,11 @@ export default function EstimateClient({ lines, userId, target }: Props) {
                       {p.model}
                       {kind && <span className={`est-notes-kind est-notes-${kind}`}>{kind === 'measured' ? 'Measured' : 'Estimate'}</span>}
                     </div>
+                    {several && <div className="est-notes-sub">{recs.length} records make this figure — a note goes on the one it’s under</div>}
                   </div>
                   <button type="button" className="est-notes-close" aria-label="Close" onClick={() => { setNotesOpen(null); notesTriggerRef.current?.focus() }}>×</button>
                 </div>
-                {/* Who was timed, on which van — the pair that makes the figure interpretable. */}
-                {rec && (
-                  <div className="est-notes-who">
-                    {kind === 'estimated' ? (
-                      <div className="est-notes-who-name">Estimate — no operator was timed</div>
-                    ) : (
-                      <>
-                        <div className="est-notes-who-label">Operator timed</div>
-                        <div className={`est-notes-who-name${rec.operator ? '' : ' est-notes-who-none'}`}>{rec.operator ?? 'Operator not recorded'}</div>
-                      </>
-                    )}
-                    {(showCollector || rec.chassis) && (
-                      <div className="est-notes-who-meta">
-                        {showCollector && <span>{kind === 'estimated' ? 'Entered by' : 'Stopwatch run by'} {rec.collector}</span>}
-                        {rec.chassis && <span>Chassis {rec.chassis}</span>}
-                      </div>
-                    )}
-                  </div>
-                )}
-                <ul className="est-notes-list">
-                  {list.map((n, i) => (
-                    <li key={i}>
-                      <p>{n.content}</p>
-                      <div className="est-notes-meta">{n.author ?? 'Unknown'} · {fmtDateTime(n.createdAt)}</div>
-                    </li>
-                  ))}
-                </ul>
+                {recs.map((rec) => renderNoteRecord(rec, kind, several))}
               </div>
             )
           })()}

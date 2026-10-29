@@ -60,12 +60,22 @@ export interface EstimateCellNote { content: string; author: string | null; crea
 export const UNASSIGNED_EMPLOYEE_ID = '999999'
 
 /**
- * Who and which van, for the record behind a cell's figure. Two different people:
+ * One record behind a cell's figure: which record, its own minutes, who and which van, and its
+ * notes. Two different people:
  *   operator   operator_id — WHO WAS TIMED, the person doing the work. null when not recorded:
  *              operator_id null, or the Unassigned placeholder (employee_id 999999).
  *   collector  collected_by — whoever ran the stopwatch (or, on an estimate, saved the figure).
+ * `id` is what a note added from the popover is written against — a record, never a cell.
  */
-export interface EstimateCellRecord { operator: string | null; collector: string | null; chassis: string | null }
+export interface EstimateCellRecord {
+  id: string
+  minutes: number
+  operator: string | null
+  collector: string | null
+  chassis: string | null
+  /** operation_time_notes on this record, oldest first. */
+  notes: EstimateCellNote[]
+}
 
 /**
  * What one (operation, model) cell holds when the grid loads. Absent from the map = nothing
@@ -91,12 +101,11 @@ export interface EstimateGrid {
   /** Pairs with ANY measured record linked — current or superseded, hidden or retired. Such a
    * pair can never be marked not applicable: measured work on a model is proof it applies. */
   measuredHistory: Set<string>
-  /** Keyed operationProductKey: the notes on the record that IS the cell's figure (measured or
-   * estimated), oldest first. Only cells with at least one note appear. */
-  notes: Map<string, EstimateCellNote[]>
-  /** Keyed operationProductKey: operator / collector / chassis of the record that IS the cell's
-   * figure. Every cell with a figure appears, notes or not. */
-  records: Map<string, EstimateCellRecord>
+  /** Keyed operationProductKey: every current record the cell's figure is built from (measured
+   * or estimated — the same records the shared rule combined), oldest first. Usually one; a merged
+   * operation or two operators on one van can leave several. Every cell with a figure appears,
+   * notes or not. */
+  records: Map<string, EstimateCellRecord[]>
 }
 
 interface GridTimeRow extends TimeRow { is_estimated: boolean; created_at: string }
@@ -121,7 +130,7 @@ export async function fetchEstimateGrid(supabase: SupabaseClient, jobIds: string
   )
   operations.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id))
   const opIds = operations.map((o) => o.id)
-  if (opIds.length === 0) return { operations, products: [], links: new Set(), cells: new Map(), exclusions: new Set(), measuredHistory: new Set(), notes: new Map(), records: new Map() }
+  if (opIds.length === 0) return { operations, products: [], links: new Set(), cells: new Map(), exclusions: new Set(), measuredHistory: new Set(), records: new Map() }
 
   const modelOperations = await fetchLinksForOperations(supabase, opIds)
   const exclusionRows = await fetchAllChunked<{ operation_id: string; product_id: string }>(
@@ -155,28 +164,30 @@ export async function fetchEstimateGrid(supabase: SupabaseClient, jobIds: string
   const measuredStats = currentForOperation(times.filter((t) => !t.is_estimated), timeModels)
 
   const cells = new Map<string, EstimateCellState>()
-  /** The record behind each cell's figure — whose notes the cell carries. With several records
-   * behind a figure, the newest. */
-  const recordByPair = new Map<string, GridTimeRow>()
+  /** The records behind each cell's figure — stat.recordIds, the very rows the shared rule
+   * combined. Whose notes the cell carries, and what a new note can be written against. */
+  const recordByPair = new Map<string, GridTimeRow[]>()
+  const rowsOf = (ids: string[]) => ids.map((id) => timeById.get(id)).filter((t): t is GridTimeRow => !!t)
+    .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id))
   const pairKeys = new Set([...Object.keys(stats), ...Object.keys(measuredStats)])
   for (const key of pairKeys) {
     const measured = measuredStats[key]
     const measuredRow = measured ? timeById.get(measured.currentId) : undefined
     if (measured && measuredRow) {
       cells.set(key, { kind: 'measured', minutes: measured.minutes })
-      recordByPair.set(key, measuredRow)
+      recordByPair.set(key, rowsOf(measured.recordIds))
       continue
     }
     const stat = stats[key]
     const current = stat ? timeById.get(stat.currentId) : undefined
     if (!stat || !current?.is_estimated) continue
     cells.set(key, { kind: 'estimated', minutes: stat.minutes, timeId: stat.currentId, fanOut: fanOut.get(stat.currentId) ?? 1 })
-    recordByPair.set(key, current)
+    recordByPair.set(key, rowsOf(stat.recordIds))
   }
 
   // The context written when each figure was collected ("two operators", "new starter") or saved
-  // ("scaled from 88A") — operation_time_notes on the cell's own record, nothing older.
-  const recordIds = [...new Set([...recordByPair.values()].map((t) => t.id))]
+  // ("scaled from 88A") — operation_time_notes on the cell's own records, nothing older.
+  const recordIds = [...new Set([...recordByPair.values()].flat().map((t) => t.id))]
   type NoteRow = { operation_time_id: string; content: string; created_at: string; profiles: { full_name: string | null } | null }
   const noteRows = await fetchAllChunked<NoteRow>(
     recordIds, READ_CHUNK,
@@ -190,14 +201,7 @@ export async function fetchEstimateGrid(supabase: SupabaseClient, jobIds: string
     if (list) list.push(n)
     else notesByRecord.set(n.operation_time_id, [n])
   }
-  const notes = new Map<string, EstimateCellNote[]>()
-  for (const [key, t] of recordByPair) {
-    const list = notesByRecord.get(t.id)
-    if (!list) continue
-    notes.set(key, list.map((n) => ({ content: n.content, author: n.profiles?.full_name ?? null, createdAt: n.created_at })))
-  }
-
-  // Who was timed and on which van — read for the cell's own record only, like the notes.
+  // Who was timed and on which van — read for the cell's own records only, like the notes.
   type WhoRow = {
     id: string
     operators: { full_name: string | null; employee_id: string | null } | null
@@ -212,16 +216,21 @@ export async function fetchEstimateGrid(supabase: SupabaseClient, jobIds: string
     { table: 'operation_times (operator, collector, chassis)' },
   )
   const whoById = new Map(whoRows.map((w) => [w.id, w]))
-  const records = new Map<string, EstimateCellRecord>()
-  for (const [key, t] of recordByPair) {
-    const w = whoById.get(t.id)
-    const op = w?.operators
-    const unassigned = !op || op.employee_id === UNASSIGNED_EMPLOYEE_ID || op.full_name === PLACEHOLDER_OPERATOR_NAME
-    records.set(key, {
-      operator: unassigned ? null : op.full_name?.trim() || null,
-      collector: w?.collector?.full_name?.trim() || null,
-      chassis: w?.chassis?.chassisnumber?.trim() || null,
-    })
+  const records = new Map<string, EstimateCellRecord[]>()
+  for (const [key, rows] of recordByPair) {
+    records.set(key, rows.map((t) => {
+      const w = whoById.get(t.id)
+      const op = w?.operators
+      const unassigned = !op || op.employee_id === UNASSIGNED_EMPLOYEE_ID || op.full_name === PLACEHOLDER_OPERATOR_NAME
+      return {
+        id: t.id,
+        minutes: t.total_minutes as number,
+        operator: unassigned ? null : op.full_name?.trim() || null,
+        collector: w?.collector?.full_name?.trim() || null,
+        chassis: w?.chassis?.chassisnumber?.trim() || null,
+        notes: (notesByRecord.get(t.id) ?? []).map((n) => ({ content: n.content, author: n.profiles?.full_name ?? null, createdAt: n.created_at })),
+      }
+    }))
   }
 
   const productIds = [...new Set([
@@ -234,7 +243,6 @@ export async function fetchEstimateGrid(supabase: SupabaseClient, jobIds: string
     operations, products, links, cells,
     exclusions: new Set(exclusionRows.map((r) => operationProductKey(r.operation_id, r.product_id))),
     measuredHistory: measuredPairsOf(times, timeModels),
-    notes,
     records,
   }
 }

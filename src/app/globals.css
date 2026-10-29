@@ -4110,6 +4110,20 @@ body {
 .est-cell-info:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
 .est-input:focus ~ .est-cell-info { visibility: hidden; }
 .est-info-legend { position: static; cursor: default; }
+/* The same button on a cell with a time but NO notes: an affordance to write, not a marker. No
+   colour, no ring, a "+" rather than an "i", and invisible at rest so the grid reads exactly as it
+   does without it. Hovering the cell brings it up faint grey; hovering or focusing the button
+   itself (Tab reaches it like the "i") makes it a plain control. It never takes the blue fill —
+   that stays the "there is something to read" state. */
+.est-cell-info.est-cell-add {
+  font-family: inherit; font-style: normal; font-weight: 600; font-size: 12px; line-height: 1;
+  color: var(--text-muted); background: transparent;
+  border-color: transparent; opacity: 0; transition: opacity 0.1s;
+}
+.est-td:hover .est-cell-add { opacity: 0.55; }
+.est-cell-info.est-cell-add:hover, .est-cell-info.est-cell-add:focus-visible, .est-cell-info.est-cell-add.est-info-on {
+  opacity: 1; color: var(--text); background: var(--surface); border-color: var(--border);
+}
 .est-notes-pop {
   position: fixed; z-index: 50; width: 360px; max-height: 380px; overflow: auto;
   background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
@@ -4157,6 +4171,22 @@ body {
 .est-notes-who-name { font-weight: 600; color: var(--text); }
 .est-notes-who-none { font-weight: 400; font-style: italic; color: var(--text-muted); }
 .est-notes-who-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 3px; font-size: 11.5px; color: var(--text-muted); }
+/* One record's block in the notes popover — several when a figure is built from several records. */
+.est-notes-pop:focus { outline: none; }
+.est-notes-rec + .est-notes-rec { border-top: 3px solid var(--bg); }
+.est-notes-rec-min { margin-bottom: 4px; font-size: 12px; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+.est-notes-add { padding: 8px 12px 12px; border-top: 1px solid var(--border); }
+.est-notes-list + .est-notes-add { border-top: 1px solid var(--border); }
+.est-notes-add-label { display: block; margin-bottom: 4px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted); }
+.est-notes-add textarea {
+  width: 100%; box-sizing: border-box; font: inherit; font-size: 13px; color: var(--text);
+  border: 1.5px solid var(--border); border-radius: 6px; padding: 6px 8px; background: var(--surface); resize: vertical;
+}
+.est-notes-add textarea:focus { outline: none; border-color: var(--blue); box-shadow: 0 0 0 3px rgba(0, 121, 193, 0.12); }
+.est-notes-add-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.est-notes-add-hint { margin-right: auto; font-size: 11.5px; color: var(--text-muted); }
+.est-notes-add-btn { padding: 5px 12px; font-size: 12.5px; }
+.est-notes-add-err { margin-top: 6px; padding: 6px 8px; border-radius: 6px; background: var(--red-bg); color: var(--red); font-size: 12px; }
 
 /* One note for the whole save. */
 .est-savebar-note {
