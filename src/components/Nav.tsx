@@ -243,12 +243,15 @@ export default function Nav() {
       ],
     },
     {
-      // "Settings", not "Admin": everybody sees Roadmap and Profile.
+      // "Settings", not "Admin": everybody sees Information and Profile.
       key: 'settings',
       heading: 'Settings',
       icon: <GearIcon />,
       items: [
-        { href: '/roadmap', label: 'Roadmap', icon: <MapIcon /> },
+        // Information took Roadmap's place for the handover to the BOM team. Roadmap is hidden,
+        // not removed: /roadmap and its page still exist, and putting this entry back restores it:
+        //   { href: '/roadmap', label: 'Roadmap', icon: <MapIcon /> },
+        { href: '/information', label: 'Information', icon: <InfoIcon /> },
         ...(isAdmin ? [{ href: '/config', label: 'Config', icon: <SlidersIcon /> }] : []),
         ...(isAdmin ? [{ href: '/admin', label: 'Admin', icon: <ShieldIcon /> }] : []),
         { href: '/profile', label: 'Profile', icon: <UserIcon /> },
@@ -562,6 +565,11 @@ function WrenchIcon() {
 function NetworkIcon() {
   return <Icon><rect x="16" y="16" width="6" height="6" rx="1" /><rect x="2" y="16" width="6" height="6" rx="1" /><rect x="9" y="2" width="6" height="6" rx="1" /><path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3" /><path d="M12 12V8" /></Icon>
 }
+function InfoIcon() {
+  return <Icon><circle cx="12" cy="12" r="10" /><path d="M12 16v-4" /><path d="M12 8h.01" /></Icon>
+}
+/** Unused while Roadmap is out of the sidebar; kept so restoring it is the one line above. */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function MapIcon() {
   return (
     <Icon>

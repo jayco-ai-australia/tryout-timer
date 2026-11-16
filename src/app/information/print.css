@@ -1,0 +1,10 @@
+/*
+ * /information — paper. A4 portrait, route-scoped for the same reason as every other printable
+ * screen: `@page` can't be scoped by selector. InformationClient pins this same rule last in
+ * <head> through lib/usePageSetup, so a rule left behind by another route can't win after a
+ * client-side navigation. Keep the two identical (INFORMATION_PAGE_CSS).
+ */
+@page {
+  size: A4 portrait;
+  margin: 16mm 18mm;
+}

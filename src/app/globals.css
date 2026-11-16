@@ -4198,3 +4198,141 @@ body {
 .est-notice-warn { background: var(--amber-bg); color: #92400e; border: 1px solid #fde68a; margin-bottom: 8px; }
 .est-savebar .est-notice-warn { margin-bottom: 0; }
 .est-foot { margin-top: 16px; font-size: 12px; color: var(--text-muted); }
+
+/* ── Information (/information) ─────────────────────────────────────────────────────────────
+   A document to be read start to finish and kept as a reference: one reading column (~70
+   characters), white sheets on the grey page, the copy's five parts as five sheets. Print is the
+   same document in black on A4 (paper in app/information/print.css), with the parts running on
+   rather than a page each, and headings kept with what follows them. */
+.info-page { max-width: 860px; margin: 0 auto; padding: 24px 16px 48px; }
+.info-toolbar { display: flex; justify-content: flex-end; margin-bottom: 12px; }
+
+.info-doc { color: var(--text-mid); font-size: 15.5px; line-height: 1.65; }
+.info-part {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+  padding: 36px 48px 32px;
+  margin-bottom: 20px;
+}
+.info-part > :first-child { margin-top: 0; }
+.info-doc p, .info-doc ul, .info-doc ol, .info-doc table { margin: 0 0 14px; max-width: 68ch; }
+.info-doc strong { color: var(--text); font-weight: 600; }
+
+.info-title { font-size: 30px; font-weight: 700; color: var(--text); line-height: 1.2; margin: 0 0 16px; }
+.info-lede { font-size: 17.5px; color: var(--text); line-height: 1.55; }
+.info-doc h2 {
+  font-size: 21px; font-weight: 700; color: var(--text); line-height: 1.3;
+  margin: 36px 0 12px; padding-top: 4px;
+  scroll-margin-top: 72px;
+}
+.info-doc h3 {
+  font-size: 16.5px; font-weight: 700; color: var(--blue); line-height: 1.35;
+  margin: 26px 0 8px;
+}
+.info-doc h2 + h3 { margin-top: 14px; }
+
+.info-doc ul, .info-doc ol { padding-left: 22px; }
+.info-doc ul { list-style: disc; }
+.info-doc ol { list-style: decimal; }
+.info-doc li { margin-bottom: 8px; padding-left: 2px; }
+.info-doc li::marker { color: var(--text-muted); }
+.info-numbered li::marker { color: var(--blue); font-weight: 700; }
+
+/* A sentence the copy lands a point on — set apart, not decorated. */
+.info-callout {
+  border-left: 4px solid var(--blue);
+  background: var(--blue-light);
+  border-radius: 0 6px 6px 0;
+  padding: 12px 16px;
+  color: var(--text);
+}
+
+.info-contents {
+  margin-top: 28px; padding-top: 20px;
+  border-top: 1px solid var(--border);
+}
+.info-contents-head {
+  font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--text-muted); margin-bottom: 8px !important;
+}
+.info-contents ol { margin: 0; }
+.info-contents li { margin-bottom: 4px; }
+.info-contents a { color: var(--blue); text-decoration: none; }
+.info-contents a:hover { text-decoration: underline; }
+
+/* The five levels, each drawn inside the one above: an indent per level and an elbow from the
+   level above. The indent is set inline per level (28px a step); the elbow is drawn back across
+   it, so the two numbers here (left -18px, 28px step) go together. */
+.info-doc .info-tree { list-style: none; padding: 0; margin: 18px 0 22px; max-width: none; }
+.info-tree-level {
+  position: relative;
+  display: flex; gap: 14px; align-items: baseline;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--blue);
+  border-radius: 6px;
+  padding: 10px 14px;
+  margin: 0 0 8px !important;
+  break-inside: avoid; page-break-inside: avoid;
+}
+.info-tree-level + .info-tree-level::before {
+  content: '';
+  position: absolute;
+  left: -18px; top: -9px;
+  width: 15px; height: 29px;
+  border-left: 1.5px solid #b8bec8;
+  border-bottom: 1.5px solid #b8bec8;
+  border-bottom-left-radius: 4px;
+}
+.info-tree-name { flex: 0 0 132px; font-weight: 700; color: var(--text); font-size: 14.5px; }
+.info-tree-desc { flex: 1; font-size: 14px; line-height: 1.5; color: var(--text-mid); }
+.info-tree-desc em { color: var(--text-muted); }
+
+.info-table { border-collapse: collapse; width: 100%; font-size: 14.5px; line-height: 1.5; }
+.info-table th, .info-table td { text-align: left; vertical-align: top; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+.info-table thead th {
+  font-size: 11.5px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--text-muted); border-bottom: 2px solid var(--border);
+}
+.info-table tbody th { font-weight: 700; color: var(--text); white-space: nowrap; width: 1%; }
+
+@media (max-width: 640px) {
+  .info-part { padding: 24px 18px 20px; }
+  .info-doc { font-size: 15px; }
+  .info-title { font-size: 25px; }
+  .info-tree-level { flex-direction: column; gap: 2px; }
+  .info-tree-name { flex-basis: auto; }
+  /* No indent on a phone (it overrides the inline 28px steps, so the elbows go too): five steps
+     would eat a third of the width. Outermost-first order still carries the nesting. */
+  .info-tree-level { margin-left: 0 !important; }
+  .info-tree-level + .info-tree-level::before { display: none; }
+  .info-table tbody th { white-space: normal; }
+}
+
+@media print {
+  .info-page { max-width: none; margin: 0; padding: 0; }
+  .info-toolbar, .info-contents { display: none !important; }
+  .info-doc { color: #000; font-size: 10.5pt; line-height: 1.5; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .info-doc * { color: #000 !important; }
+  .info-part { background: none; border: none; border-radius: 0; box-shadow: none; padding: 0; margin: 0; }
+  .info-part + .info-part { border-top: 0.75pt solid #000; margin-top: 8mm; padding-top: 2mm; }
+  .info-doc p, .info-doc ul, .info-doc ol, .info-doc table { max-width: none; margin-bottom: 3.5mm; }
+  .info-title { font-size: 22pt; margin-bottom: 5mm; }
+  .info-lede { font-size: 12.5pt; }
+  .info-doc h2 { font-size: 15pt; margin: 8mm 0 3mm; }
+  .info-doc h3 { font-size: 12pt; margin: 5mm 0 2mm; }
+  .info-doc h2, .info-doc h3 { break-after: avoid; page-break-after: avoid; }
+  .info-doc p, .info-doc li { orphans: 3; widows: 3; }
+  .info-doc li::marker { color: #000; }
+  .info-callout { background: #f1f1f1; border-left: 2.5pt solid #000; border-radius: 0; padding: 2.5mm 4mm; break-inside: avoid; }
+  .info-doc .info-tree { break-inside: avoid; page-break-inside: avoid; margin: 4mm 0 5mm; }
+  .info-tree-level { border: 0.75pt solid #777; border-left: 2.5pt solid #000; border-radius: 3px; padding: 2mm 3mm; margin-bottom: 2mm !important; }
+  .info-tree-level + .info-tree-level::before { border-color: #555; }
+  .info-tree-name { font-size: 10.5pt; }
+  .info-tree-desc { font-size: 10pt; }
+  .info-table { font-size: 10pt; break-inside: avoid; }
+  .info-table th, .info-table td { padding: 2mm 3mm; border-bottom: 0.75pt solid #999; }
+  .info-table thead th { font-size: 8.5pt; border-bottom: 1pt solid #000; }
+}
