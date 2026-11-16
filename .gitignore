@@ -42,3 +42,9 @@ next-env.d.ts
 # agent config — settings.local.json is per-machine (it holds this checkout's
 # tool permissions). A shared .claude/settings.json is deliberately NOT ignored.
 .claude/settings.local.json
+
+# build-and-swap: the build in progress, and the previous build kept for rollback
+/.next-build/
+/.next-prev/
+/.next-failed/
+/.deploy.lock/
