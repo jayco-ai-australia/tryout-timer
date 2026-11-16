@@ -41,13 +41,15 @@ export default async function AdminPage() {
     service.auth.admin.listUsers({ perPage: 1000 }),
   ])
 
-  const emailById = new Map((authUsers?.users ?? []).map((u) => [u.id, u.email ?? null]))
+  const authById = new Map((authUsers?.users ?? []).map((u) => [u.id, u]))
   const lineById = new Map(((lines ?? []) as { id: string; name: string }[]).map((l) => [l.id, l]))
-  const users: AdminUser[] = ((profiles ?? []) as unknown as Profile[]).map((p) => ({
-    ...p,
-    production_lines: p.production_line_id ? lineById.get(p.production_line_id) ?? null : null,
-    email: emailById.get(p.id) ?? null,
-  }))
+  const now = Date.now()
+  const users: AdminUser[] = ((profiles ?? []) as unknown as Profile[]).map((p) => {
+    const auth = authById.get(p.id)
+    const bannedUntil = (auth as { banned_until?: string | null } | undefined)?.banned_until ?? null
+    const line = p.production_line_id ? lineById.get(p.production_line_id) ?? null : null
+    return { ...p, production_lines: line, email: auth?.email ?? null, blocked: !!bannedUntil && new Date(bannedUntil).getTime() > now }
+  })
 
   return (
     <div style={{ minHeight: '100vh', background: 'var(--bg)' }}>

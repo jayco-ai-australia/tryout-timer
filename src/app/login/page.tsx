@@ -17,7 +17,14 @@ export default function LoginPage() {
     setError(null)
     setLoading(true)
     const { error } = await supabase.auth.signInWithPassword({ email, password })
-    if (error) { setError(error.message); setLoading(false); return }
+    if (error) {
+      // A login blocked from Admin → Users comes back as Supabase's bare "User is banned".
+      setError(error.code === 'user_banned'
+        ? 'Your access to J-Motion has been removed. Please contact your manager.'
+        : error.message)
+      setLoading(false)
+      return
+    }
     router.push('/dashboard')
     router.refresh()
   }

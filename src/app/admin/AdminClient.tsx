@@ -18,8 +18,8 @@ const ROLE_OPTIONS: { value: UserRole; label: string; hint: string }[] = [
   { value: 'admin', label: 'Admin', hint: 'Everything a manager can do, plus Admin and Config.' },
 ]
 
-/** A profile plus its login email, which lives in Auth and is read server-side in page.tsx. */
-export type AdminUser = Profile & { email: string | null }
+/** A profile plus what lives in Auth (email, and whether sign-in is blocked), read server-side in page.tsx. */
+export type AdminUser = Profile & { email: string | null; blocked: boolean }
 
 interface LineOption { id: string; name: string }
 
@@ -47,11 +47,12 @@ export default function AdminClient({ profiles: initialProfiles, currentUserId, 
   const [profiles, setProfiles] = useState(initialProfiles)
   const [records, setRecords] = useState(initialRecords)
   const [requests, setRequests] = useState(initialRequests)
-  const [confirm, setConfirm] = useState<{ type: 'user' | 'record'; id: string } | null>(null)
+  const [confirm, setConfirm] = useState<{ type: 'user' | 'record' | 'block' | 'unblock'; id: string } | null>(null)
   const [busyRequestId, setBusyRequestId] = useState<string | null>(null)
   const [adding, setAdding] = useState(false)
   const [userMessage, setUserMessage] = useState<{ kind: 'error' | 'done'; text: string } | null>(null)
   const [deletingUserId, setDeletingUserId] = useState<string | null>(null)
+  const [blockingUserId, setBlockingUserId] = useState<string | null>(null)
 
   async function handleRoleChange(userId: string, newRole: UserRole) {
     const { error } = await supabase.from('profiles').update({ role: newRole }).eq('id', userId)
@@ -82,6 +83,32 @@ export default function AdminClient({ profiles: initialProfiles, currentUserId, 
       setUserMessage({ kind: 'error', text: 'Couldn’t reach the server. Nothing was deleted.' })
     } finally {
       setDeletingUserId(null)
+    }
+  }
+
+  /** Block or unblock sign-in through app/admin/users/route.ts. Nothing else about the person changes. */
+  async function handleSetBlocked(userId: string, blocked: boolean) {
+    setConfirm(null)
+    setUserMessage(null)
+    setBlockingUserId(userId)
+    const name = profiles.find((p) => p.id === userId)?.full_name ?? 'The user'
+    try {
+      const res = await fetch(USERS_ROUTE_URL, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: userId, blocked }),
+      })
+      const json = await res.json().catch(() => null)
+      if (!res.ok) {
+        setUserMessage({ kind: 'error', text: json?.error ?? 'Something went wrong. Nothing changed.' })
+        return
+      }
+      setProfiles((prev) => prev.map((p) => p.id === userId ? { ...p, blocked: json.blocked } : p))
+      setUserMessage({ kind: 'done', text: blocked ? `${name} is blocked from signing in.` : `${name} can sign in again.` })
+    } catch {
+      setUserMessage({ kind: 'error', text: 'Couldn’t reach the server. Nothing changed.' })
+    } finally {
+      setBlockingUserId(null)
     }
   }
 
@@ -172,7 +199,10 @@ export default function AdminClient({ profiles: initialProfiles, currentUserId, 
             <tbody>
               {profiles.map((profile) => (
                 <tr key={profile.id}>
-                  <td className="primary">{profile.full_name ?? <em style={{ color: 'var(--text-muted)' }}>No name</em>}</td>
+                  <td className="primary">
+                    {profile.full_name ?? <em style={{ color: 'var(--text-muted)' }}>No name</em>}
+                    {profile.blocked && <>{' '}<span className="badge badge-red" title="Can’t sign in. Their name stays on everything they recorded.">Blocked</span></>}
+                  </td>
                   <td>{profile.email ?? <em style={{ color: 'var(--text-muted)' }}>—</em>}</td>
                   <td>
                     <select
@@ -193,9 +223,18 @@ export default function AdminClient({ profiles: initialProfiles, currentUserId, 
                     {profile.id === currentUserId ? (
                       <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>You</span>
                     ) : (
-                      <button disabled={deletingUserId === profile.id} onClick={() => setConfirm({ type: 'user', id: profile.id })} style={{ fontSize: 12, fontWeight: 600, color: 'var(--red)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-                        {deletingUserId === profile.id ? 'Deleting…' : 'Delete'}
-                      </button>
+                      <div style={{ display: 'flex', gap: 12, justifyContent: 'flex-end' }}>
+                        <button
+                          disabled={blockingUserId === profile.id}
+                          onClick={() => setConfirm({ type: profile.blocked ? 'unblock' : 'block', id: profile.id })}
+                          style={{ fontSize: 12, fontWeight: 600, color: profile.blocked ? 'var(--blue)' : 'var(--text-mid)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'inherit' }}
+                        >
+                          {blockingUserId === profile.id ? 'Saving…' : profile.blocked ? 'Unblock' : 'Block sign-in'}
+                        </button>
+                        <button disabled={deletingUserId === profile.id} onClick={() => setConfirm({ type: 'user', id: profile.id })} style={{ fontSize: 12, fontWeight: 600, color: 'var(--red)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
+                          {deletingUserId === profile.id ? 'Deleting…' : 'Delete'}
+                        </button>
+                      </div>
                     )}
                   </td>
                 </tr>
@@ -266,7 +305,26 @@ export default function AdminClient({ profiles: initialProfiles, currentUserId, 
         </div>
       )}
 
-      {confirm && (
+      {confirm && confirm.type === 'block' && (
+        <ConfirmDialog
+          title={`Block ${confirmName(confirm.id)} from signing in?`}
+          message={`${confirmName(confirm.id)} won’t be able to sign in. Their recorded times, notes and name against their work all stay. If they have J-Motion open, they’re sent to the sign-in page the next time a page loads, though a page already open can keep working for up to an hour. You can unblock them at any time.`}
+          confirmLabel="Block sign-in"
+          danger
+          onConfirm={() => handleSetBlocked(confirm.id, true)}
+          onCancel={() => setConfirm(null)}
+        />
+      )}
+      {confirm && confirm.type === 'unblock' && (
+        <ConfirmDialog
+          title={`Unblock ${confirmName(confirm.id)}?`}
+          message={`${confirmName(confirm.id)} will be able to sign in again with their existing password.`}
+          confirmLabel="Unblock"
+          onConfirm={() => handleSetBlocked(confirm.id, false)}
+          onCancel={() => setConfirm(null)}
+        />
+      )}
+      {confirm && (confirm.type === 'user' || confirm.type === 'record') && (
         <ConfirmDialog
           title={confirm.type === 'user' ? `Delete ${confirmName(confirm.id)}?` : 'Delete Record'}
           message={confirm.type === 'user'

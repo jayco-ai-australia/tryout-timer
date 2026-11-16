@@ -8,6 +8,7 @@ import type { UserRole } from '@/lib/types'
 /**
  * POST /admin/users — create a login and its profile in one action. Admin only.
  * DELETE /admin/users — remove a login and its profile (see DELETE below). Admin only.
+ * PATCH  /admin/users — block or unblock sign-in, keeping everything (see PATCH below). Admin only.
  *
  * Under /admin on purpose, so the middleware's admin gate covers it as well as the check below.
  * requireAdmin is the check that counts: both handlers run it before anything else, with the same
@@ -141,6 +142,7 @@ export async function POST(request: Request) {
       user: {
         ...profile,
         email,
+        blocked: false,
         production_lines: { id: line.id, name: line.name },
       },
     },
@@ -231,4 +233,55 @@ export async function DELETE(request: Request) {
   }
 
   return NextResponse.json({ deleted: id, login: hasLogin ? 'deleted' : 'none' })
+}
+
+/** Long enough to mean "until someone unblocks them". Supabase stores it as banned_until. */
+const BLOCK_DURATION = '876000h'
+
+/**
+ * PATCH /admin/users — block or unblock a person's sign-in. Admin only, never yourself.
+ *
+ * Blocking bans the Auth login and touches nothing else: the profile, their name, and every time,
+ * note and request they made stay exactly as they are, so their name stays against their work.
+ * Unblocking lifts the ban; their existing password works again.
+ *
+ * What blocking does to a session already open (checked live 2026-11-17): the middleware's
+ * getUser() is refused for a banned user, so their next page load or navigation sends them to
+ * /login, and refreshing the token is refused. But an access token they already hold still works
+ * straight against the database until it expires — up to an hour — so a page left open can keep
+ * reading and saving until then.
+ */
+export async function PATCH(request: Request) {
+  const gate = await requireAdmin('block or unblock users')
+  if ('denied' in gate) return gate.denied
+  const { callerId } = gate
+
+  let body: Record<string, unknown>
+  try {
+    body = await request.json()
+  } catch {
+    return fail(400, 'The request didn’t arrive. Try again.')
+  }
+  const id = typeof body.id === 'string' ? body.id : ''
+  if (!UUID_RE.test(id)) return fail(400, 'That isn’t a user.')
+  if (typeof body.blocked !== 'boolean') return fail(400, 'Say whether to block or unblock.')
+  const block = body.blocked
+  if (id === callerId) return fail(400, 'You can’t block or unblock your own account.')
+
+  const service = serviceClientOrNull()
+  if (!service) return fail(500, 'The server isn’t set up to change sign-in access.')
+
+  const { data: existing } = await service.auth.admin.getUserById(id)
+  if (!existing?.user) return fail(404, 'That user has no login to block.')
+
+  const { data: updated, error } = await service.auth.admin.updateUserById(id, { ban_duration: block ? BLOCK_DURATION : 'none' })
+  const bannedUntil = updated?.user?.banned_until ?? null
+  const nowBlocked = !!bannedUntil && new Date(bannedUntil).getTime() > Date.now()
+  if (error || nowBlocked !== block) {
+    logFailure(block ? 'block' : 'unblock', error)
+    return fail(502, block
+      ? 'Supabase didn’t block the login. Nothing changed — they can still sign in.'
+      : 'Supabase didn’t unblock the login. Nothing changed — they still can’t sign in.')
+  }
+  return NextResponse.json({ id, blocked: nowBlocked })
 }
