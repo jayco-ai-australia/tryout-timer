@@ -20,7 +20,10 @@ export default async function AdminPage() {
   // and only after the admin check above has passed.
   const service = createServiceClient()
   const [{ data: profiles }, { data: records }, { data: requests }, { data: lines }, { data: authUsers }] = await Promise.all([
-    supabase.from('profiles').select('id, full_name, role, production_line_id, created_at, production_lines ( id, name )').order('created_at', { ascending: false }),
+    // No embedded production_lines join: live has no foreign key from profiles.production_line_id,
+    // so PostgREST refuses the embed (PGRST200) and the whole list came back empty. Line names are
+    // looked up from the lines list below instead.
+    supabase.from('profiles').select('id, full_name, role, production_line_id, created_at').order('created_at', { ascending: false }),
     // Not filtered on is_active or is_hidden: this list is every recorded time, newest first, and
     // AdminClient marks the retired and hidden ones (see lib/operationTimes.ts) — including a
     // record whose operation or job is retired, which is why both parents' is_active ride along.
@@ -39,7 +42,12 @@ export default async function AdminPage() {
   ])
 
   const emailById = new Map((authUsers?.users ?? []).map((u) => [u.id, u.email ?? null]))
-  const users: AdminUser[] = ((profiles ?? []) as unknown as Profile[]).map((p) => ({ ...p, email: emailById.get(p.id) ?? null }))
+  const lineById = new Map(((lines ?? []) as { id: string; name: string }[]).map((l) => [l.id, l]))
+  const users: AdminUser[] = ((profiles ?? []) as unknown as Profile[]).map((p) => ({
+    ...p,
+    production_lines: p.production_line_id ? lineById.get(p.production_line_id) ?? null : null,
+    email: emailById.get(p.id) ?? null,
+  }))
 
   return (
     <div style={{ minHeight: '100vh', background: 'var(--bg)' }}>
