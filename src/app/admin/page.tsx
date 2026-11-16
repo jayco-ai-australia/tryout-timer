@@ -46,6 +46,7 @@ export default async function AdminPage() {
       <Nav />
       <AdminClient
         profiles={users}
+        currentUserId={user.id}
         lines={(lines ?? []) as { id: string; name: string }[]}
         records={(records ?? []) as unknown as OperationTimeWithRelations[]}
         requests={(requests ?? []) as unknown as OperatorChangeRequest[]}

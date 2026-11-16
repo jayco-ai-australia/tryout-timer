@@ -25,6 +25,8 @@ interface LineOption { id: string; name: string }
 
 interface Props {
   profiles: AdminUser[]
+  /** The signed-in admin. Their own row offers no Delete; the route refuses it regardless. */
+  currentUserId: string
   lines: LineOption[]
   records: OperationTimeWithRelations[]
   requests: OperatorChangeRequest[]
@@ -39,7 +41,7 @@ function retiredRecord(r: OperationTimeWithRelations): boolean {
   return r.is_active === false || r.operations?.is_active === false || r.operations?.jobs?.is_active === false
 }
 
-export default function AdminClient({ profiles: initialProfiles, lines, records: initialRecords, requests: initialRequests }: Props) {
+export default function AdminClient({ profiles: initialProfiles, currentUserId, lines, records: initialRecords, requests: initialRequests }: Props) {
   const supabase = createClient()
   const [tab, setTab] = useState<Tab>('users')
   const [profiles, setProfiles] = useState(initialProfiles)
@@ -48,16 +50,39 @@ export default function AdminClient({ profiles: initialProfiles, lines, records:
   const [confirm, setConfirm] = useState<{ type: 'user' | 'record'; id: string } | null>(null)
   const [busyRequestId, setBusyRequestId] = useState<string | null>(null)
   const [adding, setAdding] = useState(false)
+  const [userMessage, setUserMessage] = useState<{ kind: 'error' | 'done'; text: string } | null>(null)
+  const [deletingUserId, setDeletingUserId] = useState<string | null>(null)
 
   async function handleRoleChange(userId: string, newRole: UserRole) {
     const { error } = await supabase.from('profiles').update({ role: newRole }).eq('id', userId)
     if (!error) setProfiles((prev) => prev.map((p) => p.id === userId ? { ...p, role: newRole } : p))
   }
 
+  /** Through app/admin/users/route.ts, which deletes the login (and with it the profile) using the
+   * service key — the browser client can only reach the profile row, which left the login alive. */
   async function handleDeleteUser(userId: string) {
     setConfirm(null)
-    const { error } = await supabase.from('profiles').delete().eq('id', userId)
-    if (!error) setProfiles((prev) => prev.filter((p) => p.id !== userId))
+    setUserMessage(null)
+    setDeletingUserId(userId)
+    const name = profiles.find((p) => p.id === userId)?.full_name ?? 'The user'
+    try {
+      const res = await fetch(USERS_ROUTE_URL, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: userId }),
+      })
+      const json = await res.json().catch(() => null)
+      if (!res.ok) {
+        setUserMessage({ kind: 'error', text: json?.error ?? 'Something went wrong. Nothing was deleted.' })
+        return
+      }
+      setProfiles((prev) => prev.filter((p) => p.id !== userId))
+      setUserMessage({ kind: 'done', text: `${name} was deleted and can no longer sign in.` })
+    } catch {
+      setUserMessage({ kind: 'error', text: 'Couldn’t reach the server. Nothing was deleted.' })
+    } finally {
+      setDeletingUserId(null)
+    }
   }
 
   async function handleDeleteRecord(recordId: string) {
@@ -89,6 +114,9 @@ export default function AdminClient({ profiles: initialProfiles, lines, records:
     setBusyRequestId(null)
   }
 
+  const confirmName = (id: string) => profiles.find((p) => p.id === id)?.full_name || 'this user'
+  const confirmEmail = (id: string) => profiles.find((p) => p.id === id)?.email ?? null
+
   const pendingCount = requests.filter((r) => r.status === 'pending').length
   const tabs: { key: Tab; label: string; count: number }[] = [
     { key: 'users', label: 'Users', count: profiles.length },
@@ -118,6 +146,18 @@ export default function AdminClient({ profiles: initialProfiles, lines, records:
         <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
           {!adding && <button type="button" className="btn-primary" onClick={() => setAdding(true)}>Add user</button>}
         </div>
+        {userMessage && (
+          <p
+            role={userMessage.kind === 'error' ? 'alert' : 'status'}
+            style={{
+              margin: '0 0 12px', padding: '10px 12px', borderRadius: 8, fontSize: 13, fontWeight: 600,
+              background: userMessage.kind === 'error' ? 'var(--red-bg)' : 'var(--green-bg)',
+              color: userMessage.kind === 'error' ? 'var(--red)' : '#15803d',
+            }}
+          >
+            {userMessage.text}
+          </p>
+        )}
         {adding && (
           <AddUserForm
             lines={lines}
@@ -150,9 +190,13 @@ export default function AdminClient({ profiles: initialProfiles, lines, records:
                   <td>{profile.production_lines?.name ?? <em style={{ color: 'var(--text-muted)' }}>None</em>}</td>
                   <td>{fmtDate(profile.created_at)}</td>
                   <td className="right">
-                    <button onClick={() => setConfirm({ type: 'user', id: profile.id })} style={{ fontSize: 12, fontWeight: 600, color: 'var(--red)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-                      Delete
-                    </button>
+                    {profile.id === currentUserId ? (
+                      <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>You</span>
+                    ) : (
+                      <button disabled={deletingUserId === profile.id} onClick={() => setConfirm({ type: 'user', id: profile.id })} style={{ fontSize: 12, fontWeight: 600, color: 'var(--red)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
+                        {deletingUserId === profile.id ? 'Deleting…' : 'Delete'}
+                      </button>
+                    )}
                   </td>
                 </tr>
               ))}
@@ -224,8 +268,10 @@ export default function AdminClient({ profiles: initialProfiles, lines, records:
 
       {confirm && (
         <ConfirmDialog
-          title={confirm.type === 'user' ? 'Delete User' : 'Delete Record'}
-          message="This will permanently delete this record. This cannot be undone."
+          title={confirm.type === 'user' ? `Delete ${confirmName(confirm.id)}?` : 'Delete Record'}
+          message={confirm.type === 'user'
+            ? `This deletes ${confirmName(confirm.id)}’s login${confirmEmail(confirm.id) ? ` (${confirmEmail(confirm.id)})` : ''} and profile. They won’t be able to sign in. There is no undo.`
+            : 'This will permanently delete this record. This cannot be undone.'}
           confirmLabel="Delete"
           danger
           onConfirm={() => confirm.type === 'user' ? handleDeleteUser(confirm.id) : handleDeleteRecord(confirm.id)}
@@ -237,7 +283,7 @@ export default function AdminClient({ profiles: initialProfiles, lines, records:
 }
 
 /** Same basePath trap as app/layout's BASE_PATH: fetch() doesn't get next.config's prefix. */
-const ADD_USER_URL = '/jmotion/admin/users'
+const USERS_ROUTE_URL = '/jmotion/admin/users'
 
 /**
  * Add user — creates the login and the profile in one call to app/admin/users/route.ts, which
@@ -268,7 +314,7 @@ function AddUserForm({ lines, onCreated, onClose }: {
     setBusy(true)
     setError(null)
     try {
-      const res = await fetch(ADD_USER_URL, {
+      const res = await fetch(USERS_ROUTE_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password, full_name: fullName, role, production_line_id: lineId }),
