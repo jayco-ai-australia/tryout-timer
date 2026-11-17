@@ -195,6 +195,10 @@ body {
 .badge-amber  { background: var(--amber-bg); color: #92400e; }
 .badge-red    { background: var(--red-bg);   color: #b91c1c; }
 .badge-blue   { background: var(--blue-light); color: var(--blue); }
+/* Where a minutes figure came from (lib/figureSource), in the Labour Matrix's two fills and the
+   text colours /estimate's notes use on the same fills. */
+.badge-measured  { background: var(--measured-bg);  color: var(--green-deep); }
+.badge-estimated { background: var(--estimated-bg); color: #9a4a00; }
 
 /* Live dot */
 .live-dot {

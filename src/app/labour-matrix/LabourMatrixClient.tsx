@@ -9,6 +9,7 @@ import {
   type JobCompleteness, type OperationTimeStat, type TimeExclusionFlags,
 } from '@/lib/operationTimes'
 import { computeCoverageCombos, coverageComboKey, estimateOnlyComboKeys, type CoverageCombo } from '@/lib/coverage'
+import { estimatedTimeIds as estimatedIdsOf, figureSource, isEstimatedFigure } from '@/lib/figureSource'
 import { chunked, fetchAllChunked, fetchAllRows, logSupabaseError, READ_CHUNK } from '@/lib/supabaseRead'
 import { selectIn } from '@/lib/chunkedIn'
 import { feedTargetsForLine, loadLineSplit, modelsForLine, type LineSplit } from '@/lib/lines'
@@ -970,9 +971,9 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
   const cells = useMemo(() => {
     const jobIdByOp = new Map(source.operations.map((o) => [o.id, o.job_id]))
 
-    // Which current records are estimates — asked of the record the shared helper PICKED
-    // (stat.currentId), never decided here, so the colour describes the very figure in the cell.
-    const estimatedTimeIds = new Set(source.operationTimes.filter((t) => t.is_estimated).map((t) => t.id))
+    // Which current records are estimates — lib/figureSource's step 1 asks it of the record the
+    // shared helper PICKED (stat.currentId), so the colour describes the very figure in the cell.
+    const estimatedTimeIds = estimatedIdsOf(source.operationTimes)
 
     interface Acc { minutes: number; timed: Set<string>; required: Set<string>; estimated: number }
     const acc = new Map<string, Acc>()
@@ -1014,7 +1015,7 @@ export default function LabourMatrixClient({ lines, userId, role }: Props) {
       if (a.timed.has(operationId)) continue
       a.timed.add(operationId)
       a.minutes += stat.minutes
-      if (estimatedTimeIds.has(stat.currentId)) a.estimated += 1
+      if (isEstimatedFigure(stat, estimatedTimeIds)) a.estimated += 1
     }
 
     // Applicability comes from the shared combos, not from `required.size` — same answer today,
@@ -2411,10 +2412,11 @@ function Cell({ cell, columnLabel, jobCount, grain, model, onOpen, onEstimate, f
   // grains they are those counts summed. See columnCells for why summing them is sufficient.
   const state: JobCompleteness = jobCompleteness(cell.timedOps, cell.totalOps)
   // WHERE the figure came from, as a background — on top of, never instead of, the text colour
-  // and underline above. Measured only if every timed operation beneath is measured; one estimate
-  // anywhere and the figure is partly inferred, so it reads as estimated. An untimed cell has no
-  // figure to source and gets no background, which is what keeps the red 0.0 on white.
-  const source = cell.timedOps === 0 ? '' : cell.estimatedOps > 0 ? ' lm-src-estimated' : ' lm-src-measured'
+  // and underline above. lib/figureSource's step 2: measured only if every timed operation beneath
+  // is measured; one estimate anywhere and it reads as estimated. An untimed cell has no figure to
+  // source and gets no background, which is what keeps the red 0.0 on white.
+  const figureSrc = figureSource(cell.timedOps, cell.estimatedOps)
+  const source = figureSrc ? ` lm-src-${figureSrc}` : ''
   const cls = ` ${base}-${state === 'none' ? 'none' : state === 'partial' ? 'partial' : 'timed'}${source}`
   const sourceNote = cell.timedOps === 0 ? ''
     : cell.estimatedOps === 0 ? ' · measured'

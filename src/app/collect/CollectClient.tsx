@@ -2,6 +2,7 @@
 
 import SelectAllControl from '@/components/SelectAllControl'
 import { TIME_FLAG_COLUMNS, type TimeRow } from '@/lib/operationTimes'
+import { estimatedTimeIds, figureSource, isEstimatedFigure, type FigureSource } from '@/lib/figureSource'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { selectIn } from '@/lib/chunkedIn'
@@ -166,6 +167,9 @@ export default function CollectClient({ lines, userId }: Props) {
   // ── Models pane: the applies-list of the selected operation, plus its coverage ────────
   const [opModels, setOpModels] = useState<Product[]>([])
   const [opStats, setOpStats] = useState<Record<string, OperationTimeStat>>({})
+  /** Measured or estimated, per model, for the coverage badges — lib/figureSource, the Labour
+   * Matrix's rule. Presentation only: it never touches a figure. */
+  const [opSources, setOpSources] = useState<Record<string, FigureSource>>({})
   const [loadingModels, setLoadingModels] = useState(false)
   /** The coverage targets the next run gets banked against. Default none — a time banked
    * against models nobody chose is exactly the quiet wrong data this screen exists to fix. */
@@ -446,7 +450,7 @@ export default function CollectClient({ lines, userId }: Props) {
     try {
       const links = await fetchLinksForOperations(supabase, [opId])
       const productIds = [...new Set(links.map((l) => l.product_id))]
-      if (productIds.length === 0) { setOpModels([]); setOpStats({}); return }
+      if (productIds.length === 0) { setOpModels([]); setOpStats({}); setOpSources({}); return }
 
       const [productRows, { data: timeRows, error: timesError }] = await Promise.all([
         // Chunked (lib/chunkedIn): an operation on a big line applies to hundreds of models.
@@ -456,12 +460,12 @@ export default function CollectClient({ lines, userId }: Props) {
         // behind the figure, and currentForOperation counts that from the rows it is handed. It
         // picks the current record itself — the query's job is to select the column, not to
         // pre-decide the answer.
-        supabase.from('operation_times').select(`id, operation_id, total_minutes, superseded_by, chassis_id, ${TIME_FLAG_COLUMNS}, created_at`).eq('operation_id', opId),
+        supabase.from('operation_times').select(`id, operation_id, total_minutes, superseded_by, chassis_id, is_estimated, ${TIME_FLAG_COLUMNS}, created_at`).eq('operation_id', opId),
       ])
       if (timesError) throw new Error(timesError.message)
 
       // The row shape is stated here, not inferred — see lib/operationTimes' TIME_PARENT_JOIN.
-      const times = (timeRows ?? []) as unknown as TimeRow[]
+      const times = (timeRows ?? []) as unknown as (TimeRow & { is_estimated: boolean })[]
       // Chunked (lib/chunkedIn): one operation accumulates a run per model per re-measure, so
       // this id list grows with history rather than being bounded by anything.
       const timeModels = await selectIn<{ operation_time_id: string; product_id: string }>(
@@ -474,9 +478,14 @@ export default function CollectClient({ lines, userId }: Props) {
       // operation, so remap down to plain product ids for the row lookup.
       const pairStats = currentForOperation(times, timeModels)
       const stats: Record<string, OperationTimeStat> = {}
+      const sources: Record<string, FigureSource> = {}
+      const estimatedIds = estimatedTimeIds(times)
       for (const id of productIds) {
         const stat = pairStats[operationProductKey(opId, id)]
-        if (stat) stats[id] = stat
+        if (!stat) continue
+        stats[id] = stat
+        // One figure per badge, so step 2 over a single figure — the same call a Matrix cell makes.
+        sources[id] = figureSource(1, isEstimatedFigure(stat, estimatedIds) ? 1 : 0) ?? 'measured'
       }
 
       // Sorted here, NOT left to the query: each chunk comes back model-ordered on its own,
@@ -484,8 +493,9 @@ export default function CollectClient({ lines, userId }: Props) {
       // only sorted within each run. This list is rendered in array order.
       setOpModels([...productRows].sort((a, b) => a.model.localeCompare(b.model)))
       setOpStats(stats)
+      setOpSources(sources)
     } catch (err) {
-      setOpModels([]); setOpStats({})
+      setOpModels([]); setOpStats({}); setOpSources({})
       setPageError(err instanceof Error ? err.message : 'Could not load this operation’s models')
     } finally {
       setLoadingModels(false)
@@ -493,7 +503,7 @@ export default function CollectClient({ lines, userId }: Props) {
   }, [supabase])
 
   useEffect(() => {
-    if (!activeOperationId) { setOpModels([]); setOpStats({}); return }
+    if (!activeOperationId) { setOpModels([]); setOpStats({}); setOpSources({}); return }
     loadModels(activeOperationId)
   }, [activeOperationId, loadModels])
 
@@ -1148,6 +1158,7 @@ export default function CollectClient({ lines, userId }: Props) {
           operation={selectedOperation}
           products={opModels}
           stats={opStats}
+          sources={opSources}
           loading={loadingModels}
           canLink={Boolean(modelLinkLineId)}
           onOpenLinkDrawer={openLinkDrawerForCurrent}
@@ -1723,12 +1734,14 @@ function CollectOperationsPane({
  * It opens the drawer scoped to this one operation and adds links; it never reaches the ticks.
  */
 function ModelsCoveragePane({
-  operation, products, stats, loading, selectedIds, gapCount, timedCount, sortWithinSeries,
+  operation, products, stats, sources, loading, selectedIds, gapCount, timedCount, sortWithinSeries,
   canLink, onOpenLinkDrawer, onToggle, onToggleSeries, onSelectGaps, onSelectAll, onClear,
 }: {
   operation: Operation | null
   products: Product[]
   stats: Record<string, OperationTimeStat>
+  /** Measured or estimated per model id, for the badge colour and its tooltip. */
+  sources: Record<string, FigureSource>
   loading: boolean
   selectedIds: Set<string>
   gapCount: number
@@ -1852,8 +1865,13 @@ function ModelsCoveragePane({
             onToggleSeries={onToggleSeries}
             renderRowStatus={(p) => {
               const stat = stats[p.id]
+              // The panel has no key, so the tooltip leads with the state: colour isn't the only signal.
+              const src = sources[p.id] ?? 'measured'
               return stat ? (
-                <span className="badge badge-green" title={`Current time for this model — ${historyLabel(stat)}`}>
+                <span
+                  className={`badge badge-${src}`}
+                  title={`${src === 'estimated' ? 'Estimated' : 'Measured'} · Current time for this model — ${historyLabel(stat)}`}
+                >
                   {fmtMinutes(stat.minutes)}m{stat.archived > 0 && <> &middot; +{stat.archived}</>}
                 </span>
               ) : (
