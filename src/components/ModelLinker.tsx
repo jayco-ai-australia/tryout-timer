@@ -562,6 +562,10 @@ export default function ModelLinker({ operationId, operationName, productionLine
     try {
       await recordOperationTime(supabase, {
         operationId, productIds: [product.id], operatorId, collectedBy: userId, totalMinutes: minutes,
+        // SAME HOLE as /collect had (Nov 2026): a chassis-less save beside an existing chassis-less
+        // figure sums with it, so a re-time here doubles the figure. Not asked yet — this says
+        // "add" out loud until this screen wires up useSameChassisPrompt. See THE CHASSIS-LESS GUARD.
+        sameChassis: { action: 'add-separate' },
       })
       setManualMinutes((prev) => ({ ...prev, [product.id]: '' }))
       setOpenTimeProductId(null)

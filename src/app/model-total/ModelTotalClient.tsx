@@ -1154,6 +1154,10 @@ export default function ModelTotalClient({ lines, userId, role }: Props) {
         operatorId: addTimeOperatorId,
         collectedBy: userId,
         totalMinutes: minutes,
+        // SAME HOLE as /collect had (Nov 2026): a chassis-less save beside an existing chassis-less
+        // figure sums with it, so a re-time here doubles the figure. Not asked yet — this says
+        // "add" out loud until this screen wires up useSameChassisPrompt. See THE CHASSIS-LESS GUARD.
+        sameChassis: { action: 'add-separate' },
       })
       if (addTimeNote.trim()) {
         await addOperationTimeNote(supabase, created.id, addTimeNote.trim(), userId)

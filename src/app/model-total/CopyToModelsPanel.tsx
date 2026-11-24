@@ -449,6 +449,9 @@ export default function CopyToModelsPanel({
               totalMinutes: run.totalMinutes as number,
               // No timestamps: this is a copy, not a stopwatch run.
               isImported: true,
+              // Deliberately added: each source run is copied as its own record (a merged
+              // operation's runs are pieces that sum), so there is no re-time to ask about.
+              sameChassis: { action: 'add-separate' },
             })
             result.created += 1
             perTarget.created += 1

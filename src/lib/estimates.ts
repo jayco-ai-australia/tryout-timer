@@ -600,6 +600,9 @@ async function writeOne(supabase: SupabaseClient, w: EstimateWrite, userId: stri
       startedAt: null,
       completedAt: null,
       isEstimated: true,
+      // A new cell only: an existing estimate is re-saved in place below and a measured pair is
+      // refused, so there is no chassis-less figure here for this to sum with.
+      sameChassis: { action: 'add-separate' },
     })
     return created.id
   }

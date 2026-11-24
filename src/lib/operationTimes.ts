@@ -810,12 +810,23 @@ export interface RecordOperationTimeInput {
    * ask (SameChassisPrompt) and call again with the answer:
    *   add-separate   write a new record alongside — merged sub-tasks, parallel operators
    *   correct        edit THAT record's minutes in place (updateOperationTime); nothing new
-   * Only a save with a chassis can meet the guard, so a chassis-less caller never needs this.
+   *
+   * A CHASSIS-LESS save meets the same question per model — see THE CHASSIS-LESS GUARD — and is
+   * answered with `per-model` (one answer for each model that already has a figure), or with a
+   * blanket add-separate from a caller that deliberately adds (estimates, copies, splits, and the
+   * screens not yet asking — see the call sites marked SAME HOLE).
    */
   sameChassis?: SameChassisResolution
 }
 
-export type SameChassisResolution = { action: 'add-separate' } | { action: 'correct'; recordId: string }
+export type SameChassisResolution =
+  | { action: 'add-separate' }
+  | { action: 'correct'; recordId: string }
+  /** Chassis-less only: one answer per model that already holds a current chassis-less record. */
+  | { action: 'per-model'; byProduct: Record<string, ModelRecordResolution> }
+
+/** What to do for ONE model that already has a chassis-less figure for the operation. */
+export type ModelRecordResolution = { action: 'add-separate' } | { action: 'correct'; recordId: string }
 
 /** A current, counted record already on the chassis — what the prompt shows to decide by. */
 export interface ExistingChassisRecord {
@@ -825,6 +836,10 @@ export interface ExistingChassisRecord {
   createdAt: string
   /** Newest first. Empty when the record has none. */
   notes: string[]
+  /** An /estimate figure rather than a measured one. */
+  isEstimated: boolean
+  /** How many models the record counts towards — all of them, not just the ones being saved. */
+  modelCount: number
 }
 
 /**
@@ -857,10 +872,10 @@ export async function fetchCurrentRecordsOnChassis(
   operationId: string,
   chassisId: string
 ): Promise<ExistingChassisRecord[]> {
-  type Row = TimeExclusionFlags & { id: string; total_minutes: number | null; operator_id: string | null; created_at: string; superseded_by: string | null }
+  type Row = TimeExclusionFlags & { id: string; total_minutes: number | null; operator_id: string | null; created_at: string; superseded_by: string | null; is_estimated: boolean }
   const { data, error } = await supabase
     .from('operation_times')
-    .select(`id, total_minutes, operator_id, created_at, superseded_by, ${TIME_FLAG_COLUMNS}`)
+    .select(`id, total_minutes, operator_id, created_at, superseded_by, is_estimated, ${TIME_FLAG_COLUMNS}`)
     .eq('operation_id', operationId)
     .eq('chassis_id', chassisId)
     .is('superseded_by', null)
@@ -869,7 +884,18 @@ export async function fetchCurrentRecordsOnChassis(
   if (error) throw new Error(error.message)
   const rows = ((data ?? []) as unknown as Row[]).filter((r) => countsTowardLabour(r) && r.total_minutes != null)
   if (rows.length === 0) return []
+  const links = await fetchOperationTimeModelLinks(supabase, rows.map((r) => r.id))
+  const modelCount = new Map<string, number>()
+  for (const l of links) modelCount.set(l.operation_time_id, (modelCount.get(l.operation_time_id) ?? 0) + 1)
+  return describeRecords(supabase, rows.map((r) => ({ ...r, modelCount: modelCount.get(r.id) ?? 0 })))
+}
 
+/** Operator name and notes for records the prompt shows — shared by both guards. */
+async function describeRecords(
+  supabase: SupabaseClient,
+  rows: { id: string; total_minutes: number | null; operator_id: string | null; created_at: string; is_estimated: boolean; modelCount: number }[]
+): Promise<ExistingChassisRecord[]> {
+  if (rows.length === 0) return []
   const operatorIds = [...new Set(rows.map((r) => r.operator_id).filter((id): id is string => id != null))]
   const [{ data: operators, error: opError }, notes] = await Promise.all([
     operatorIds.length > 0
@@ -887,7 +913,106 @@ export async function fetchCurrentRecordsOnChassis(
     operatorName: r.operator_id && nameById.get(r.operator_id) !== PLACEHOLDER_OPERATOR_NAME ? nameById.get(r.operator_id) ?? null : null,
     createdAt: r.created_at,
     notes: notes.filter((n) => n.operation_time_id === r.id).map((n) => n.content),
+    isEstimated: r.is_estimated,
+    modelCount: r.modelCount,
   }))
+}
+
+/**
+ * One model of a chassis-less save, as the chassis-less guard found it: the current chassis-less
+ * records already on it (empty = this time is its first) and what its figure is now and would
+ * become under each answer, through the counting rule itself (currentForOperation), so the prompt
+ * can say "19.61-2.48V.AV would become 16.2" rather than describe the arithmetic.
+ */
+export interface ChassislessModelState {
+  productId: string
+  /** Current, counted, chassis-less records on this model for the operation. Newest first. */
+  records: ExistingChassisRecord[]
+  /** The pair's figure now — van observations included — or null when it has none. */
+  figureNow: number | null
+  /** The figure if this time is added alongside what is there. */
+  ifAdded: number
+  /** The figure if this time corrects that record, by record id. */
+  ifCorrected: Record<string, number>
+}
+
+/**
+ * recordOperationTime was asked to save a chassis-less time against models where one or more
+ * already hold a current chassis-less record, without being told what each one is. Nothing was
+ * written. Chassis-less records SUM (combineCurrentRecords), so a re-time added beside the first
+ * doubles the figure; only the person saving knows whether it is a re-time. The caller shows
+ * SameChassisPrompt (which handles this as well) and calls again with a `per-model` answer.
+ */
+export class ChassislessRecordError extends Error {
+  constructor(
+    public readonly operationId: string,
+    /** Every model being saved, in the order asked — those with records AND those without. */
+    public readonly models: ChassislessModelState[]
+  ) {
+    const n = models.filter((m) => m.records.length > 0).length
+    super(
+      `${n === 1 ? 'One model already has' : `${n} models already have`} a time for this operation, so ` +
+      'nothing was saved yet — choose whether this corrects it or is separate work.'
+    )
+    this.name = 'ChassislessRecordError'
+  }
+}
+
+/**
+ * What the chassis-less guard asks about, for the models being saved: each model's current,
+ * counted, chassis-less records, and its figure now / if added / if corrected. One read of the
+ * operation's records (with their full model fan-out), so the figures are the rule's own answer.
+ */
+export async function fetchChassislessState(
+  supabase: SupabaseClient,
+  operationId: string,
+  productIds: string[],
+  totalMinutes: number
+): Promise<{ models: ChassislessModelState[]; times: OperationTimeWithModels[] }> {
+  const times = await fetchOperationTimesWithModels(supabase, operationId)
+  const wanted = new Set(productIds)
+  const asRow = (t: OperationTimeWithModels): TimeRow => ({
+    id: t.id, operation_id: t.operation_id, total_minutes: t.total_minutes, superseded_by: t.superseded_by,
+    chassis_id: t.chassis_id, created_at: t.created_at,
+    is_active: t.is_active, is_hidden: t.is_hidden, operations: t.operations,
+  })
+  const rows = times.map(asRow)
+  const links = times.flatMap((t) => t.productIds.filter((p) => wanted.has(p)).map((p) => ({ operation_time_id: t.id, product_id: p })))
+  const NEW = '__this-save__'
+  const newRow: TimeRow = { is_active: true, is_hidden: false, operations: LIVE_PARENTS, id: NEW, operation_id: operationId, total_minutes: totalMinutes, superseded_by: null, chassis_id: null, created_at: '9999' }
+  const figure = (rs: TimeRow[], ls: TimeModelRow[], productId: string) =>
+    currentForOperation(rs, ls)[operationProductKey(operationId, productId)]?.minutes ?? null
+
+  const now = currentForOperation(rows, links)
+  const onModel = new Map<string, OperationTimeWithModels[]>()
+  for (const t of times) {
+    if (t.chassis_id != null || t.superseded_by != null || t.total_minutes == null || !countsTowardLabour(t)) continue
+    for (const p of t.productIds) if (wanted.has(p)) (onModel.get(p) ?? onModel.set(p, []).get(p)!).push(t)
+  }
+  const described = new Map(
+    (await describeRecords(supabase, [...new Map([...onModel.values()].flat().map((t) => [t.id, t])).values()]
+      .map((t) => ({ ...t, modelCount: t.productIds.length }))))
+      .map((r) => [r.id, r])
+  )
+
+  const models = [...wanted].map((productId) => {
+    const own = (onModel.get(productId) ?? []).sort((a, b) => b.created_at.localeCompare(a.created_at) || b.id.localeCompare(a.id))
+    const withNew = [...links, { operation_time_id: NEW, product_id: productId }]
+    const ifCorrected: Record<string, number> = {}
+    for (const r of own) {
+      // A correction takes that record out of this model's figure and puts this time in its place.
+      const without = withNew.filter((l) => !(l.operation_time_id === r.id && l.product_id === productId))
+      ifCorrected[r.id] = figure([...rows, newRow], without, productId) as number
+    }
+    return {
+      productId,
+      records: own.map((t) => described.get(t.id)!),
+      figureNow: now[operationProductKey(operationId, productId)]?.minutes ?? null,
+      ifAdded: figure([...rows, newRow], withNew, productId) as number,
+      ifCorrected,
+    }
+  })
+  return { models, times }
 }
 
 /**
@@ -908,6 +1033,10 @@ export interface RecordedOperationTime {
   /** true when the save CORRECTED an existing record in place (sameChassis: correct): `created`
    * is that record, edited, and no new record exists. A caller adding a note adds it there. */
   corrected: boolean
+  /** The models whose existing figure this save corrected rather than added to. A van
+   * correction corrects every saved model; a chassis-less save only the models answered
+   * `correct`. Empty when nothing was corrected. */
+  correctedProductIds: string[]
 }
 
 /**
@@ -1329,7 +1458,8 @@ export async function recordOperationTime(
   if (chassisId != null && input.sameChassis?.action !== 'add-separate') {
     const existing = await fetchCurrentRecordsOnChassis(supabase, operationId, chassisId)
     const correction = input.sameChassis
-    if (!correction) {
+    // A per-model answer is the chassis-less question's; on a van it answers nothing, so ask.
+    if (!correction || correction.action === 'per-model') {
       if (existing.length > 0) throw new SameChassisRecordError(operationId, chassisId, existing)
     } else {
       // Re-checked against the fresh read: the record picked in the prompt may have been
@@ -1341,7 +1471,95 @@ export async function recordOperationTime(
       // A correction is an edit of THAT record, through the one updater — no new record, and its
       // operator, timestamps and links stay as they were.
       const updated = await updateOperationTime(supabase, correction.recordId, { totalMinutes })
-      return { created: updated, savedProductIds, refusedProductIds, measuredProductIds, corrected: true }
+      return { created: updated, savedProductIds, refusedProductIds, measuredProductIds, corrected: true, correctedProductIds: savedProductIds }
+    }
+  }
+
+  /**
+   * ── THE CHASSIS-LESS GUARD: a re-time without a van is asked about too, per model ─────────
+   *
+   * Chassis-less records on a pair SUM, the same as records on one van (combineCurrentRecords),
+   * so re-timing an operation from /collect added the second figure to the first: 2,495 minutes
+   * across 28 operations were cleaned out of the live data in November 2026, all of it this.
+   * The operation and the models are enough to see the existing record, so the same question is
+   * asked — but per model, because one save banks a run against many models and some of them may
+   * already hold a figure while others do not. Estimates count: a measured time added beside an
+   * estimate sums with it just the same.
+   *
+   * Answered with `per-model`, one answer for each model that has a figure:
+   *   add-separate   the model gets this record alongside what is there (summed)
+   *   correct R      R is taken out of THIS model's figure and this record takes its place:
+   *                    R counts for nothing else being kept   → R is hidden (updateOperationTime)
+   *                    R also counts for other models         → this model is split off R
+   *                                                             (splitOperationTimeForModel) and
+   *                                                             the split copy is hidden, so R's
+   *                                                             other models are untouched
+   *                  Hidden, not edited in place, because R may be an estimate (an edited
+   *                  estimate would show a measured figure as estimated) and so the figure it
+   *                  replaced stays visible in the times drawer.
+   * Models with no chassis-less record just get the new record — nothing to ask.
+   *
+   * Order: every take-out first, then the insert. A take-out refused (RLS: you can only hide
+   * what you collected) stops the save before the new record exists, so a refusal can never
+   * leave both figures counting; if the insert then fails, what was hidden is un-hidden. A
+   * missing figure for a moment is better than a doubled one that looks normal.
+   *
+   * A blanket add-separate skips the guard — estimates, copies, splits and the screens not yet
+   * asking (marked SAME HOLE at their call sites). Fails closed on a failed read.
+   */
+  const hiddenForCorrection: string[] = []
+  let correctedProductIds: string[] = []
+  if (chassisId == null && input.sameChassis?.action !== 'add-separate') {
+    const { models, times } = await fetchChassislessState(supabase, operationId, savedProductIds, totalMinutes)
+    const affected = models.filter((m) => m.records.length > 0)
+    if (affected.length > 0) {
+      const answer = input.sameChassis
+      if (answer?.action !== 'per-model') throw new ChassislessRecordError(operationId, models)
+      // Every model with a figure must be answered against what is there NOW; a record corrected,
+      // hidden or added since the prompt opened means the question is asked again on fresh data.
+      const stale = affected.some((m) => {
+        const a = answer.byProduct[m.productId]
+        return !a || (a.action === 'correct' && !m.records.some((r) => r.id === a.recordId))
+      })
+      if (stale) throw new ChassislessRecordError(operationId, models)
+
+      const correcting = new Map<string, string[]>() // record id → models it is corrected for
+      for (const m of affected) {
+        const a = answer.byProduct[m.productId]
+        if (a.action === 'correct') correcting.set(a.recordId, [...(correcting.get(a.recordId) ?? []), m.productId])
+      }
+      const byId = new Map(times.map((t) => [t.id, t]))
+      // Whole-record hides first: they are the writes RLS is most likely to refuse.
+      const plan = [...correcting].map(([id, productIdsForRecord]) => ({
+        record: byId.get(id) as OperationTimeWithModels,
+        productIdsForRecord,
+        whole: (byId.get(id) as OperationTimeWithModels).productIds.every((p) => productIdsForRecord.includes(p)),
+      })).sort((a, b) => Number(b.whole) - Number(a.whole))
+      try {
+        for (const { record, productIdsForRecord, whole } of plan) {
+          if (whole) {
+            await updateOperationTime(supabase, record.id, { isHidden: true })
+            hiddenForCorrection.push(record.id)
+            continue
+          }
+          const noteContents = (await fetchOperationTimeNotes(supabase, [record.id])).map((n) => n.content)
+          for (const productId of productIdsForRecord) {
+            const { created: copy } = await splitOperationTimeForModel(supabase, {
+              original: record, productId, totalMinutes: record.total_minutes as number,
+              operatorId: record.operator_id, collectedBy, noteContents,
+            })
+            await updateOperationTime(supabase, copy.id, { isHidden: true })
+            hiddenForCorrection.push(copy.id)
+          }
+        }
+      } catch (err) {
+        await unhideAfterFailedCorrection(supabase, hiddenForCorrection)
+        throw new Error(
+          `Nothing was saved: the existing time could not be corrected (${err instanceof Error ? err.message : 'rejected'}). ` +
+          'Choose "Add as separate work" only if this really is extra work, or ask whoever recorded it to correct it.'
+        )
+      }
+      correctedProductIds = [...correcting.values()].flat()
     }
   }
 
@@ -1375,10 +1593,17 @@ export async function recordOperationTime(
     .select('*')
     .single()
   if (insertError || !created) {
+    // A correction's take-outs already happened; put them back rather than leave models untimed.
+    await unhideAfterFailedCorrection(supabase, hiddenForCorrection)
     throw new Error(insertError?.message ?? 'Could not save time')
   }
 
-  await linkOperationTimeToModels(supabase, created.id, savedProductIds)
+  try {
+    await linkOperationTimeToModels(supabase, created.id, savedProductIds)
+  } catch (err) {
+    await unhideAfterFailedCorrection(supabase, hiddenForCorrection)
+    throw err
+  }
 
   /**
    * ── A NEW RECORD NEVER ARCHIVES ANOTHER ───────────────────────────────────────────────────
@@ -1401,7 +1626,26 @@ export async function recordOperationTime(
    * Those, and only those, write superseded_by (via setSupersededBy).
    */
 
-  return { created: created as OperationTime, savedProductIds, refusedProductIds, measuredProductIds, corrected: false }
+  return {
+    created: created as OperationTime, savedProductIds, refusedProductIds, measuredProductIds,
+    corrected: correctedProductIds.length > 0, correctedProductIds,
+  }
+}
+
+/** Compensation for the chassis-less guard: un-hide what a correction hid before its insert
+ * failed. Best effort per record; a record that can't be put back is named, not swallowed. */
+async function unhideAfterFailedCorrection(supabase: SupabaseClient, ids: string[]): Promise<void> {
+  const stuck: string[] = []
+  for (const id of ids) {
+    try { await updateOperationTime(supabase, id, { isHidden: false }) } catch { stuck.push(id) }
+  }
+  if (stuck.length > 0) {
+    throw new Error(
+      `The time was not saved, and ${stuck.length === 1 ? 'one existing record' : `${stuck.length} existing records`} ` +
+      'taken out to make room for it could not be put back — those models now read untimed. ' +
+      'Un-hide them in the times drawer, or ask an admin.'
+    )
+  }
 }
 
 // ── operation_time_models: the junction, and the only three functions that touch it ────────
@@ -1916,8 +2160,8 @@ export async function splitOperationTimeForModel(
         ? { teamId: original.team_id, productionLineId: original.production_line_id }
         : undefined,
       // A split divides a run that already exists between models — it is not a re-time, so
-      // there is nothing to ask. It carries the original's chassis, and without this the guard
-      // would ask about the original itself.
+      // there is nothing to ask. It carries the original's chassis (or none), and without this
+      // either guard would ask about the original itself.
       sameChassis: { action: 'add-separate' },
     }))
   } catch (err) {

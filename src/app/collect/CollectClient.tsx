@@ -30,7 +30,8 @@ import {
   type OperationTimeStat,
 } from '@/lib/operationTimes'
 import { fetchLinksForOperations } from '@/lib/modelOperations'
-import { saveTimerRun, useStopwatches, type ActiveTimer } from '@/lib/stopwatch'
+import { completeTimer, saveTimerRun, useStopwatches, type ActiveTimer } from '@/lib/stopwatch'
+import { useSameChassisPrompt } from '@/components/SameChassisPrompt'
 import { findSectionTray, setJobSection, sortSections, teamForJob } from '@/lib/sections'
 import { createOperation, createOperations, parseOperationNames } from '@/lib/operations'
 import { fmtMinutes } from '@/lib/format'
@@ -53,6 +54,10 @@ import type { Job, Operation, Product, ProductionLine, Section, Team } from '@/l
  * about an operation on a model, not about a particular van, and attaching a chassis would make
  * it look like a tryout measurement when it isn't. recordOperationTime is called with
  * chassisId: null.
+ *
+ * Chassis-less records on a model SUM, so re-timing an operation here used to add the second
+ * figure to the first. Every save goes through useSameChassisPrompt: models that already hold a
+ * time without a van are shown, grouped, and each group is corrected (the default) or added to.
  *
  * ── What this replaced ────────────────────────────────────────────────────────────────────
  * The old screen had two entry flows. "Chassis-first" is now /tryouts, which does that job
@@ -128,6 +133,16 @@ const OK_BOX: React.CSSProperties = {
  * a timer started here must not turn up in a van's rail as though it belonged to that chassis. */
 const TIMERS_KEY = 'jmotion_collect_timers'
 
+/** Manual entry stopped because the prompt was cancelled at a row — reported like a failure. */
+class CancelledAtRow extends Error {
+  constructor(public readonly operationName: string) { super(`Cancelled at ${operationName}`); this.name = 'CancelledAtRow' }
+}
+
+/** " Corrected the existing time on 3 models rather than adding to it." — or nothing. */
+function correctedSummary(n: number): string {
+  return n === 0 ? '' : ` Corrected the existing time on ${n === 1 ? 'one model' : `${n} models`} rather than adding to it.`
+}
+
 function one<T>(v: T | T[] | null | undefined): T | null {
   if (Array.isArray(v)) return v[0] ?? null
   return v ?? null
@@ -187,6 +202,9 @@ export default function CollectClient({ lines, userId }: Props) {
     timers, nowMs, start: startStopwatch, togglePause, restart: restartTimer, discard: discardTimer,
     addNote: addTimerNote, removeNote: removeTimerNote,
   } = useStopwatches(TIMERS_KEY)
+  /** "Already timed for these models" — asked when a save would add a time beside an existing
+   * chassis-less one, which would sum with it. See SameChassisPrompt. */
+  const { withSameChassisPrompt, sameChassisPrompt } = useSameChassisPrompt()
   const [startTarget, setStartTarget] = useState<TimerTarget | null>(null)
   const [completingTimer, setCompletingTimer] = useState<ActiveTimer | null>(null)
   const [completing, setCompleting] = useState(false)
@@ -857,13 +875,23 @@ export default function CollectClient({ lines, userId }: Props) {
       // The shared save path: ONE operation_times row, linked to every model on the timer via
       // operation_time_models, then the run's notes in order. chassisId is null on the timer
       // and rides through untouched.
-      const recorded = await saveTimerRun(supabase, timer, {
+      // Models that already hold a time without a van are asked about first — correct it or add
+      // as separate work, per group (see SameChassisPrompt). Cancel writes nothing and leaves the
+      // timer running in the rail and this dialog open.
+      const recorded = await withSameChassisPrompt((sameChassis) => saveTimerRun(supabase, timer, {
         userId,
         operatorId: result.operatorId,
         notes: result.notes,
         note: result.note,
         atMs: result.atMs,
+        sameChassis,
+      }), {
+        operationName: timer.operationName,
+        chassisNumber: null,
+        minutes: completeTimer(timer, result.atMs ?? Date.now()).totalMinutes,
+        modelNames: Object.fromEntries(timer.models.map((m) => [m.productId, m.model])),
       })
+      if (!recorded) return
       discardTimer(timer.timerId)
       setCompletingTimer(null)
       // The models were snapshotted at Start; one unlinked while the clock ran is refused at
@@ -873,6 +901,7 @@ export default function CollectClient({ lines, userId }: Props) {
       )
       setSavedNotice(
         `“${timer.operationName}” banked against ${plural(recorded.savedProductIds.length, 'model')}.`
+        + correctedSummary(recorded.correctedProductIds.length)
         + (refusedNames.length > 0
           ? ` Skipped, no time saved: ${refusedNames.join(', ')} — the operation no longer applies to `
             + `${refusedNames.length === 1 ? 'it' : 'them'}.`
@@ -954,6 +983,7 @@ export default function CollectClient({ lines, userId }: Props) {
 
     let recorded = 0
     let minutesRecorded = 0
+    let modelsCorrected = 0
     const modelsBanked = new Set<string>()
     const refusals: string[] = []
     try {
@@ -962,7 +992,9 @@ export default function CollectClient({ lines, userId }: Props) {
         // dialog doesn't let a row with none be filled in, so an empty list here is skipped.
         const models = manualModels[entry.operationId] ?? []
         if (models.length === 0) continue
-        const { created, savedProductIds, refusedProductIds } = await recordOperationTime(supabase, {
+        // Asked per row, before that row is written: models already holding a time without a van
+        // are corrected or added to, per group (SameChassisPrompt).
+        const saved = await withSameChassisPrompt((sameChassis) => recordOperationTime(supabase, {
           operationId: entry.operationId,
           productIds: models.map((p) => p.id),
           // Blank → null → recorded against the placeholder operator, since
@@ -971,7 +1003,18 @@ export default function CollectClient({ lines, userId }: Props) {
           collectedBy: userId,
           totalMinutes: entry.minutes,
           chassisId: null,
+          sameChassis,
+        }), {
+          operationName: entry.operationName,
+          chassisNumber: null,
+          minutes: entry.minutes,
+          modelNames: Object.fromEntries(models.map((p) => [p.id, p.model])),
         })
+        // Cancelled at this row: nothing of it was written. Stop here, saying what already landed,
+        // exactly as a failure part-way does.
+        if (!saved) throw new CancelledAtRow(entry.operationName)
+        const { created, savedProductIds, refusedProductIds, correctedProductIds } = saved
+        modelsCorrected += correctedProductIds.length
         for (const id of savedProductIds) modelsBanked.add(id)
         if (refusedProductIds.length > 0) {
           refusals.push(
@@ -983,7 +1026,14 @@ export default function CollectClient({ lines, userId }: Props) {
         minutesRecorded += entry.minutes
       }
     } catch (err) {
-      const detail = err instanceof Error ? err.message : 'the write was rejected'
+      if (err instanceof CancelledAtRow && recorded === 0) {
+        // Nothing written at all — back to the dialog with every row as typed.
+        setSavingManual(false)
+        return
+      }
+      const detail = err instanceof CancelledAtRow
+        ? `you cancelled at “${err.operationName}”, so it and the rows after it were not saved`
+        : err instanceof Error ? err.message : 'the write was rejected'
       setManualError(
         recorded === 0
           ? `Nothing was recorded: ${detail}`
@@ -1003,6 +1053,7 @@ export default function CollectClient({ lines, userId }: Props) {
     setSavedNotice(
       `Recorded ${plural(recorded, 'time')} across ${plural(modelsBanked.size, 'model')} — ` +
       `${Number(minutesRecorded.toFixed(2))} minutes.` +
+      correctedSummary(modelsCorrected) +
       (refusals.length > 0
         ? ` Some models were skipped because the operation stopped applying to them before the save: ${refusals.join('; ')}.`
         : '')
@@ -1308,6 +1359,9 @@ export default function CollectClient({ lines, userId }: Props) {
           onCancel={() => { setManualTargets(null); setManualModels(null); setManualError(null) }}
         />
       )}
+      {/* Over the complete or manual dialog, which stays open (and ignores Escape while saving)
+          beneath it. */}
+      {sameChassisPrompt}
 
       {/* ── Job editor: name + section, the shared drawer /setup opens ──────────────────── */}
       {jobDrawerOpen && jobDrawer && (
