@@ -143,6 +143,12 @@ function correctedSummary(n: number): string {
   return n === 0 ? '' : ` Corrected the existing time on ${n === 1 ? 'one model' : `${n} models`} rather than adding to it.`
 }
 
+/** " Replaced the estimate on 2 models with this measured time." — or nothing. Never asked about,
+ * so always said. */
+function replacedSummary(n: number): string {
+  return n === 0 ? '' : ` Replaced the estimate on ${n === 1 ? 'one model' : `${n} models`} with this measured time.`
+}
+
 function one<T>(v: T | T[] | null | undefined): T | null {
   if (Array.isArray(v)) return v[0] ?? null
   return v ?? null
@@ -902,6 +908,7 @@ export default function CollectClient({ lines, userId }: Props) {
       setSavedNotice(
         `“${timer.operationName}” banked against ${plural(recorded.savedProductIds.length, 'model')}.`
         + correctedSummary(recorded.correctedProductIds.length)
+        + replacedSummary(recorded.replacedEstimateProductIds.length)
         + (refusedNames.length > 0
           ? ` Skipped, no time saved: ${refusedNames.join(', ')} — the operation no longer applies to `
             + `${refusedNames.length === 1 ? 'it' : 'them'}.`
@@ -984,6 +991,7 @@ export default function CollectClient({ lines, userId }: Props) {
     let recorded = 0
     let minutesRecorded = 0
     let modelsCorrected = 0
+    let estimatesReplaced = 0
     const modelsBanked = new Set<string>()
     const refusals: string[] = []
     try {
@@ -1013,8 +1021,9 @@ export default function CollectClient({ lines, userId }: Props) {
         // Cancelled at this row: nothing of it was written. Stop here, saying what already landed,
         // exactly as a failure part-way does.
         if (!saved) throw new CancelledAtRow(entry.operationName)
-        const { created, savedProductIds, refusedProductIds, correctedProductIds } = saved
+        const { created, savedProductIds, refusedProductIds, correctedProductIds, replacedEstimateProductIds } = saved
         modelsCorrected += correctedProductIds.length
+        estimatesReplaced += replacedEstimateProductIds.length
         for (const id of savedProductIds) modelsBanked.add(id)
         if (refusedProductIds.length > 0) {
           refusals.push(
@@ -1054,6 +1063,7 @@ export default function CollectClient({ lines, userId }: Props) {
       `Recorded ${plural(recorded, 'time')} across ${plural(modelsBanked.size, 'model')} — ` +
       `${Number(minutesRecorded.toFixed(2))} minutes.` +
       correctedSummary(modelsCorrected) +
+      replacedSummary(estimatesReplaced).replace(' with this measured time', ' with the measured time') +
       (refusals.length > 0
         ? ` Some models were skipped because the operation stopped applying to them before the save: ${refusals.join('; ')}.`
         : '')

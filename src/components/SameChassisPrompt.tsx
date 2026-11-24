@@ -26,6 +26,8 @@ import {
  * getting this time, and each group with a figure is answered on its own — Correct (the default:
  * adding is the rarer intent and the one that silently inflates) or Add as separate work — with
  * what each does to one of its models' figure, in minutes. See ChassislessPrompt below.
+ * Estimates are never asked about: a measured time replaces them without a question (the guard
+ * does it), so this only says so, and a save that meets nothing but estimates never opens it.
  *
  * Use it through useSameChassisPrompt rather than rendering it directly: the hook catches either
  * guard's error around any save and calls the save again with the answer, so a screen only wraps
@@ -268,6 +270,7 @@ function ChassislessPrompt({ operationName, minutes, modelNames, models, onChoos
               </div>
               <div style={{ ...MUTED, fontSize: 12, marginTop: 8 }}>
                 {name(example.productId)} is {fmtMinutes(example.figureNow)} min now.
+                {example.estimatesReplaced.length > 0 && ` Its estimate (${fmtMinutes(example.estimatesReplaced[0].totalMinutes)} min) is replaced by this measured time either way.`}
                 {g.models.length > 1 && ' Applies to every model in this group.'}
               </div>
             </section>
@@ -277,14 +280,18 @@ function ChassislessPrompt({ operationName, minutes, modelNames, models, onChoos
         {fresh.length > 0 && (
           <section style={{ border: '1px dashed var(--border)', borderRadius: 10, padding: 14 }}>
             <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)', marginBottom: 2 }}>
-              No time yet without a van · {fresh.length === 1 ? name(fresh[0].productId) : `${fresh.length} models`}
+              No measured time yet without a van · {fresh.length === 1 ? name(fresh[0].productId) : `${fresh.length} models`}
             </div>
             {fresh.length > 1 && <div style={{ ...MUTED, fontSize: 12, marginBottom: 6, overflowWrap: 'anywhere' }}>{nameList(fresh.map((m) => name(m.productId)))}</div>}
             <div style={{ ...MUTED }}>
               This time is recorded for {fresh.length === 1 ? 'it' : 'them'} — nothing to decide.{' '}
               {fresh[0].figureNow == null
                 ? <>{name(fresh[0].productId)} goes from untimed to <strong style={STRONG}>{fmtMinutes(fresh[0].ifAdded)} min</strong>.</>
-                : <>{name(fresh[0].productId)} has van times only ({fmtMinutes(fresh[0].figureNow)} min); averaged with this it becomes <strong style={STRONG}>{fmtMinutes(fresh[0].ifAdded)} min</strong>.</>}
+                : <>{name(fresh[0].productId)} goes from {fmtMinutes(fresh[0].figureNow)} to <strong style={STRONG}>{fmtMinutes(fresh[0].ifAdded)} min</strong>.</>}
+              {(() => {
+                const n = fresh.filter((m) => m.estimatesReplaced.length > 0).length
+                return n === 0 ? null : <> {n === fresh.length && n === 1 ? 'Its estimate is' : `The estimate on ${n === fresh.length ? 'each' : `${n} of them`} is`} replaced by this measured time.</>
+              })()}
             </div>
           </section>
         )}

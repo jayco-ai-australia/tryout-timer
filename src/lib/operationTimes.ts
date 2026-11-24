@@ -926,11 +926,15 @@ async function describeRecords(
  */
 export interface ChassislessModelState {
   productId: string
-  /** Current, counted, chassis-less records on this model for the operation. Newest first. */
+  /** Current, counted, chassis-less records on this model that need an answer. Newest first.
+   * For a measured save these are the MEASURED ones only — estimates step aside unasked. */
   records: ExistingChassisRecord[]
+  /** Current estimates on this model that a measured save replaces without asking. The figures
+   * below already leave them out. Empty for an estimate save. */
+  estimatesReplaced: ExistingChassisRecord[]
   /** The pair's figure now — van observations included — or null when it has none. */
   figureNow: number | null
-  /** The figure if this time is added alongside what is there. */
+  /** The figure if this time is added alongside what is there (less any estimates replaced). */
   ifAdded: number
   /** The figure if this time corrects that record, by record id. */
   ifCorrected: Record<string, number>
@@ -967,7 +971,9 @@ export async function fetchChassislessState(
   supabase: SupabaseClient,
   operationId: string,
   productIds: string[],
-  totalMinutes: number
+  totalMinutes: number,
+  /** A measured save: estimates on these models step aside rather than being asked about. */
+  replaceEstimates: boolean
 ): Promise<{ models: ChassislessModelState[]; times: OperationTimeWithModels[] }> {
   const times = await fetchOperationTimesWithModels(supabase, operationId)
   const wanted = new Set(productIds)
@@ -995,9 +1001,17 @@ export async function fetchChassislessState(
       .map((r) => [r.id, r])
   )
 
+  // Estimates stepping aside leave every saved model's figure, whatever is answered about the rest.
+  const steppingAside = (t: OperationTimeWithModels) => replaceEstimates && t.is_estimated
+  const stepAsideLinks = new Set(
+    [...onModel].flatMap(([p, ts]) => ts.filter(steppingAside).map((t) => `${t.id}:${p}`))
+  )
+  const linksAfter = links.filter((l) => !stepAsideLinks.has(`${l.operation_time_id}:${l.product_id}`))
+
   const models = [...wanted].map((productId) => {
-    const own = (onModel.get(productId) ?? []).sort((a, b) => b.created_at.localeCompare(a.created_at) || b.id.localeCompare(a.id))
-    const withNew = [...links, { operation_time_id: NEW, product_id: productId }]
+    const all = (onModel.get(productId) ?? []).sort((a, b) => b.created_at.localeCompare(a.created_at) || b.id.localeCompare(a.id))
+    const own = all.filter((t) => !steppingAside(t))
+    const withNew = [...linksAfter, { operation_time_id: NEW, product_id: productId }]
     const ifCorrected: Record<string, number> = {}
     for (const r of own) {
       // A correction takes that record out of this model's figure and puts this time in its place.
@@ -1007,6 +1021,7 @@ export async function fetchChassislessState(
     return {
       productId,
       records: own.map((t) => described.get(t.id)!),
+      estimatesReplaced: all.filter(steppingAside).map((t) => described.get(t.id)!),
       figureNow: now[operationProductKey(operationId, productId)]?.minutes ?? null,
       ifAdded: figure([...rows, newRow], withNew, productId) as number,
       ifCorrected,
@@ -1037,6 +1052,9 @@ export interface RecordedOperationTime {
    * correction corrects every saved model; a chassis-less save only the models answered
    * `correct`. Empty when nothing was corrected. */
   correctedProductIds: string[]
+  /** Models whose current ESTIMATE this measured save replaced, unasked — an estimate is a
+   * placeholder until the work is measured. Report it: "the estimate on N models was replaced". */
+  replacedEstimateProductIds: string[]
 }
 
 /**
@@ -1471,7 +1489,7 @@ export async function recordOperationTime(
       // A correction is an edit of THAT record, through the one updater — no new record, and its
       // operator, timestamps and links stay as they were.
       const updated = await updateOperationTime(supabase, correction.recordId, { totalMinutes })
-      return { created: updated, savedProductIds, refusedProductIds, measuredProductIds, corrected: true, correctedProductIds: savedProductIds }
+      return { created: updated, savedProductIds, refusedProductIds, measuredProductIds, corrected: true, correctedProductIds: savedProductIds, replacedEstimateProductIds: [] }
     }
   }
 
@@ -1499,6 +1517,13 @@ export async function recordOperationTime(
    *                  replaced stays visible in the times drawer.
    * Models with no chassis-less record just get the new record — nothing to ask.
    *
+   * ESTIMATES ARE NOT ASKED ABOUT. An estimate is a placeholder until the work is measured, so a
+   * MEASURED save replaces every current estimate on its models the same way a correction does
+   * (hidden, or split off and hidden), silently, and reports them in replacedEstimateProductIds.
+   * Only measured + measured is asked — the case only a person can judge. (Fourteen live pairs
+   * had an estimate summing with a measurement, cleaned in November 2026.) An estimate save is
+   * the reverse case and never replaces anything; /estimate refuses it over a measured figure.
+   *
    * Order: every take-out first, then the insert. A take-out refused (RLS: you can only hide
    * what you collected) stops the save before the new record exists, so a refusal can never
    * leave both figures counting; if the insert then fails, what was hidden is un-hidden. A
@@ -1509,25 +1534,30 @@ export async function recordOperationTime(
    */
   const hiddenForCorrection: string[] = []
   let correctedProductIds: string[] = []
+  let replacedEstimateProductIds: string[] = []
   if (chassisId == null && input.sameChassis?.action !== 'add-separate') {
-    const { models, times } = await fetchChassislessState(supabase, operationId, savedProductIds, totalMinutes)
+    const { models, times } = await fetchChassislessState(supabase, operationId, savedProductIds, totalMinutes, !isEstimated)
     const affected = models.filter((m) => m.records.length > 0)
-    if (affected.length > 0) {
+    const withEstimates = models.filter((m) => m.estimatesReplaced.length > 0)
+    if (affected.length > 0 || withEstimates.length > 0) {
       const answer = input.sameChassis
-      if (answer?.action !== 'per-model') throw new ChassislessRecordError(operationId, models)
+      if (affected.length > 0 && answer?.action !== 'per-model') throw new ChassislessRecordError(operationId, models)
       // Every model with a figure must be answered against what is there NOW; a record corrected,
       // hidden or added since the prompt opened means the question is asked again on fresh data.
       const stale = affected.some((m) => {
-        const a = answer.byProduct[m.productId]
+        const a = answer?.action === 'per-model' ? answer.byProduct[m.productId] : undefined
         return !a || (a.action === 'correct' && !m.records.some((r) => r.id === a.recordId))
       })
       if (stale) throw new ChassislessRecordError(operationId, models)
 
-      const correcting = new Map<string, string[]>() // record id → models it is corrected for
+      const correcting = new Map<string, string[]>() // record id → models it is taken out of
+      const takeOut = (recordId: string, productId: string) => correcting.set(recordId, [...(correcting.get(recordId) ?? []), productId])
       for (const m of affected) {
-        const a = answer.byProduct[m.productId]
-        if (a.action === 'correct') correcting.set(a.recordId, [...(correcting.get(a.recordId) ?? []), m.productId])
+        const a = answer?.action === 'per-model' ? answer.byProduct[m.productId] : undefined
+        if (a?.action === 'correct') takeOut(a.recordId, m.productId)
       }
+      for (const m of withEstimates) for (const e of m.estimatesReplaced) takeOut(e.id, m.productId)
+      const estimateIds = new Set(withEstimates.flatMap((m) => m.estimatesReplaced.map((e) => e.id)))
       const byId = new Map(times.map((t) => [t.id, t]))
       // Whole-record hides first: they are the writes RLS is most likely to refuse.
       const plan = [...correcting].map(([id, productIdsForRecord]) => ({
@@ -1535,8 +1565,10 @@ export async function recordOperationTime(
         productIdsForRecord,
         whole: (byId.get(id) as OperationTimeWithModels).productIds.every((p) => productIdsForRecord.includes(p)),
       })).sort((a, b) => Number(b.whole) - Number(a.whole))
+      let failedRecord: string | null = null
       try {
         for (const { record, productIdsForRecord, whole } of plan) {
+          failedRecord = record.id
           if (whole) {
             await updateOperationTime(supabase, record.id, { isHidden: true })
             hiddenForCorrection.push(record.id)
@@ -1554,12 +1586,18 @@ export async function recordOperationTime(
         }
       } catch (err) {
         await unhideAfterFailedCorrection(supabase, hiddenForCorrection)
-        throw new Error(
-          `Nothing was saved: the existing time could not be corrected (${err instanceof Error ? err.message : 'rejected'}). ` +
-          'Choose "Add as separate work" only if this really is extra work, or ask whoever recorded it to correct it.'
-        )
+        const detail = err instanceof Error ? err.message : 'rejected'
+        throw new Error(failedRecord && estimateIds.has(failedRecord)
+          ? `Nothing was saved: the estimate already on this operation could not be replaced (${detail}). ` +
+            'A measured time replaces an estimate, so it is not saved beside it — ask whoever saved the estimate, or an admin, to remove it, then save again.'
+          : `Nothing was saved: the existing time could not be corrected (${detail}). ` +
+            'Choose "Add as separate work" only if this really is extra work, or ask whoever recorded it to correct it.')
       }
-      correctedProductIds = [...correcting.values()].flat()
+      correctedProductIds = [...new Set(affected.filter((m) => {
+        const a = answer?.action === 'per-model' ? answer.byProduct[m.productId] : undefined
+        return a?.action === 'correct'
+      }).map((m) => m.productId))]
+      replacedEstimateProductIds = withEstimates.map((m) => m.productId)
     }
   }
 
@@ -1628,7 +1666,7 @@ export async function recordOperationTime(
 
   return {
     created: created as OperationTime, savedProductIds, refusedProductIds, measuredProductIds,
-    corrected: correctedProductIds.length > 0, correctedProductIds,
+    corrected: correctedProductIds.length > 0, correctedProductIds, replacedEstimateProductIds,
   }
 }
 
